@@ -1,0 +1,16 @@
+# Copy to terraform.tfvars (gitignored -- local, per-machine override, same
+# convention as terraform/providers/baremetal's) to trim footprint on a
+# smaller box. Both default to true -- omit this file entirely (or these
+# two lines) once you're on hardware that doesn't need the trim, no code
+# changes required either way. See variables.tf for what each actually
+# costs.
+
+# enable_observability = false
+# enable_shared_oltp   = false
+
+# Required -- no default for either. GitHub username/org kestra-lakehouse
+# was pushed to ghcr.io under, and a GitHub PAT with read:packages scope.
+# See docs/ROADMAP.md's "Image distribution" section and kestra.tf's
+# kubernetes_secret_v1.ghcr_pull.
+ghcr_username = "<your-github-username>"
+ghcr_token    = "<a GitHub PAT with read:packages scope>"

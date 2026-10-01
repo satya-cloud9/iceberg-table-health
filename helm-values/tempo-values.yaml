@@ -1,0 +1,22 @@
+# Chart: grafana/tempo — single-binary mode, filesystem storage.
+# helm install tempo grafana/tempo -n observability -f helm-values/tempo-values.yaml
+#
+# Nothing in this stack emits traces out of the box — Trino and Kestra
+# don't ship OpenTelemetry instrumentation by default. This is here so the
+# wiring (Grafana datasource, storage) is ready if/when you add OTel
+# instrumentation to a Kestra flow or a client querying Trino; until then
+# Tempo will sit essentially idle, which is why its footprint below is
+# deliberately small.
+
+tempo:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 300m
+      memory: 512Mi
+
+persistence:
+  enabled: true
+  size: 5Gi

@@ -1,0 +1,69 @@
+# Chart: trinodb/trino (https://trinodb.github.io/charts/) — repo: https://trinodb.github.io/charts
+# Applied via terraform/tenants/_template/trino.tf as one values source
+# among several -- this file holds only what's identical across every
+# tenant (sizing, image, access control). The Iceberg catalog block
+# (which points at this tenant's Nessie namespace and storage prefix) is
+# generated per-tenant in trino.tf and layered on top, since a tenant_id
+# has to be interpolated into it.
+#
+# Single coordinator + single worker — enough to prove the pipeline works,
+# not a performance configuration. Bump `worker.replicas` and the JVM/query
+# memory settings once this is running and you want to push real data
+# through it.
+
+image:
+  tag: "483"
+
+server:
+  workers: 1
+  # 70-85% of the pod's memory limit, per Trino's own JVM heap guidance.
+  # At 2Gi limit -> ~1.5G heap. Raise both together if the 8GB-box trimming
+  # in README.md isn't in effect.
+  config:
+    query:
+      maxMemoryPerNode: "1GB"
+
+coordinator:
+  jvm:
+    maxHeapSize: "1536M"
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+  startupProbe:
+    periodSeconds: 10
+    failureThreshold: 60
+    timeoutSeconds: 5
+
+worker:
+  replicas: 1
+  jvm:
+    maxHeapSize: "1536M"
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+  startupProbe:
+    periodSeconds: 10
+    failureThreshold: 60
+    timeoutSeconds: 5
+
+# Iceberg catalog config is generated per-tenant by trino.tf (needs this
+# tenant's namespace and storage prefix interpolated in) -- see that
+# file's `iceberg_catalog_properties` local.
+
+accessControl:
+  # The chart's own `type` field only accepts "configmap" or "properties" --
+  # "allow-all" was never a valid value for it. Trino's built-in
+  # AllowAllSystemAccessControl plugin is selected via the actual
+  # access-control.properties file's own access-control.name key, which
+  # `type: properties` renders from this raw string.
+  type: properties
+  properties: |
+    access-control.name=allow-all

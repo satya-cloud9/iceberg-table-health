@@ -1,0 +1,156 @@
+plugins {
+    id 'io.kestra.gradle.repository-conventions' version '1.2.10'
+    id 'java-library'
+    id 'idea'
+    id 'jacoco'
+    id "com.gradleup.shadow" version "9.6.1"
+}
+// NOTE: unlike kestra-io/plugin-template, this build intentionally drops the
+// maven-publish / signing / net.researchgate.release plugins — this plugin
+// is built and loaded locally on satya-homelab, it is not being published to
+// Maven Central.
+
+def isBuildSnapshot = version.toString().endsWith("-SNAPSHOT")
+
+repositories {
+    mavenLocal()
+    mavenCentral()
+    if (isBuildSnapshot) {
+        maven { url "https://central.sonatype.com/repository/maven-snapshots/" }
+    }
+}
+
+final targetJavaVersion = JavaVersion.VERSION_21
+
+java {
+    sourceCompatibility = targetJavaVersion
+    targetCompatibility = targetJavaVersion
+}
+
+group = "io.kestra.plugin.lakehouse"
+description = 'Kubernetes task runner that executes each task in the tenant-owned namespace instead of the platform pod (dbt-first use case)'
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = "UTF-8"
+    options.compilerArgs.add("-parameters")
+}
+
+dependencies {
+    // Kestra platform — provided by the host Kestra JVM at runtime, never shaded in.
+    annotationProcessor enforcedPlatform("io.kestra:platform:$kestraVersion")
+    implementation enforcedPlatform("io.kestra:platform:$kestraVersion")
+
+    // lombok
+    annotationProcessor "org.projectlombok:lombok"
+    compileOnly "org.projectlombok:lombok"
+
+    // kestra — compileOnly: these classes come from the host application classpath
+    annotationProcessor group: "io.kestra", name: "processor", version: kestraVersion
+    compileOnly group: "io.kestra", name: "core", version: kestraVersion
+    compileOnly group: "io.kestra", name: "script", version: kestraVersion
+
+    // Kubernetes client — this one IS bundled into the shaded plugin jar (implementation,
+    // not compileOnly) because the host Kestra distribution does not ship it.
+    // Pin and bump deliberately; re-test against the cluster's actual K8s API version
+    // (kubectl version) when you bump it.
+    implementation 'io.fabric8:kubernetes-client:6.13.4'
+}
+
+// fabric8's kubernetes-client 6.13.4 doesn't pin an upper bound on its own Jackson
+// dependency, so Gradle resolved it to whatever was newest at build time --
+// confirmed via `unzip -p build/libs/*.jar .../jackson-databind/pom.properties`
+// to be 2.21.1. Jackson 2.19.0 introduced a serialization regression that throws
+// "NullPointerException: ... keySerializer is null" while serializing
+// FieldsV1/managedFields (fabric8io/kubernetes-client#7036 -- fix targeted at
+// their 7.3.0 milestone, NOT backported to the 6.13.x line this plugin is
+// pinned to for Kestra 1.3.37 compatibility). managedFields is stamped onto
+// nearly every real Kubernetes object by server-side-apply field tracking, so
+// this fired on the very first Pod watch event during the smoke-test run --
+// this wasn't a fluke or an RBAC problem, every real watch event hits it.
+// Forcing all three Jackson artifacts to 2.18.2 (last known-good line before
+// the regression) fixes it without needing to touch fabric8's own version.
+configurations.all {
+    resolutionStrategy {
+        force 'com.fasterxml.jackson.core:jackson-databind:2.18.2'
+        force 'com.fasterxml.jackson.core:jackson-core:2.18.2'
+        force 'com.fasterxml.jackson.core:jackson-annotations:2.18.2'
+    }
+}
+/**********************************************************************************************************************\
+ * Test
+ **********************************************************************************************************************/
+test {
+    useJUnitPlatform()
+}
+
+dependencies {
+    testAnnotationProcessor enforcedPlatform("io.kestra:platform:$kestraVersion")
+    testImplementation enforcedPlatform("io.kestra:platform:$kestraVersion")
+
+    testAnnotationProcessor "org.projectlombok:lombok"
+    testCompileOnly 'org.projectlombok:lombok'
+
+    testAnnotationProcessor "io.micronaut:micronaut-inject-java"
+    testAnnotationProcessor "io.micronaut.validation:micronaut-validation-processor"
+    testImplementation "io.micronaut.test:micronaut-test-junit5"
+    testImplementation "io.micronaut:micronaut-jackson-databind"
+
+    testAnnotationProcessor group: "io.kestra", name: "processor", version: kestraVersion
+    testImplementation group: "io.kestra", name: "core", version: kestraVersion
+    testImplementation group: "io.kestra", name: "tests", version: kestraVersion
+    testImplementation group: "io.kestra", name: "script", version: kestraVersion
+    testImplementation group: "io.kestra", name: "repository-memory", version: kestraVersion
+    testImplementation group: "io.kestra", name: "runner-memory", version: kestraVersion
+    testImplementation group: "io.kestra", name: "storage-local", version: kestraVersion
+
+    testImplementation "org.junit.jupiter:junit-jupiter-engine"
+    testImplementation "org.hamcrest:hamcrest"
+    testImplementation "org.hamcrest:hamcrest-library"
+}
+
+test {
+    finalizedBy jacocoTestReport
+}
+
+jacocoTestReport {
+    dependsOn test
+    reports {
+        xml.required.set(true)
+    }
+}
+
+jar {
+    manifest {
+        attributes(
+            "X-Kestra-Name": project.name,
+            "X-Kestra-Title": "DBT Kubernetes Task Runner",
+            "X-Kestra-Group": project.group + ".k8s",
+            "X-Kestra-Description": project.description,
+            "X-Kestra-Version": project.version
+        )
+    }
+}
+
+// This is the artifact that actually gets loaded into Kestra: fabric8's client
+// (and its transitive deps: jackson, okhttp, bouncycastle, snakeyaml, ...) are
+// bundled in here alongside our own class, since the host Kestra distribution
+// does not provide them on its own classpath.
+shadowJar {
+    archiveClassifier.set(null)
+    mergeServiceFiles()
+
+    // If you hit a NoSuchMethodError / LinkageError on a Jackson (or okhttp) class
+    // at plugin-load time, it almost certainly means fabric8's bundled version of
+    // that library collided with a *different* version Kestra itself already loads
+    // on the host classpath. Fix by relocating the colliding package, e.g.:
+       relocate 'com.fasterxml.jackson', 'io.kestra.plugin.lakehouse.k8s.shaded.jackson'
+    // Left commented out until/unless you actually observe the collision — relocating
+    // pre-emptively just makes stack traces harder to read for no benefit.
+}
+
+idea {
+    module {
+        downloadJavadoc = true
+        downloadSources = true
+    }
+}

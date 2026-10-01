@@ -1,0 +1,24 @@
+# SUPERSEDED -- this manual, kubectl-applied RBAC file is no longer how
+# a tenant's dbt execution namespace gets provisioned. It's kept here as
+# a historical reference for what the RBAC shape looks like, not for
+# applying.
+#
+# What replaced it: terraform/tenants/_template/dbt-execution.tf, applied
+# declaratively as part of a tenant's own `tofu apply` (scripts/05-apply-tenant.sh)
+# alongside everything else about that tenant's workspace (namespace,
+# ResourceQuota, LimitRange, Role, RoleBinding, and the NetworkPolicy
+# ingress hole that lets the execution namespace reach the tenant).
+#
+# Why this changed: this file originally had to be applied by hand, once
+# per tenant, completely outside Terraform -- which broke this repo's own
+# stated pattern (docs/architecture.md: "adding a tenant is a new
+# instantiation directory, never a copy of _template") and hardcoded the
+# Kestra worker's ServiceAccount name as a literal ("kestra") that a human
+# had to manually re-confirm via `kubectl get sa -n platform` rather than
+# something Terraform could verify itself. The Terraform version reads
+# that ServiceAccount's real name back from the cluster (terraform/platform/kestra.tf's
+# data source + kestra_service_account_name output) instead of assuming it.
+#
+# If you're looking at this file wondering what to run: nothing here.
+# See terraform/tenants/_template/dbt-execution.tf and that tenant's own
+# main.tf (e.g. terraform/tenants/tenant-a/main.tf) instead.

@@ -1,0 +1,38 @@
+services:
+  floci:
+    # nightly, not latest: EKS Pod Identity / IRSA OIDC signing (floci-io/floci#3783)
+    # merged to main 2026-09-18 and isn't in a stable release yet as of this
+    # writing -- confirmed empirically (a `latest` image built 2026-09-15
+    # returns no identity.oidc.issuer from DescribeCluster; a `nightly` image
+    # built 2026-09-21 does). Swap to a pinned x.y.z once a stable release
+    # ships with this, the same way the old comment here intended for
+    # `latest` -- `nightly` is a rolling tag, not something to leave this
+    # file pointed at long-term.
+    image: floci/floci:nightly
+    container_name: lakehouse-floci
+    ports:
+      - "4566:4566"   # same edge port LocalStack used — every emulated AWS API, one endpoint
+    environment:
+      - FLOCI_STORAGE_MODE=hybrid          # persists state to disk but keeps hot data in memory
+      - FLOCI_STORAGE_PERSISTENT_PATH=/app/data
+      - FLOCI_DEFAULT_REGION=us-east-1
+      # Required for FLOCI_SERVICES_EKS_POD_IDENTITY_WEBHOOK (default true)
+      # to actually activate, per floci's own EKS docs -- see
+      # terraform/providers/aws/workload-identity.tf's header comment for
+      # what this gates.
+      - FLOCI_TLS_ENABLED=true
+    volumes:
+      - "floci-data:/app/data"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    healthcheck:
+      # Floci serves LocalStack's /_localstack/health path for drop-in
+      # compatibility, so this check (and the ones in scripts/03 and
+      # scripts/status.sh) didn't need to change when we swapped tools.
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  floci-data:
+

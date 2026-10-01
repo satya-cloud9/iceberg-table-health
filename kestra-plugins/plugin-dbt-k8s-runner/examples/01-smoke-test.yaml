@@ -1,0 +1,20 @@
+# Run this FIRST, before wiring up dbt. It proves the runner mechanics --
+# create Pod in tenant-a-dbt-exec (tenant-a's own dedicated execution
+# namespace -- see terraform/tenants/_template/dbt-execution.tf), stream
+# logs back into the Kestra UI, capture exit code, clean up -- against a
+# trivial busybox image, so a failure here is unambiguously about the
+# runner/RBAC, not about dbt.
+id: k8s_runner_smoke_test
+namespace: tenant.data_eng
+
+tasks:
+  - id: hello_from_tenant_namespace
+    type: io.kestra.plugin.scripts.shell.Commands
+    taskRunner:
+      type: io.kestra.plugin.lakehouse.k8s.KubernetesTaskRunner
+      namespace: tenant-a-dbt-exec
+      containerImage: busybox:1.36
+      delete: true
+    commands:
+      - echo "running inside $(hostname), namespace tenant-a-dbt-exec"
+      - echo "KESTRA_ENV=$KESTRA_ENV"

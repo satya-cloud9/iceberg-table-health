@@ -1,0 +1,31 @@
+# kind cluster topology standing in for EKS. 1 control-plane + 2 workers —
+# enough to exercise pod scheduling/anti-affinity across nodes without the
+# overhead of more. Service UIs (Trino, Kestra, Grafana) are reached via
+# `kubectl port-forward` (see `make status`) rather than NodePort/Ingress —
+# simpler to keep stable across re-creates of the cluster.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: lakehouse
+
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "role=control-plane"
+  - role: worker
+    kubeadmConfigPatches:
+      - |
+        kind: JoinConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "role=worker,workload=data"
+  - role: worker
+    kubeadmConfigPatches:
+      - |
+        kind: JoinConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "role=worker,workload=data"
