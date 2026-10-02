@@ -53,15 +53,36 @@ and 3 partitions for `glue.demo.smoke_events`.
 |---|---|
 | `docker/spark.Dockerfile` | `apache/spark:3.5.6` + Iceberg runtime and AWS bundle 1.10.0 + `jobs/` |
 | `jobs/run_sql.py` | runs every statement in one SQL file and prints results |
-| `jobs/sql/*.sql` | one file per job (`smoke.sql` now; generator, metrics, compaction next) |
-| `k8s/sparkapp-sql.tmpl.yaml` | the one SparkApplication template every job renders |
+| `jobs/sql/*.sql` | SQL jobs (`smoke.sql`; metrics and compaction next) |
+| `jobs/generate_small_files.py` | GL1 generator: healthy vs fragmented day partitions |
+| `k8s/sparkapp.tmpl.yaml` | the one SparkApplication template every job renders |
 | `k8s/spark-jobs.yaml` | job namespace + ResourceQuota |
 | `helm/spark-operator-values.yaml` | operator watches `spark-jobs`, creates the `spark` service account |
 | `scripts/env.sh` | shared settings; overrides via env vars |
-| `scripts/run-sql-job.sh <name>` | render, submit, wait, print driver log for `jobs/sql/<name>.sql` |
+| `scripts/run-job.sh sql <name>` / `py <script> [args]` | render, submit, wait, print driver log |
 
 Pods reach Floci at `http://172.17.0.1:4566` (Docker bridge gateway, the same
 address the base repo's aws provider uses). Override with `AWS_ENDPOINT` if
 your Docker network differs.
 
 Every change to `jobs/` needs `make gl-image` again before the next run.
+
+## GL1 — Small-file generator
+
+Builds `glue.demo.events`: 7 days of 200,000 events each. Healthy days are
+written in one commit (one file). Fragmented days (2026-09-03 and 2026-09-05
+by default) take 30 commits of 10 files each, i.e. 300 small files and 30
+snapshots per day, the way frequent incremental runs leave a table. Every day
+holds the same row count, so a later read benchmark compares like with like.
+
+```bash
+make gl-image      # jobs/ changed, so rebuild + reload first
+make gl-generate   # GEN_ARGS="--recreate" by default
+```
+
+Pass: the result table shows ~1 file per healthy day and ~300 files per
+fragmented day, with a much smaller `avg_file_kb` on the fragmented days.
+
+Options (`GEN_ARGS`): `--table`, `--start`, `--days`, `--rows-per-day`,
+`--fragmented 2026-09-03,2026-09-05`, `--commits`, `--files-per-commit`,
+`--recreate`.

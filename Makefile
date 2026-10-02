@@ -58,7 +58,7 @@ up: preflight install emulator-up provider-apply platform-apply tenant-apply flo
 # --- Glue-Lite flavor (flavors/glue-lite) --------------------------------
 # Kestra, Spark Operator, Glue, S3, Iceberg on the emulated EKS cluster --
 # no platform/tenant layers. Tear down with `make destroy` as usual.
-.PHONY: gl-spike gl-cluster gl-spark-operator gl-image gl-smoke gl-up
+.PHONY: gl-spike gl-cluster gl-spark-operator gl-image gl-smoke gl-up gl-generate
 
 gl-spike:
 	bash flavors/glue-lite/spike/run-glue-spike.sh
@@ -72,6 +72,12 @@ gl-image:
 	bash flavors/glue-lite/scripts/03-build-load-image.sh
 
 gl-smoke:
-	bash flavors/glue-lite/scripts/run-sql-job.sh smoke
+	bash flavors/glue-lite/scripts/run-job.sh sql smoke
 
 gl-up: gl-cluster gl-spark-operator gl-image gl-smoke
+
+# GL1: build glue.demo.events with healthy and fragmented day partitions.
+# Override sizes, e.g.  make gl-generate GEN_ARGS="--commits 60 --files-per-commit 20"
+GEN_ARGS ?= --recreate
+gl-generate:
+	bash flavors/glue-lite/scripts/run-job.sh py generate_small_files.py $(GEN_ARGS)

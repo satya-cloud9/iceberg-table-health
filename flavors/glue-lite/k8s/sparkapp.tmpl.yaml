@@ -1,11 +1,13 @@
-# One SparkApplication = one SQL file run by jobs/run_sql.py. Every Glue-Lite
-# job (smoke, generator, metrics, compaction) renders this same template, so
-# the catalog wiring lives in exactly one place. Kestra will render it too.
+# One SparkApplication = one Python job from jobs/ (run_sql.py for SQL files,
+# or a dedicated script like generate_small_files.py). Every Glue-Lite job
+# renders this same template, so the catalog wiring lives in exactly one
+# place. Kestra will render it too.
 #
-# Rendered by scripts/run-sql-job.sh with envsubst:
-#   JOB_NAME  SparkApplication name (unique per run)
-#   SQL_FILE  path inside the image, e.g. /opt/jobs/sql/smoke.sql
-#   IMAGE     Spark image (glue-lite-spark:local on Floci, ECR on EKS)
+# Rendered by scripts/run-job.sh with envsubst:
+#   JOB_NAME   SparkApplication name (unique per run)
+#   MAIN_FILE  script inside the image, e.g. /opt/jobs/run_sql.py
+#   JOB_ARGS   pre-indented YAML list lines ("    - --table\n    - x")
+#   IMAGE      Spark image (glue-lite-spark:local on Floci, ECR on EKS)
 #   AWS_ENDPOINT  where pods reach Floci (http://172.17.0.1:4566); the eks
 #                 overlay (GL4) drops the four *.endpoint / path-style lines
 #   WAREHOUSE     s3://<bucket>/warehouse
@@ -23,14 +25,15 @@ spec:
   mode: cluster
   image: ${IMAGE}
   imagePullPolicy: IfNotPresent
-  mainApplicationFile: local:///opt/jobs/run_sql.py
+  mainApplicationFile: local://${MAIN_FILE}
   arguments:
-    - ${SQL_FILE}
+${JOB_ARGS}
   sparkVersion: "3.5.6"
   restartPolicy:
     type: Never
   sparkConf:
     spark.ui.enabled: "false"
+    spark.sql.session.timeZone: UTC
     spark.sql.extensions: org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
     spark.sql.catalog.glue: org.apache.iceberg.spark.SparkCatalog
     spark.sql.catalog.glue.catalog-impl: org.apache.iceberg.aws.glue.GlueCatalog

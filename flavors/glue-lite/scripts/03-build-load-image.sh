@@ -28,4 +28,4 @@ for node in $(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do
 done
 
 echo ""
-echo "Next: bash flavors/glue-lite/scripts/run-sql-job.sh smoke"
+echo "Next: bash flavors/glue-lite/scripts/run-job.sh sql smoke"
