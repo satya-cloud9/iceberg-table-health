@@ -49,3 +49,7 @@ dbt/.user.yml
 build/
 .gradle/
 *.swp
+
+# Per-run output of scripts/03-apply-provider.sh; debug.log echoes the
+# emulated EKS admin key, so never commit this folder.
+terraform/providers/*/generated/
