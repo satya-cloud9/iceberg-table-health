@@ -17,10 +17,22 @@ WAREHOUSE="${WAREHOUSE:-s3://$WAREHOUSE_BUCKET/warehouse}"
 IMAGE="${IMAGE:-glue-lite-spark:local}"
 SPARK_OPERATOR_VERSION="${SPARK_OPERATOR_VERSION:-2.5.2}"
 
-# Use the project's kubeconfig (written by `make provider-apply`), not
-# ~/.kube/config, so this never touches another cluster by accident.
-if [ -z "${KUBECONFIG:-}" ] && [ -f "$REPO_ROOT/terraform/generated/aws.tfvars.json" ]; then
-  KUBECONFIG="$(jq -r '.kubeconfig_path' "$REPO_ROOT/terraform/generated/aws.tfvars.json")"
+# Always use this project's kubeconfig (written by `make provider-apply`).
+# An inherited KUBECONFIG is ignored on purpose: a stale export in the shell
+# profile pointed these scripts at another project's cluster. To force a
+# different one, set GL_KUBECONFIG explicitly.
+CONTRACT_JSON="$REPO_ROOT/terraform/generated/aws.tfvars.json"
+if [ -n "${GL_KUBECONFIG:-}" ]; then
+  KUBECONFIG="$GL_KUBECONFIG"
+elif [ -f "$CONTRACT_JSON" ]; then
+  KUBECONFIG="$(jq -r '.kubeconfig_path' "$CONTRACT_JSON")"
   case "$KUBECONFIG" in /*) ;; *) KUBECONFIG="$REPO_ROOT/$KUBECONFIG" ;; esac
+else
+  echo "No $CONTRACT_JSON -- run 'make gl-cluster' first." >&2
+  return 1 2>/dev/null || exit 1
+fi
+if [ ! -f "$KUBECONFIG" ]; then
+  echo "Kubeconfig $KUBECONFIG doesn't exist -- re-run 'make gl-cluster'." >&2
+  return 1 2>/dev/null || exit 1
 fi
 export KUBECONFIG AWS_ENDPOINT AWS_REGION WAREHOUSE IMAGE
