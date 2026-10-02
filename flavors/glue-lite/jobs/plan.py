@@ -188,6 +188,18 @@ def plan_table(table, findings, tm, cfg):
                               f"options => map({opt_sql}))"),
                 "note": "; ".join(note) or f"{len(chosen)} partitions, ~{files_in_scope} files"})
 
+    # 1b. deletes: the rewrite applies them, but the delete files can stay
+    # attached. rewrite_data_files gives new files the starting sequence
+    # number, so a delete file from the last DELETE still "applies" by
+    # sequence number and remove-dangling-deletes keeps it. This procedure
+    # drops delete rows whose data files are gone, and empty delete files.
+    if any(s["kind"] == "rewrite_data_files" and "DELETE_BUILDUP" in s["symptoms"] for s in steps):
+        steps.append({"kind": "rewrite_position_delete_files", "auto": True,
+                      "symptoms": ["DELETE_BUILDUP"],
+                      "statement": (f"CALL glue.system.rewrite_position_delete_files(table => '{ident}', "
+                                    f"options => map('rewrite-all', 'true'))"),
+                      "note": "removes delete files left pointing at rewritten data files"})
+
     hot = [f for f in active if f["symptom"] == "HOT_PARTITION"]
     if hot:
         steps.append({"kind": "hold", "auto": False, "symptoms": ["HOT_PARTITION"], "statement": "",
@@ -331,15 +343,14 @@ def main():
             records.append((run_id, scan_id, now, t, uuid, s["kind"], ",".join(s["symptoms"]),
                             stmt, status, float(dur), result))
             if status == "failed" and DANGLING in stmt and _unsupported_option(result):
-                # Older Iceberg: retry without the option, then clean up dangling
-                # position deletes with the dedicated procedure.
-                for kind, retry in ((s["kind"], strip_dangling_option(stmt)),
-                                    ("rewrite_position_delete_files",
-                                     f"CALL glue.system.rewrite_position_delete_files(table => '{_ident(t)}')")):
-                    status, result, dur = run_sql(spark, retry)
-                    print(f"  -> {kind} (fallback): {status} in {dur}s  {result[:300]}", flush=True)
-                    records.append((run_id, scan_id, datetime.now(timezone.utc), t, uuid, kind,
-                                    ",".join(s["symptoms"]), retry, status, float(dur), result))
+                # Older Iceberg: retry without the option (the next step,
+                # rewrite_position_delete_files, still cleans up the deletes).
+                retry = strip_dangling_option(stmt)
+                status, result, dur = run_sql(spark, retry)
+                print(f"  -> {s['kind']} (retry without remove-dangling-deletes): {status} in {dur}s  "
+                      f"{result[:300]}", flush=True)
+                records.append((run_id, scan_id, datetime.now(timezone.utc), t, uuid, s["kind"],
+                                ",".join(s["symptoms"]), retry, status, float(dur), result))
     if a.apply and records:
         spark.createDataFrame(records, schema).writeTo(f"{ns}.actions").append()
         print(f"\nRecorded {len(records)} actions in {ns}.actions under {run_id}. "

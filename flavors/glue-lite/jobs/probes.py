@@ -84,6 +84,17 @@ def partition_metrics(spark, table, info, cfg):
               if info["partitioned"] else
               f"LEFT JOIN (SELECT '{{}}' AS partition_key, max(committed_at) AS last_updated_at "
               f"FROM {table}.snapshots) p ON a.partition_key = p.partition_key")
+    # F6 counts writer commits only. Iceberg's last_updated_at moves on any
+    # commit, including our own compaction ('replace'), which would make a
+    # just-fixed partition look hot. Files added by non-replace snapshots
+    # still in history give the last writer write; if none are left (history
+    # expired), the last write is older than every retained snapshot and the
+    # partition is not hot (minutes = NULL).
+    epk = "to_json(e.data_file.partition)" if info["partitioned"] else "'{}'"
+    w_join = (f"LEFT JOIN (SELECT {epk} AS partition_key, max(s.committed_at) AS last_write "
+              f"FROM {table}.all_entries e JOIN {table}.snapshots s ON e.snapshot_id = s.snapshot_id "
+              f"WHERE e.status = 1 AND s.operation <> 'replace' GROUP BY 1) w "
+              f"ON a.partition_key = w.partition_key")
     return spark.sql(f"""
         WITH f AS (
             SELECT {pk} AS partition_key, content, file_size_in_bytes, record_count,
@@ -125,10 +136,10 @@ def partition_metrics(spark, table, info, cfg):
                CAST(files_old_spec AS BIGINT)     AS files_old_spec,
                CAST(files_current_sort AS BIGINT) AS files_current_sort,
                p.last_updated_at,
-               CAST((unix_timestamp(current_timestamp()) - unix_timestamp(p.last_updated_at)) / 60.0
+               CAST((unix_timestamp(current_timestamp()) - unix_timestamp(w.last_write)) / 60.0
                     AS DOUBLE) AS minutes_since_update,
                CAST({target} AS BIGINT) AS target_file_bytes
-        FROM a {p_join}
+        FROM a {p_join} {w_join}
         ORDER BY a.partition_key
     """)
 

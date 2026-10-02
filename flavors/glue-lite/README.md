@@ -325,3 +325,27 @@ always goes first; `--days all` benchmarks the whole table with no filter
 (planning then reads every manifest, which is what s4 is about); after a
 non-`before` run, a before/after table is printed against the latest `before`
 run of the same table.
+
+### Fixes from the first S2 run
+
+- **Hot window counts writers only.** Iceberg's `last_updated_at` moves on any
+  commit, so our own compaction made s2's just-rewritten partitions look hot
+  (`HOT_PARTITION` x7). `minutes_since_update` now comes from the last
+  non-`replace` commit that added files to the partition (`.all_entries` joined
+  to `.snapshots`). If no writer commit is left in history, the partition is
+  not hot.
+- **Deletes need `rewrite_position_delete_files`.** The delete-aware rewrite
+  applied the deletes, but each day's delete file stayed attached:
+  `rewrite_data_files` gives new files the *starting* sequence number, so the
+  delete file from the last `DELETE` still applies by sequence number and
+  `remove-dangling-deletes` keeps it. Queries were correct; the metadata
+  wasn't. plan.py now follows the data rewrite with
+  `rewrite_position_delete_files(... 'rewrite-all' => 'true')`, which drops
+  delete rows whose data files are gone.
+
+```bash
+make gl-image
+make gl-scan                    # s2 still DELETE_BUILDUPx7 (after fix)
+make gl-plan T=s2 APPLY=1       # rewrite + rewrite_position_delete_files
+make gl-scan                    # s2 should PASS (after fix), not HOT_PARTITION
+```
