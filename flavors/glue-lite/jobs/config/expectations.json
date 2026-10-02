@@ -1,10 +1,18 @@
 {
-  "_comment": "GL2.5d/e expectation matrix: what the symptom engine must find on each scenario table. Any active symptom not listed under 'expect' or 'allow' is unexpected. Findings held for workload evidence (needs-evidence) are ignored. Partition selectors: 'partitions' (exact set of partition values), 'newest' (only the table's newest partition), 'not_newest', 'min_value' (every flagged partition >= this value), 'count', 'min_count'; 'optional': true = allowed but not required (selectors still apply when it appears). 'fresh' marks a table whose check is only valid while its newest partition is younger than the hot window; past that the result is STALE, not FAIL. 'after' (optional): expectations once plan.py has applied fixes to the table (matched by table UUID, so a rebuild resets it to 'before'); an empty expect list means healthy.",
+  "_comment": "GL2.5d/e expectation matrix: what the symptom engine must find on each scenario table. Any active symptom not listed under 'expect' or 'allow' is unexpected. Findings held for workload evidence (needs-evidence) are ignored. Partition selectors: 'partitions' (exact set of partition values), 'newest' (only the table's newest partition), 'not_newest', 'min_value' (every flagged partition >= this value), 'prefix' (every flagged partition value starts with this; multi-field values are joined with '/'), 'count', 'min_count'; 'optional': true = allowed but not required (selectors still apply when it appears). 'fresh' marks a table whose check is only valid while its newest partition is younger than the hot window; past that the result is STALE, not FAIL. 'after' (optional): expectations once plan.py has applied fixes to the table (matched by table UUID, so a rebuild resets it to 'before'); an empty expect list means healthy.",
   "tables": {
     "glue.demo.s0_small_appends": {
       "expect": [
-        {"symptom": "SMALL_FILES", "partitions": ["2026-09-03", "2026-09-05"]},
-        {"symptom": "SNAPSHOT_BUILDUP"}
+        {
+          "symptom": "SMALL_FILES",
+          "partitions": [
+            "2026-09-03",
+            "2026-09-05"
+          ]
+        },
+        {
+          "symptom": "SNAPSHOT_BUILDUP"
+        }
       ],
       "after": {
         "_comment": "after make gl-plan T=s0 APPLY=1: both days compacted, old snapshots expired",
@@ -13,17 +21,31 @@
     },
     "glue.demo.s1_late_arrivals": {
       "expect": [
-        {"symptom": "SCATTERED_SMALL_FILES"},
-        {"symptom": "SMALL_FILES", "min_count": 3, "min_value": "2026-09-11"}
+        {
+          "symptom": "SCATTERED_SMALL_FILES"
+        },
+        {
+          "symptom": "SMALL_FILES",
+          "min_count": 3,
+          "min_value": "2026-09-11"
+        }
       ],
       "after": {
         "_comment": "one plan run compacts the top 10 of 11 flagged days; the 11th waits for the next run, and with 1 partition left SCATTERED clears",
-        "expect": [{"symptom": "SMALL_FILES", "count": 1}]
+        "expect": [
+          {
+            "symptom": "SMALL_FILES",
+            "count": 1
+          }
+        ]
       }
     },
     "glue.demo.s2_mor_deletes": {
       "expect": [
-        {"symptom": "DELETE_BUILDUP", "count": 7}
+        {
+          "symptom": "DELETE_BUILDUP",
+          "count": 7
+        }
       ],
       "after": {
         "_comment": "deletes applied to rewritten files and the old delete files removed",
@@ -33,22 +55,43 @@
     "glue.demo.s3_hot_partition": {
       "fresh": true,
       "expect": [
-        {"symptom": "HOT_PARTITION", "newest": true},
-        {"symptom": "SMALL_FILES", "count": 1, "not_newest": true},
-        {"symptom": "SNAPSHOT_BUILDUP"}
+        {
+          "symptom": "HOT_PARTITION",
+          "newest": true
+        },
+        {
+          "symptom": "SMALL_FILES",
+          "count": 1,
+          "not_newest": true
+        },
+        {
+          "symptom": "SNAPSHOT_BUILDUP"
+        }
       ],
       "after": {
         "_comment": "past day compacted, snapshots expired, today held while hot. Today may still be hot (HOT_PARTITION), cooled but not yet compacted (SMALL_FILES, next run's work), or compacted by a second run (healthy). Anything on the past day, or SNAPSHOT_BUILDUP, fails.",
         "expect": [
-          {"symptom": "HOT_PARTITION", "newest": true, "optional": true},
-          {"symptom": "SMALL_FILES", "newest": true, "optional": true}
+          {
+            "symptom": "HOT_PARTITION",
+            "newest": true,
+            "optional": true
+          },
+          {
+            "symptom": "SMALL_FILES",
+            "newest": true,
+            "optional": true
+          }
         ]
       }
     },
     "glue.demo.s4_manifest_bloat": {
       "expect": [
-        {"symptom": "MANIFEST_BLOAT"},
-        {"symptom": "SNAPSHOT_BUILDUP"}
+        {
+          "symptom": "MANIFEST_BLOAT"
+        },
+        {
+          "symptom": "SNAPSHOT_BUILDUP"
+        }
       ],
       "after": {
         "_comment": "rewrite_manifests + expire_snapshots; merging stays off until approved, which only matters for future commits",
@@ -57,13 +100,89 @@
     },
     "glue.demo.s5_skewed_partition": {
       "expect": [
-        {"symptom": "PARTITION_SKEW"}
+        {
+          "symptom": "PARTITION_SKEW"
+        }
       ]
     },
     "glue.demo.s6_over_partitioned": {
       "expect": [
-        {"symptom": "OVER_PARTITIONED"}
+        {
+          "symptom": "OVER_PARTITIONED"
+        }
       ]
+    },
+    "glue.demo.s7_unpartitioned": {
+      "expect": [
+        {
+          "symptom": "SMALL_FILES",
+          "count": 1
+        },
+        {
+          "symptom": "SNAPSHOT_BUILDUP"
+        }
+      ],
+      "after": {
+        "_comment": "no where clause (whole table), snapshots expired",
+        "expect": []
+      }
+    },
+    "glue.demo.s8_identity_bucket": {
+      "expect": [
+        {
+          "symptom": "SMALL_FILES",
+          "count": 8,
+          "prefix": "eu/"
+        },
+        {
+          "symptom": "SCATTERED_SMALL_FILES",
+          "optional": true
+        }
+      ],
+      "_comment": "every eu commit writes to all 8 buckets, so the late-arrival rule may also fire; that's allowed",
+      "after": {
+        "_comment": "scope widened from region='eu' + bucket to region='eu'",
+        "expect": []
+      }
+    },
+    "glue.demo.s9_hourly_small": {
+      "expect": [
+        {
+          "symptom": "SMALL_FILES",
+          "count": 2
+        }
+      ],
+      "after": {
+        "_comment": "proves the hour-partition WHERE hit the right hours",
+        "expect": []
+      }
+    },
+    "glue.demo.s10_equality_deletes": {
+      "expect": [
+        {
+          "symptom": "DELETE_BUILDUP",
+          "count": 1
+        }
+      ],
+      "after": {
+        "_comment": "eq deletes applied by the rewrite; remove-dangling-deletes drops the eq-delete files",
+        "expect": []
+      }
+    },
+    "glue.demo.s11_string_keys": {
+      "expect": [
+        {
+          "symptom": "SMALL_FILES",
+          "partitions": [
+            "a/b",
+            "o'neil"
+          ]
+        }
+      ],
+      "after": {
+        "_comment": "proves quoting of string partition values in the WHERE",
+        "expect": []
+      }
     }
   }
 }

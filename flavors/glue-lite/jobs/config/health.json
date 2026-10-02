@@ -14,6 +14,7 @@
       "min_excess_files": 4,
       "delete_ratio": 0.05,
       "delete_min_files": 1,
+      "eq_delete_min_files": 5,
       "min_oversized_files": 1,
       "scattered_min_partitions": 3,
       "scattered_partition_share": 0.3,

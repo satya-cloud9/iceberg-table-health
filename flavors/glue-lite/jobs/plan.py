@@ -103,8 +103,15 @@ def field_predicate(field, value):
     return None
 
 
-def partition_predicate(partition_key, fields):
-    """'{"occurred_at_day":"2026-09-03"}' -> SQL on source columns, or None."""
+def partition_predicate(partition_key, fields, widened=None):
+    """'{"occurred_at_day":"2026-09-03"}' -> SQL on source columns.
+
+    "TRUE" for an unpartitioned table. A field whose transform can't be a
+    range (bucket, truncate on strings) is dropped, which widens the scope to
+    every value of that field; the rewrite still only picks small files, so
+    widening costs some extra reading, never correctness. The dropped field
+    names are added to `widened`. None if no field can be expressed.
+    """
     try:
         values = json.loads(partition_key or "{}")
     except ValueError:
@@ -112,15 +119,20 @@ def partition_predicate(partition_key, fields):
     if not values:
         return "TRUE"
     by_name = {f["name"]: f for f in fields}
-    parts = []
+    parts, dropped = [], []
     for name, value in values.items():
         f = by_name.get(name)
         if f is None or f["transform"] == "void":
             continue
         p = field_predicate(f, value)
         if p is None:
-            return None
-        parts.append(p)
+            dropped.append(name)
+        else:
+            parts.append(p)
+    if dropped and not parts:
+        return None
+    if widened is not None:
+        widened.update(dropped)
     return " AND ".join(parts) if parts else "TRUE"
 
 
@@ -151,10 +163,13 @@ def plan_table(table, findings, tm, cfg):
         budget = int(rw.get("max_partitions_per_run", 10))
         ranked = sorted(parts.items(), key=lambda kv: -kv[1]["score"])
         chosen, skipped = ranked[:budget], ranked[budget:]
-        preds, unsupported = [], []
+        preds, unsupported, widened = [], [], set()
         for key, _ in chosen:
-            pr = partition_predicate(key, fields)
-            (preds.append(f"({pr})") if pr else unsupported.append(key))
+            pr = partition_predicate(key, fields, widened)
+            if pr is None:
+                unsupported.append(key)
+            elif f"({pr})" not in preds:              # widened keys can collapse to one
+                preds.append(f"({pr})")
         syms = sorted(set().union(*(v["symptoms"] for _, v in chosen)))
         if "SCATTERED_SMALL_FILES" in names:
             syms.append("SCATTERED_SMALL_FILES")
@@ -178,13 +193,16 @@ def plan_table(table, findings, tm, cfg):
             note.append(f"{len(skipped)} more flagged partitions left for the next run (budget {budget})")
         if unsupported:
             note.append(f"{len(unsupported)} partitions skipped: transform can't be scoped by a range")
+        if widened:
+            note.append(f"scope widened over {', '.join(sorted(widened))} (bucket/truncate can't be a range)")
         if preds:
-            where = " OR ".join(preds)
+            where = "" if "(TRUE)" in preds else \
+                f"where => \"{_sql_str(' OR '.join(preds))}\", "   # TRUE: whole table, no where
             opt_sql = ", ".join(f"'{k}', '{v}'" for k, v in opts.items())
             steps.append({
                 "kind": "rewrite_data_files", "auto": True, "symptoms": syms,
                 "statement": (f"CALL glue.system.rewrite_data_files(table => '{ident}', "
-                              f"strategy => 'binpack', where => \"{_sql_str(where)}\", "
+                              f"strategy => 'binpack', {where}"
                               f"options => map({opt_sql}))"),
                 "note": "; ".join(note) or f"{len(chosen)} partitions, ~{files_in_scope} files"})
 

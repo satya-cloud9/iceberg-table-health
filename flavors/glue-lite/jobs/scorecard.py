@@ -55,6 +55,10 @@ def _check(exp, hits, newest):
         problems.append(f"{name} on {vals}, expected only the newest partition {newest}")
     if exp.get("not_newest") and newest in vals:
         problems.append(f"{name} on the newest partition {newest}")
+    if "prefix" in exp:
+        off = [v for v in vals if not v.startswith(exp["prefix"])]
+        if off:
+            problems.append(f"{name} on partitions not starting with {exp['prefix']!r}: {off}")
     if "min_value" in exp:
         low = [v for v in vals if v < exp["min_value"]]
         if low:

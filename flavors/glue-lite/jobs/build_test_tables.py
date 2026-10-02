@@ -14,12 +14,24 @@ this schema make 1 MB, so a "healthy day" of 100,000 rows is one ~3.8 MB file.
   s4_manifest_bloat    60 commits, manifest merging off          -> MANIFEST_BLOAT
   s5_skewed_partition  one day ~30x the others                   -> PARTITION_SKEW
   s6_over_partitioned  hours() on low volume: 720 tiny partitions -> OVER_PARTITIONED
+  s7_unpartitioned     no partition spec, 40 small appends       -> SMALL_FILES, SNAPSHOT_BUILDUP
+  s8_identity_bucket   region + bucket(8, customer_id); eu fragmented -> SMALL_FILES (8 buckets)
+  s9_hourly_small      hours(), 2 fragmented hours of 48         -> SMALL_FILES
+  s10_equality_deletes unpartitioned v2 + 10 equality-delete commits -> DELETE_BUILDUP
+  s11_string_keys      identity on awkward strings ("o'neil", "a/b") -> SMALL_FILES
 
 s3 is always built last: it ages its past day beyond the hot window, then
 writes "today", so a scan started right after sees exactly one hot partition.
+Without s3 in the run, the builder waits out the hot window at the end so
+the new tables aren't scanned as hot.
+
+These s7-s11 cover structures plan.py and the probes had not met on real
+data: no partition spec, bucket transforms, hour partitions, equality deletes
+(written through Iceberg's Java API; Spark itself only writes position
+deletes) and string partition values that need quoting.
 
 Usage (via scripts/run-job.sh py build_test_tables.py ...):
-  build_test_tables.py [--only s0,s4] [--hot-minutes 3]
+  build_test_tables.py [--only s0,s4] [--hot-minutes 3] [--no-settle]
 """
 import argparse
 import math
@@ -70,14 +82,16 @@ class Builder:
         self.next_id += n
         return start
 
-    def create(self, table, partition_expr, props):
+    def create(self, table, partition_expr, props, extra_cols=""):
         all_props = {**LOAD_PROPS, **props}
         tblprops = ", ".join(f"'{k}' = '{v}'" for k, v in all_props.items())
+        cols = SCHEMA_SQL + (f", {extra_cols}" if extra_cols else "")
+        part = f"PARTITIONED BY ({partition_expr})" if partition_expr else ""
         self.spark.sql(f"DROP TABLE IF EXISTS {table} PURGE")
         self.spark.sql(f"""
-            CREATE TABLE {table} ({SCHEMA_SQL})
+            CREATE TABLE {table} ({cols})
             USING iceberg
-            PARTITIONED BY ({partition_expr})
+            {part}
             TBLPROPERTIES ({tblprops})
         """)
 
@@ -193,6 +207,97 @@ def s6_over_partitioned(b, args):
     return t
 
 
+def s7_unpartitioned(b, args):
+    t = f"{NS}.s7_unpartitioned"
+    b.create(t, "", {})
+    b.day(t, date(2026, 9, 1), 100_000)                    # one healthy file
+    for _ in range(40):                                    # 40 small appends
+        b.day(t, date(2026, 9, 2), 500)
+    b.finish(t)
+    return t
+
+
+def _regional(b, rows, region, start_epoch, span):
+    return events(b.spark, b.take(rows), rows, start_epoch, span).withColumn("region", F.lit(region))
+
+
+def s8_identity_bucket(b, args):
+    t = f"{NS}.s8_identity_bucket"
+    b.create(t, "region, bucket(8, customer_id)", {}, extra_cols="region STRING")
+    start = epoch(date(2026, 9, 1))
+    base = _regional(b, 40_000, "us", start, 86400).unionAll(_regional(b, 40_000, "apac", start, 86400))
+    base.coalesce(1).writeTo(t).append()                   # us, apac: one file per bucket
+    for _ in range(20):                                    # eu: each commit adds a file to all 8 buckets
+        _regional(b, 400, "eu", start, 86400).coalesce(1).writeTo(t).append()
+    b.finish(t)
+    return t
+
+
+def s9_hourly_small(b, args):
+    t = f"{NS}.s9_hourly_small"
+    b.create(t, "hours(occurred_at)", {})
+    start = epoch(date(2026, 9, 1))
+    events(b.spark, b.take(48 * 500), 48 * 500, start, 48 * 3600).coalesce(1).writeTo(t).append()
+    for h in (10, 30):                                     # two hours get 14 commits x 2 files
+        for _ in range(14):
+            events(b.spark, b.take(400), 400, start + h * 3600, 3600).repartition(2).writeTo(t).append()
+    b.finish(t)
+    return t
+
+
+def s10_equality_deletes(b, args):
+    t = f"{NS}.s10_equality_deletes"
+    b.create(t, "", {"format-version": "2"})
+    b.day(t, date(2026, 9, 1), 100_000)
+    try:
+        for k in range(10):                                # 10 commits, each deleting customer_id = k
+            write_equality_delete(b.spark, t, "customer_id", k)
+    except Exception as e:                                 # report and carry on with the other tables
+        print(f"  s10: could not write equality deletes ({type(e).__name__}: {e}); "
+              f"the table has none, so its scorecard check will fail", flush=True)
+    b.finish(t)
+    return t
+
+
+def write_equality_delete(spark, table, column, value):
+    """Commit one equality-delete file (column = value) through Iceberg's Java API.
+    Spark's DELETE writes position deletes only; Flink upserts write these."""
+    jvm, gw = spark._jvm, spark.sparkContext._gateway
+    jt = jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark._jsparkSession, table)
+    schema = jt.schema()
+    ids = gw.new_array(jvm.int, 1)
+    ids[0] = schema.findField(column).fieldId()
+    eq_schema = schema.select([column])
+    factory = jvm.org.apache.iceberg.data.GenericAppenderFactory(schema, jt.spec(), ids, eq_schema, None)
+    path = jt.locationProvider().newDataLocation(f"eq-delete-{column}-{value}-{int(time.time() * 1000)}.parquet")
+    out = jvm.org.apache.iceberg.encryption.EncryptedFiles.plainAsEncryptedOutput(jt.io().newOutputFile(path))
+    writer = factory.newEqDeleteWriter(out, jvm.org.apache.iceberg.FileFormat.PARQUET, None)
+    rec = jvm.org.apache.iceberg.data.GenericRecord.create(eq_schema)
+    rec.setField(column, value)
+    writer.write(rec)
+    writer.close()
+    jt.newRowDelta().addDeletes(writer.toDeleteFile()).commit()
+
+
+STRING_KEYS = ["north america", "o'neil", "a/b", "x=y"]
+
+
+def s11_string_keys(b, args):
+    t = f"{NS}.s11_string_keys"
+    b.create(t, "region", {}, extra_cols="region STRING")
+    start = epoch(date(2026, 9, 1))
+    base = None
+    for r in STRING_KEYS:                                  # one healthy file per key
+        df = _regional(b, 20_000, r, start, 86400)
+        base = df if base is None else base.unionAll(df)
+    base.coalesce(1).writeTo(t).append()
+    for r in ("o'neil", "a/b"):                            # two keys get 12 small appends
+        for _ in range(12):
+            _regional(b, 300, r, start, 86400).coalesce(1).writeTo(t).append()
+    b.finish(t)
+    return t
+
+
 def s3_hot_partition(b, args):
     t = f"{NS}.s3_hot_partition"
     b.create(t, "days(occurred_at)", {})
@@ -215,6 +320,11 @@ BUILDERS = {
     "s4": s4_manifest_bloat,
     "s5": s5_skewed_partition,
     "s6": s6_over_partitioned,
+    "s7": s7_unpartitioned,
+    "s8": s8_identity_bucket,
+    "s9": s9_hourly_small,
+    "s10": s10_equality_deletes,
+    "s11": s11_string_keys,
     "s3": s3_hot_partition,      # keep last
 }
 
@@ -224,6 +334,8 @@ def main():
     p.add_argument("--only", default="", help="comma-separated scenario ids, e.g. s0,s4")
     p.add_argument("--hot-minutes", type=int, default=3,
                    help="hot window the scan will use; s3 ages its past day beyond it")
+    p.add_argument("--no-settle", action="store_true",
+                   help="without s3 in the run, don't wait out the hot window at the end")
     args = p.parse_args()
 
     wanted = [s.strip() for s in args.only.split(",") if s.strip()] or list(BUILDERS)
@@ -244,6 +356,11 @@ def main():
                    round(sum(total_data_file_size_in_bytes) / 1048576, 1) AS data_mb
             FROM {table}.partitions
         """).show(truncate=False)
+    if "s3" not in wanted and not args.no_settle:
+        wait = args.hot_minutes * 60 + 30
+        print(f"=== waiting {wait}s so the new tables are past the {args.hot_minutes}-min hot window ===",
+              flush=True)
+        time.sleep(wait)
     spark.stop()
 
 

@@ -19,7 +19,7 @@ import json
 import math
 import re
 
-RULE_VERSION = "2.5e-1"
+RULE_VERSION = "2.5e-2"
 
 # symptom -> (category, level, action, remedy)
 CATALOG = {
@@ -129,10 +129,16 @@ def partition_findings(table, rows, th, hot_minutes):
         hot = minutes is not None and minutes < hot_minutes
 
         small = excess >= min_excess
-        deletes = del_files >= th["delete_min_files"] and del_ratio >= th["delete_ratio"]
+        eq_files = _num(r.get("delete_files_eq"))
+        # Position deletes: judged by the share of rows deleted. Equality
+        # deletes: one record can delete many rows and every eq-delete file is
+        # checked against every older data file on read, so their count matters.
+        pos_deletes = del_files >= th["delete_min_files"] and del_ratio >= th["delete_ratio"]
+        eq_deletes = eq_files >= th.get("eq_delete_min_files", 5)
+        deletes = pos_deletes or eq_deletes
         ev = {"data_files": data_files, "excess_files": excess,
               "small_files": _num(r.get("small_files")), "ideal_files": _num(r.get("ideal_files")),
-              "delete_files": del_files, "delete_ratio": round(del_ratio, 4),
+              "delete_files": del_files, "delete_files_eq": eq_files, "delete_ratio": round(del_ratio, 4),
               "minutes_since_update": None if minutes is None else round(minutes, 1)}
 
         if (small or deletes) and hot:
@@ -143,7 +149,9 @@ def partition_findings(table, rows, th, hot_minutes):
         if small:
             out.append(_finding(table, "SMALL_FILES", excess / min_excess, ev, key))
         if deletes:
-            out.append(_finding(table, "DELETE_BUILDUP", del_ratio / th["delete_ratio"], ev, key))
+            out.append(_finding(table, "DELETE_BUILDUP",
+                                max(del_ratio / th["delete_ratio"],
+                                    eq_files / th.get("eq_delete_min_files", 5)), ev, key))
         if _num(r.get("oversized_files")) >= th["min_oversized_files"]:
             out.append(_finding(table, "OVERSIZED_FILES",
                                 _num(r.get("oversized_files")) / th["min_oversized_files"], ev, key))

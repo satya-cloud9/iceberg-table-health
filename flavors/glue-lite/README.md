@@ -368,3 +368,39 @@ s3's `after` block uses `optional` expectations: `HOT_PARTITION` or
 `SMALL_FILES` may appear, but only on today; anything on the past day, or
 `SNAPSHOT_BUILDUP`, fails. All three states (still hot, cooled, compacted by
 a second run) pass.
+
+## GL2.5f — Shapes not yet tested (s7–s11)
+
+Tables for structures the probes and plan.py hadn't met on real data, so
+"generic in code" becomes "proven generic" through the same scorecard.
+
+| Table | Shape | Before | What the fix proves |
+|---|---|---|---|
+| `s7_unpartitioned` | no partition spec, 40 small appends | `SMALL_FILES`, `SNAPSHOT_BUILDUP` | whole-table rewrite with no `where` |
+| `s8_identity_bucket` | `region, bucket(8, customer_id)`; each eu commit writes to all 8 buckets | `SMALL_FILES` x8 on `eu/*` (`SCATTERED_SMALL_FILES` allowed) | bucket can't be a range: scope widens to `region = 'eu'` |
+| `s9_hourly_small` | `hours()`, 2 of 48 hours fragmented | `SMALL_FILES` x2 | hour partition values turned into the right time ranges |
+| `s10_equality_deletes` | unpartitioned v2, 10 equality-delete commits (via Iceberg's Java API) | `DELETE_BUILDUP` | eq deletes applied, eq-delete files dropped |
+| `s11_string_keys` | identity on `north america`, `o'neil`, `a/b`, `x=y` | `SMALL_FILES` on `a/b`, `o'neil` | quoting in the `where` |
+
+Engine changes:
+- `DELETE_BUILDUP` also fires on equality-delete files (>= 5 per partition).
+  Their record count says nothing about rows deleted, and each one is checked
+  against every older data file on read, so the file count is what matters.
+- plan.py: a field that can't be a range (bucket, truncate) is dropped from
+  the scope instead of skipping the partition; the note says the scope was
+  widened. The rewrite still only picks small files. Unpartitioned tables get
+  no `where` at all.
+- Scorecard: `prefix` selector (multi-field partition values are joined with `/`).
+
+```bash
+make gl-image
+make gl-test-tables TT_ARGS="--only s7,s8,s9,s10,s11"   # waits out the hot window at the end
+make gl-scan                                            # s7-s11 PASS (before)
+make gl-plan T=s7,s8,s9,s10,s11                         # check the statements
+make gl-plan T=s7,s8,s9,s10,s11 APPLY=1
+make gl-scan                                            # s7-s11 PASS (after fix)
+```
+
+s10's equality deletes go through `GenericAppenderFactory` over py4j. If that
+class isn't in the image, the builder says so and s10's scorecard check fails
+instead of the whole build.
