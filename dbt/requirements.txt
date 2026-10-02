@@ -1,0 +1,2 @@
+dbt-core>=1.8,<2
+dbt-trino>=1.8,<2
