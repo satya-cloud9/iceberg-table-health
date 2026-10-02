@@ -1,5 +1,5 @@
 {
-  "_comment": "GL2.5d/e expectation matrix: what the symptom engine must find on each scenario table. Any active symptom not listed under 'expect' or 'allow' is unexpected. Findings held for workload evidence (needs-evidence) are ignored. Partition selectors: 'partitions' (exact set of partition values), 'newest' (only the table's newest partition), 'not_newest', 'min_value' (every flagged partition >= this value), 'count', 'min_count'. 'fresh' marks a table whose check is only valid while its newest partition is younger than the hot window; past that the result is STALE, not FAIL. 'after' (optional): expectations once plan.py has applied fixes to the table (matched by table UUID, so a rebuild resets it to 'before'); an empty expect list means healthy.",
+  "_comment": "GL2.5d/e expectation matrix: what the symptom engine must find on each scenario table. Any active symptom not listed under 'expect' or 'allow' is unexpected. Findings held for workload evidence (needs-evidence) are ignored. Partition selectors: 'partitions' (exact set of partition values), 'newest' (only the table's newest partition), 'not_newest', 'min_value' (every flagged partition >= this value), 'count', 'min_count'; 'optional': true = allowed but not required (selectors still apply when it appears). 'fresh' marks a table whose check is only valid while its newest partition is younger than the hot window; past that the result is STALE, not FAIL. 'after' (optional): expectations once plan.py has applied fixes to the table (matched by table UUID, so a rebuild resets it to 'before'); an empty expect list means healthy.",
   "tables": {
     "glue.demo.s0_small_appends": {
       "expect": [
@@ -36,7 +36,14 @@
         {"symptom": "HOT_PARTITION", "newest": true},
         {"symptom": "SMALL_FILES", "count": 1, "not_newest": true},
         {"symptom": "SNAPSHOT_BUILDUP"}
-      ]
+      ],
+      "after": {
+        "_comment": "past day compacted, snapshots expired, today held while hot. Today may still be hot (HOT_PARTITION), cooled but not yet compacted (SMALL_FILES, next run's work), or compacted by a second run (healthy). Anything on the past day, or SNAPSHOT_BUILDUP, fails.",
+        "expect": [
+          {"symptom": "HOT_PARTITION", "newest": true, "optional": true},
+          {"symptom": "SMALL_FILES", "newest": true, "optional": true}
+        ]
+      }
     },
     "glue.demo.s4_manifest_bloat": {
       "expect": [

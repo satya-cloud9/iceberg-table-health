@@ -46,7 +46,7 @@ def _check(exp, hits, newest):
     """Problems with one expected symptom, given its findings (partition values)."""
     name = exp["symptom"]
     if not hits:
-        return [f"{name} not found"]
+        return [] if exp.get("optional") else [f"{name} not found"]
     vals = sorted(v for v in hits if v is not None)
     problems = []
     if "partitions" in exp and vals != sorted(exp["partitions"]):

@@ -349,3 +349,22 @@ make gl-scan                    # s2 still DELETE_BUILDUPx7 (after fix)
 make gl-plan T=s2 APPLY=1       # rewrite + rewrite_position_delete_files
 make gl-scan                    # s2 should PASS (after fix), not HOT_PARTITION
 ```
+
+### S3 end to end
+
+```bash
+make gl-image
+make gl-scan FRESH_S3=1         # rebuild s3, scan straight after: s3 PASS (before)
+make gl-plan T=s3 APPLY=1       # compacts the past day, holds today, expires snapshots
+make gl-scan                    # s3 PASS (after fix): today HOT_PARTITION or SMALL_FILES
+make gl-plan T=s3 APPLY=1       # once today has cooled: compacts today
+make gl-scan                    # s3 PASS (after fix): healthy
+```
+
+`plan.py` acts on the scan's findings, not on the clock: if today was hot when
+scanned, it is held even if it has cooled by the time the plan runs.
+
+s3's `after` block uses `optional` expectations: `HOT_PARTITION` or
+`SMALL_FILES` may appear, but only on today; anything on the past day, or
+`SNAPSHOT_BUILDUP`, fails. All three states (still hot, cooled, compacted by
+a second run) pass.
