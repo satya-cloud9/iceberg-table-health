@@ -236,6 +236,33 @@ def plan_table(table, findings, tm, cfg):
     return steps
 
 
+DANGLING = "'remove-dangling-deletes', 'true'"
+
+
+def _ident(table):
+    return table.split(".", 1)[1] if table.startswith("glue.") else table
+
+
+def _unsupported_option(error):
+    e = error.lower()
+    return "remove-dangling-deletes" in e or "cannot use options" in e or "not supported" in e
+
+
+def strip_dangling_option(stmt):
+    return stmt.replace(", " + DANGLING, "").replace(DANGLING + ", ", "")
+
+
+def run_sql(spark, stmt):
+    """-> (status, result_json_or_error, seconds)."""
+    t0 = time.perf_counter()
+    try:
+        rows = [r.asDict() for r in spark.sql(stmt).collect()]
+        status, result = "ok", json.dumps(rows, default=str)
+    except Exception as e:  # record and carry on with the next step
+        status, result = "failed", f"{type(e).__name__}: {e}"[:2000]
+    return status, result, round(time.perf_counter() - t0, 2)
+
+
 def match_tables(all_tables, wanted):
     """'s0' matches glue.demo.s0_small_appends; full or short names also work."""
     if not wanted:
@@ -299,16 +326,20 @@ def main():
                 continue
             now = datetime.now(timezone.utc)
             stmt = s["statement"].replace("{now}", f"TIMESTAMP '{now.strftime('%Y-%m-%d %H:%M:%S')}'")
-            t0 = time.perf_counter()
-            try:
-                rows = [r.asDict() for r in spark.sql(stmt).collect()]
-                status, result = "ok", json.dumps(rows, default=str)
-            except Exception as e:  # record and continue with the next table
-                status, result = "failed", f"{type(e).__name__}: {e}"[:2000]
-            dur = round(time.perf_counter() - t0, 2)
+            status, result, dur = run_sql(spark, stmt)
             print(f"  -> {s['kind']}: {status} in {dur}s  {result[:300]}", flush=True)
             records.append((run_id, scan_id, now, t, uuid, s["kind"], ",".join(s["symptoms"]),
                             stmt, status, float(dur), result))
+            if status == "failed" and DANGLING in stmt and _unsupported_option(result):
+                # Older Iceberg: retry without the option, then clean up dangling
+                # position deletes with the dedicated procedure.
+                for kind, retry in ((s["kind"], strip_dangling_option(stmt)),
+                                    ("rewrite_position_delete_files",
+                                     f"CALL glue.system.rewrite_position_delete_files(table => '{_ident(t)}')")):
+                    status, result, dur = run_sql(spark, retry)
+                    print(f"  -> {kind} (fallback): {status} in {dur}s  {result[:300]}", flush=True)
+                    records.append((run_id, scan_id, datetime.now(timezone.utc), t, uuid, kind,
+                                    ",".join(s["symptoms"]), retry, status, float(dur), result))
     if a.apply and records:
         spark.createDataFrame(records, schema).writeTo(f"{ns}.actions").append()
         print(f"\nRecorded {len(records)} actions in {ns}.actions under {run_id}. "

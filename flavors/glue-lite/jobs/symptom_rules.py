@@ -19,7 +19,7 @@ import json
 import math
 import re
 
-RULE_VERSION = "2.5c-1"
+RULE_VERSION = "2.5e-1"
 
 # symptom -> (category, level, action, remedy)
 CATALOG = {
@@ -156,15 +156,17 @@ def table_findings(table, tm, rows, th, cfg):
     target = _num(tm.get("target_file_bytes"), 1) or 1
     parts = _num(tm.get("partitions"))
 
-    # SCATTERED_SMALL_FILES: many partitions each a little fragmented, and the
-    # writer touches several partitions per commit (late-arrival fingerprint).
-    with_excess = _num(tm.get("partitions_with_excess"))
+    # SCATTERED_SMALL_FILES: many partitions fragmented enough to compact, and
+    # the writer touches several partitions per commit (late-arrival
+    # fingerprint). Counts only partitions SMALL_FILES would flag, so the
+    # finding clears once the planner has worked through them.
+    with_excess = sum(1 for r in rows if _num(r.get("excess_files")) >= th["min_excess_files"])
     share = with_excess / parts if parts else 0.0
     avg_parts = _num(tm.get("avg_changed_partitions_per_commit"))
     if (with_excess >= th["scattered_min_partitions"] and share >= th["scattered_partition_share"]
             and avg_parts >= th["scattered_avg_changed_partitions"]):
         out.append(_finding(table, "SCATTERED_SMALL_FILES", share / th["scattered_partition_share"],
-                            {"partitions_with_excess": with_excess, "partitions": parts,
+                            {"partitions_to_compact": with_excess, "partitions": parts,
                              "share": round(share, 3), "avg_changed_partitions_per_commit": avg_parts}))
 
     # SNAPSHOT_BUILDUP: too many, or too old, snapshots kept.

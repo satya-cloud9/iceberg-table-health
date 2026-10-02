@@ -194,7 +194,7 @@ make gl-symptoms    # rules over the latest scan -> glue.ops.symptoms
 | `HOT_PARTITION` | partition | would be `SMALL_FILES`/`DELETE_BUILDUP`, but written < 3 min ago | defer |
 | `DELETE_BUILDUP` | partition | delete records / data records >= 5% (ratio, not count: Iceberg keeps ~1 position-delete file per data file) | auto |
 | `OVERSIZED_FILES` | partition | any file > 180% of target | auto |
-| `SCATTERED_SMALL_FILES` | table | >= 3 and >= 30% of partitions have excess files, and commits touch >= 3 partitions on average | auto |
+| `SCATTERED_SMALL_FILES` | table | >= 3 and >= 30% of partitions have >= 4 excess files (the ones `SMALL_FILES` flags, so it clears once they're compacted), and commits touch >= 3 partitions on average | auto |
 | `SNAPSHOT_BUILDUP` | table | > 30 snapshots or oldest > 120 h | auto |
 | `MANIFEST_BLOAT` | table | merging on: >= `commit.manifest.min-count-to-merge` (100); merging off: >= 20 manifests; and avg manifest < 8 MB | auto |
 | `UNBOUNDED_RETENTION` | table | metadata versions > `previous-versions-max` (100) with no auto-delete | approval |
@@ -299,3 +299,29 @@ else the default, and records which (`target_source` in `table_metrics`).
 **Planning time.** The benchmark also times Iceberg's `planFiles()` for each
 day (median of the runs, after a warm-up) and records the files it planned
 (`plan_median_ms`, `planned_files` in `read_benchmarks`).
+
+### S1, S2, S4 and the benchmark
+
+```bash
+make gl-plan T=s1,s2,s4            # dry run
+make gl-plan T=s1,s2,s4 APPLY=1
+make gl-scan                       # s1, s2, s4 scored against their 'after' blocks
+make gl-bench BENCH_LABEL=before BENCH_ARGS="--table glue.demo.s4_manifest_bloat --days all"   # before APPLY
+make gl-bench BENCH_LABEL=after  BENCH_ARGS="--table glue.demo.s4_manifest_bloat --days all"   # after APPLY
+```
+
+- **s1**: one run compacts the top 10 of 11 flagged days; `after` expects one
+  `SMALL_FILES` left (the next run's work) and no `SCATTERED_SMALL_FILES`.
+- **s2**: binpack with `delete-file-threshold=1` and `remove-dangling-deletes`.
+  If this Iceberg rejects the option, plan.py retries without it and then runs
+  `rewrite_position_delete_files`; both attempts are recorded in
+  `glue.ops.actions`. `after` expects no `DELETE_BUILDUP`.
+- **s4**: `rewrite_manifests` + `expire_snapshots`; `after` expects healthy.
+  Re-enabling manifest merging is printed for approval.
+
+Benchmark changes: Spark's INFO logging is off (output is just the results);
+timed runs are interleaved in a shuffled order after a warm-up pass, so no day
+always goes first; `--days all` benchmarks the whole table with no filter
+(planning then reads every manifest, which is what s4 is about); after a
+non-`before` run, a before/after table is printed against the latest `before`
+run of the same table.
