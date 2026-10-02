@@ -31,6 +31,7 @@ prometheus:
     serviceMonitorSelectorNilUsesHelmValues: false
     podMonitorSelectorNilUsesHelmValues: false
 
+
 grafana:
   enabled: true
   adminPassword: admin   # local-only demo credential — change before exposing this anywhere
@@ -78,6 +79,9 @@ kubeStateMetrics:
 nodeExporter:
   enabled: true
 
+prometheus-node-exporter:
+  hostRootFsMount:
+    enabled: false
 # Trino and Kestra don't get scraped automatically — add ServiceMonitors
 # for them once you confirm what each exposes:
 #   - Trino: JMX metrics need the jmx_exporter javaagent (not wired up in
