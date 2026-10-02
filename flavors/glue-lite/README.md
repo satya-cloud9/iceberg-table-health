@@ -132,3 +132,45 @@ files. One warm-up, then 5 timed runs; the median is recorded.
 Pass: fragmented days drop from ~300 files to 1, `still_flagged` false, and
 the report shows the fragmented days' read times falling toward the healthy
 day's.
+
+## GL2.5a/b — Test tables and metric inventory
+
+Detection comes first, as a catalog-wide scan: a fixed set of metrics measures
+every table the same way, without knowing which scenario built it.
+
+```bash
+make gl-image          # jobs/ changed
+make gl-test-tables    # S0-S6 in glue.demo, rebuilt from scratch (~10 min)
+make gl-metrics        # metric inventory over every table in glue.demo
+```
+
+**Test scale.** `jobs/config/health.json` sets the target file size to 8 MB
+(64x below Iceberg's 512 MB default) so small tables show real symptoms. A
+healthy day of 100,000 rows is one ~3.8 MB file.
+
+| Table | Built as | Intended symptom |
+|---|---|---|
+| `s0_small_appends` | 7 days; 09-03 and 09-05 get 20 commits x 10 files | `SMALL_FILES` |
+| `s1_late_arrivals` | 30 days, then 20 runs adding a small file to recent days (decaying, seed 42) | `SCATTERED_SMALL_FILES` |
+| `s2_mor_deletes` | 7 days, then 10 merge-on-read `DELETE`s (1% of rows each) | `DELETE_BUILDUP` |
+| `s3_hot_partition` | fragmented past day, wait out the hot window, then fragment today | `SMALL_FILES` + `HOT_PARTITION` |
+| `s4_manifest_bloat` | 60 commits of one healthy day each, manifest merging off | `MANIFEST_BLOAT` |
+| `s5_skewed_partition` | 29 normal days + one day with 30x the rows in 15 files | `PARTITION_SKEW` |
+| `s6_over_partitioned` | `hours()` partitioning, 30 days: 720 one-file partitions | `OVER_PARTITIONED` |
+
+`s3` is built last and waits `--hot-minutes` (default 3) + 30 s between its two
+phases, so a scan started right after sees exactly one hot partition.
+
+**Outputs.** `glue.ops.partition_metrics` (one row per partition: files,
+deletes, size percentiles, small/oversized/excess files, spec and sort-order
+coverage, minutes since update) and `glue.ops.table_metrics` (one row per
+table: read amplification, skew, undersized partitions, snapshots and commit
+pattern, manifests, metadata versions, retained bytes, clustering efficiency
+on declared filter columns, sort order, write properties). Metric IDs match
+the inventory in the roadmap.
+
+**Clustering (C1).** For each declared filter column (`filter_columns` in the
+config), per-file min/max bounds give the expected files a point lookup must
+open; efficiency 1 = files don't overlap (sorted), 0 = every file spans the
+whole range. Tested locally against mock metadata: 200 overlapping files -> 0,
+10 sorted files -> 1.

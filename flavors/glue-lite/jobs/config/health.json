@@ -1,0 +1,21 @@
+{
+  "_comment": "Table Health Advisor settings. 'defaults' apply to every table; 'tables' overrides per table. Test scale: target file size is 8 MB (64x below Iceberg's 512 MB default) so small test tables show real symptoms.",
+  "defaults": {
+    "target_file_bytes": 8388608,
+    "small_file_ratio": 0.75,
+    "oversized_file_ratio": 1.8,
+    "undersized_partition_ratio": 0.10,
+    "hot_partition_minutes": 15,
+    "recent_commits": 50,
+    "filter_columns": []
+  },
+  "tables": {
+    "glue.demo.s0_small_appends":     { "filter_columns": ["customer_id"] },
+    "glue.demo.s1_late_arrivals":     { "filter_columns": ["customer_id"] },
+    "glue.demo.s2_mor_deletes":       { "filter_columns": ["customer_id"] },
+    "glue.demo.s3_hot_partition":     { "filter_columns": ["customer_id"] },
+    "glue.demo.s4_manifest_bloat":    { "filter_columns": ["customer_id"] },
+    "glue.demo.s5_skewed_partition":  { "filter_columns": ["customer_id"] },
+    "glue.demo.s6_over_partitioned":  { "filter_columns": ["customer_id"] }
+  }
+}
