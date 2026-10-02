@@ -93,12 +93,14 @@ def main():
 
         per_commit = max(1, a.rows_per_day // a.commits)
         print(f"{day}: fragmented -> {a.commits} commits x {a.files_per_commit} files, "
-              f"{per_commit} rows per commit", flush=True)
+              f"~{per_commit} rows per commit", flush=True)
         for c in range(a.commits):
-            (day_rows(spark, day, next_id, per_commit)
+            # Last commit takes the remainder so every day totals rows_per_day.
+            n = per_commit if c < a.commits - 1 else a.rows_per_day - per_commit * (a.commits - 1)
+            (day_rows(spark, day, next_id, n)
              .repartition(a.files_per_commit)
              .writeTo(a.table).append())
-            next_id += per_commit
+            next_id += n
             if (c + 1) % 10 == 0:
                 print(f"  {day}: {c + 1}/{a.commits} commits", flush=True)
 

@@ -58,7 +58,8 @@ up: preflight install emulator-up provider-apply platform-apply tenant-apply flo
 # --- Glue-Lite flavor (flavors/glue-lite) --------------------------------
 # Kestra, Spark Operator, Glue, S3, Iceberg on the emulated EKS cluster --
 # no platform/tenant layers. Tear down with `make destroy` as usual.
-.PHONY: gl-spike gl-cluster gl-spark-operator gl-image gl-smoke gl-up gl-generate
+.PHONY: gl-spike gl-cluster gl-spark-operator gl-image gl-smoke gl-up gl-generate \
+        gl-health gl-bench gl-compact gl-report gl-demo
 
 gl-spike:
 	bash flavors/glue-lite/spike/run-glue-spike.sh
@@ -81,3 +82,33 @@ gl-up: gl-cluster gl-spark-operator gl-image gl-smoke
 GEN_ARGS ?= --recreate
 gl-generate:
 	bash flavors/glue-lite/scripts/run-job.sh py generate_small_files.py $(GEN_ARGS)
+
+# GL2: measure, compact, benchmark, report.
+#   make gl-health                       per-partition health -> glue.ops.table_health
+#   make gl-bench BENCH_LABEL=before     read timings -> glue.ops.read_benchmarks
+#   make gl-compact                      rewrite_data_files on COMPACT_ARGS days
+#   make gl-report                       before/after tables from glue.ops.*
+#   make gl-demo                         all of the above, in order
+HEALTH_ARGS ?=
+COMPACT_ARGS ?= --days 2026-09-03,2026-09-05 --maintenance
+BENCH_LABEL ?= before
+BENCH_ARGS ?=
+gl-health:
+	bash flavors/glue-lite/scripts/run-job.sh py table_health.py $(HEALTH_ARGS)
+
+gl-bench:
+	bash flavors/glue-lite/scripts/run-job.sh py read_benchmark.py --label $(BENCH_LABEL) $(BENCH_ARGS)
+
+gl-compact:
+	bash flavors/glue-lite/scripts/run-job.sh py compact.py $(COMPACT_ARGS)
+
+gl-report:
+	bash flavors/glue-lite/scripts/run-job.sh sql report
+
+gl-demo:
+	$(MAKE) gl-health
+	$(MAKE) gl-bench BENCH_LABEL=before
+	$(MAKE) gl-compact
+	$(MAKE) gl-health
+	$(MAKE) gl-bench BENCH_LABEL=after
+	$(MAKE) gl-report

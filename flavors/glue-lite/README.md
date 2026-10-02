@@ -53,8 +53,13 @@ and 3 partitions for `glue.demo.smoke_events`.
 |---|---|
 | `docker/spark.Dockerfile` | `apache/spark:3.5.6` + Iceberg runtime and AWS bundle 1.10.0 + `jobs/` |
 | `jobs/run_sql.py` | runs every statement in one SQL file and prints results |
-| `jobs/sql/*.sql` | SQL jobs (`smoke.sql`; metrics and compaction next) |
+| `jobs/sql/*.sql` | SQL jobs (`smoke.sql`, `report.sql`) |
 | `jobs/generate_small_files.py` | GL1 generator: healthy vs fragmented day partitions |
+| `jobs/gl_common.py` | shared helpers: ops tables, per-partition health query |
+| `jobs/table_health.py` | GL2 metrics -> `glue.ops.table_health` |
+| `jobs/compact.py` | GL2 `rewrite_data_files` per partition -> `glue.ops.compaction_runs` |
+| `jobs/read_benchmark.py` | GL2 read timings -> `glue.ops.read_benchmarks` |
+| `jobs/sql/report.sql` | before/after report over the three ops tables |
 | `k8s/sparkapp.tmpl.yaml` | the one SparkApplication template every job renders |
 | `k8s/spark-jobs.yaml` | job namespace + ResourceQuota |
 | `helm/spark-operator-values.yaml` | operator watches `spark-jobs`, creates the `spark` service account |
@@ -86,3 +91,44 @@ fragmented day, with a much smaller `avg_file_kb` on the fragmented days.
 Options (`GEN_ARGS`): `--table`, `--start`, `--days`, `--rows-per-day`,
 `--fragmented 2026-09-03,2026-09-05`, `--commits`, `--files-per-commit`,
 `--recreate`.
+
+**Result (2026-10-02):** healthy days 1 file of ~7.6 MB; fragmented days 300
+files of ~30 KB; 65 snapshots.
+
+## GL2 — Measure, compact, benchmark
+
+```bash
+make gl-image   # jobs/ changed
+make gl-demo    # health -> bench before -> compact -> health -> bench after -> report
+```
+
+Or step by step: `make gl-health`, `make gl-bench BENCH_LABEL=before`,
+`make gl-compact`, `make gl-health`, `make gl-bench BENCH_LABEL=after`,
+`make gl-report`. Each step is its own SparkApplication (~1 min of pod
+start-up each).
+
+**How "needs compaction" is decided** (`gl_common.partition_health`):
+
+| Column | Meaning |
+|---|---|
+| `ideal_files` | target-sized files the partition's data needs (min 1) |
+| `excess_files` | `data_files - ideal_files`: files compaction would remove |
+| `small_files` | data files under 75% of target (Iceberg's own `min-file-size-bytes` default) |
+| `needs_compaction` | `excess_files >= --min-excess` (default 4) |
+
+A healthy day here is one 7.6 MB file: "small" against a 128 MB target, but
+its data fits in one file, so `excess_files` is 0 and it is not flagged.
+
+**Compaction** runs one `rewrite_data_files` CALL per day with a `where`
+filter, partial progress on, then (`--maintenance`) `rewrite_manifests` and
+`expire_snapshots` keeping the last 5. Orphan-file removal is left out for
+now.
+
+**Read benchmark** compares a healthy control day (09-02) with the
+fragmented days, before and after. Queries read real column data, because a
+bare `count(*)` is answered from Iceberg file statistics without opening
+files. One warm-up, then 5 timed runs; the median is recorded.
+
+Pass: fragmented days drop from ~300 files to 1, `still_flagged` false, and
+the report shows the fragmented days' read times falling toward the healthy
+day's.
