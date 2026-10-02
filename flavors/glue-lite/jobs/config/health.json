@@ -1,13 +1,36 @@
 {
-  "_comment": "Table Health Advisor settings. 'defaults' apply to every table; 'tables' overrides per table. Test scale: target file size is 8 MB (64x below Iceberg's 512 MB default) so small test tables show real symptoms.",
+  "_comment": "Table Health Advisor settings. 'defaults' apply to every table; 'tables' overrides per table ('thresholds' merges key by key). Test scale: target file size is 8 MB (64x below Iceberg's 512 MB default) so small test tables show real symptoms. Thresholds were calibrated on the first gl-metrics run of S0-S6 (2026-10-02); production values are noted in the README.",
   "defaults": {
     "target_file_bytes": 8388608,
     "small_file_ratio": 0.75,
     "oversized_file_ratio": 1.8,
     "undersized_partition_ratio": 0.10,
-    "hot_partition_minutes": 15,
+    "hot_partition_minutes": 3,
     "recent_commits": 50,
-    "filter_columns": []
+    "filter_columns": [],
+    "filter_columns_evidence": "declared",
+    "workload_min_evidence": "observed",
+    "thresholds": {
+      "min_excess_files": 4,
+      "delete_ratio": 0.05,
+      "delete_min_files": 1,
+      "min_oversized_files": 1,
+      "scattered_min_partitions": 3,
+      "scattered_partition_share": 0.3,
+      "scattered_avg_changed_partitions": 3,
+      "max_snapshots": 30,
+      "max_snapshot_age_h": 120,
+      "manifest_merge_min_count": 100,
+      "max_manifests_no_merge": 20,
+      "small_manifest_bytes": 8388608,
+      "max_metadata_versions": 100,
+      "skew_ratio": 10,
+      "skew_min_partitions": 5,
+      "skew_min_largest_targets": 2,
+      "over_partitioned_min_partitions": 100,
+      "over_partitioned_share": 0.8,
+      "min_pruning_efficiency": 0.3
+    }
   },
   "tables": {
     "glue.demo.s0_small_appends":     { "filter_columns": ["customer_id"] },

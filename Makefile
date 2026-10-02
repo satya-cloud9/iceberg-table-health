@@ -59,7 +59,7 @@ up: preflight install emulator-up provider-apply platform-apply tenant-apply flo
 # Kestra, Spark Operator, Glue, S3, Iceberg on the emulated EKS cluster --
 # no platform/tenant layers. Tear down with `make destroy` as usual.
 .PHONY: gl-spike gl-cluster gl-spark-operator gl-image gl-smoke gl-up gl-generate \
-        gl-health gl-bench gl-compact gl-report gl-demo gl-test-tables gl-metrics
+        gl-health gl-bench gl-compact gl-report gl-demo gl-test-tables gl-metrics gl-symptoms
 
 gl-spike:
 	bash flavors/glue-lite/spike/run-glue-spike.sh
@@ -116,11 +116,16 @@ gl-demo:
 # GL2.5: test tables and metric inventory.
 #   make gl-test-tables              build S0-S6 test tables (~10 min; s3 waits out its hot window)
 #   make gl-metrics                  run the metric inventory over every table in glue.demo
+#   make gl-symptoms                 apply the symptom rules to the latest scan -> glue.ops.symptoms
 #   make gl-test-tables TT_ARGS="--only s0,s4"
 TT_ARGS ?=
 METRIC_ARGS ?=
+SYM_ARGS ?=
 gl-test-tables:
 	JOB_TIMEOUT_MIN=45 bash flavors/glue-lite/scripts/run-job.sh py build_test_tables.py $(TT_ARGS)
 
 gl-metrics:
 	bash flavors/glue-lite/scripts/run-job.sh py scan_metrics.py $(METRIC_ARGS)
+
+gl-symptoms:
+	bash flavors/glue-lite/scripts/run-job.sh py detect_symptoms.py $(SYM_ARGS)

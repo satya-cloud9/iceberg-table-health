@@ -174,3 +174,55 @@ config), per-file min/max bounds give the expected files a point lookup must
 open; efficiency 1 = files don't overlap (sorted), 0 = every file spans the
 whole range. Tested locally against mock metadata: 200 overlapping files -> 0,
 10 sorted files -> 1.
+
+## GL2.5c — Symptom engine
+
+Rules turn one scan's metrics into named findings. Every threshold lives in
+`jobs/config/health.json` under `thresholds` (per-table overrides merge key by
+key). The rules are plain Python (`jobs/symptom_rules.py`), so they are
+unit-tested without Spark.
+
+```bash
+make gl-image       # jobs/ changed
+make gl-metrics     # new scan
+make gl-symptoms    # rules over the latest scan -> glue.ops.symptoms
+```
+
+| Symptom | Level | Fires when (test thresholds) | Action |
+|---|---|---|---|
+| `SMALL_FILES` | partition | excess files >= 4 and not hot | auto |
+| `HOT_PARTITION` | partition | would be `SMALL_FILES`/`DELETE_BUILDUP`, but written < 3 min ago | defer |
+| `DELETE_BUILDUP` | partition | delete records / data records >= 5% (ratio, not count: Iceberg keeps ~1 position-delete file per data file) | auto |
+| `OVERSIZED_FILES` | partition | any file > 180% of target | auto |
+| `SCATTERED_SMALL_FILES` | table | >= 3 and >= 30% of partitions have excess files, and commits touch >= 3 partitions on average | auto |
+| `SNAPSHOT_BUILDUP` | table | > 30 snapshots or oldest > 120 h | auto |
+| `MANIFEST_BLOAT` | table | merging on: >= `commit.manifest.min-count-to-merge` (100); merging off: >= 20 manifests; and avg manifest < 8 MB | auto |
+| `UNBOUNDED_RETENTION` | table | metadata versions > `previous-versions-max` (100) with no auto-delete | approval |
+| `PARTITION_SKEW` | table | largest / median partition >= 10, >= 5 partitions, largest >= 2x target | approval |
+| `OVER_PARTITIONED` | table | >= 100 partitions and >= 80% under 10% of target | approval |
+| `MIXED_SPEC` | table | any file on an older partition spec | approval |
+| `LEGACY_FORMAT` | table | format version 1 | approval |
+| `METRICS_DISABLED` | table | a filter column has no min/max stats | approval |
+| `POOR_CLUSTERING` | column | pruning efficiency < 0.3 | needs-evidence |
+
+**Why these gates.** Calibrated on the first `gl-metrics` run:
+
+- `avg_changed_partitions_per_commit` alone can't spot late arrivals: bulk
+  loads (s5 = 15, s6 = 720) and deletes (s2 = 7) score high too. Late arrivals
+  need many partitions *with excess files* as well (s1 has ~25 of 30).
+- `OVER_PARTITIONED` needs a partition-count gate: the smoke/spike tables have
+  3 tiny partitions (undersized share 1.0) and are fine.
+- `MANIFEST_BLOAT`: with merging on, Iceberg merges by itself at 100
+  manifests, so s0/s3 (45) are not flagged; s4 has merging off, so 60 is.
+- `PARTITION_SKEW` needs the big partition to be big in absolute terms, not
+  just relative to tiny neighbours.
+
+**Workload-dependent findings wait for evidence.** `POOR_CLUSTERING` fires
+from declared `filter_columns`, but it is written with action
+`needs-evidence` until the evidence level reaches `workload_min_evidence`
+(default `observed`, which the 2.5d++ spark-log adapter will provide).
+Reports list these separately; the 2.5d scorecard ignores them.
+
+**Production values** (to revisit at GL4): target 512 MB, `max_snapshots`
+~100 with age as the main trigger, `over_partitioned_min_partitions` ~1000,
+`hot_partition_minutes` ~60.

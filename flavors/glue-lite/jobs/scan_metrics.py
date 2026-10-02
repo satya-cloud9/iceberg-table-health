@@ -69,17 +69,6 @@ def as_row(values, schema):
     return tuple(coerce(values.get(f.name), f.dataType) for f in schema)
 
 
-def load_config(path):
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
-
-
-def table_config(config, table):
-    cfg = dict(config.get("defaults", {}))
-    cfg.update(config.get("tables", {}).get(table, {}))
-    return cfg
-
-
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--namespace", default="glue.demo")
@@ -89,7 +78,7 @@ def main():
     p.add_argument("--scan-id", default=None)
     a = p.parse_args()
 
-    config = load_config(a.config)
+    config = gl.load_config(a.config)
     scan_id = a.scan_id or gl.new_run_id("scan")
     spark = SparkSession.builder.appName("gl25-scan-metrics").getOrCreate()
     spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {gl.OPS_NAMESPACE}")
@@ -109,7 +98,7 @@ def main():
     summary = []
     for name in names:
         table = f"{a.namespace}.{name}"
-        cfg = table_config(config, table)
+        cfg = gl.table_config(config, table)
         info = probes.table_info(spark, table)
         try:
             pm = probes.partition_metrics(spark, table, info, cfg)

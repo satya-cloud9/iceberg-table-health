@@ -3,6 +3,7 @@
 Everything here reads Iceberg's own metadata tables (`<table>.files`,
 `<table>.partitions`), which list files and their stats without scanning data.
 """
+import json
 import uuid
 from datetime import datetime, timezone
 
@@ -29,6 +30,22 @@ OPS_TABLES = {
         files_in_partition BIGINT, runs BIGINT,
         median_ms DOUBLE, min_ms DOUBLE, max_ms DOUBLE""",
 }
+
+
+def load_config(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def table_config(config, table):
+    """'defaults' overlaid with the table's entry; nested dicts (thresholds) merge key by key."""
+    cfg = json.loads(json.dumps(config.get("defaults", {})))
+    for k, v in config.get("tables", {}).get(table, {}).items():
+        if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+            cfg[k].update(v)
+        else:
+            cfg[k] = v
+    return cfg
 
 
 def new_run_id(prefix):
