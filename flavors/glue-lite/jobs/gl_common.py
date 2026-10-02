@@ -28,7 +28,8 @@ OPS_TABLES = {
         run_id STRING, measured_at TIMESTAMP, table_name STRING,
         label STRING, day STRING, query_name STRING,
         files_in_partition BIGINT, runs BIGINT,
-        median_ms DOUBLE, min_ms DOUBLE, max_ms DOUBLE""",
+        median_ms DOUBLE, min_ms DOUBLE, max_ms DOUBLE,
+        plan_median_ms DOUBLE, planned_files BIGINT""",
 }
 
 
@@ -46,6 +47,37 @@ def table_config(config, table):
         else:
             cfg[k] = v
     return cfg
+
+
+def resolve_target(config, table, properties):
+    """Target file size for judging a table, and where it came from.
+
+    1. a per-table entry in health.json ("config-table")
+    2. the table's own write.target-file-size-bytes ("table-property")
+    3. the health.json default ("config-default")
+    """
+    entry = config.get("tables", {}).get(table, {})
+    if "target_file_bytes" in entry:
+        return int(entry["target_file_bytes"]), "config-table"
+    prop = (properties or {}).get("write.target-file-size-bytes")
+    if prop:
+        try:
+            return int(prop), "table-property"
+        except ValueError:
+            pass
+    return int(config.get("defaults", {}).get("target_file_bytes", 536870912)), "config-default"
+
+
+def ensure_columns(spark, table, ddl):
+    """Add any DDL columns an existing ops table is missing (tables created by older versions)."""
+    have = {f.name for f in spark.table(table).schema.fields}
+    missing = []
+    for part in ddl.split(","):
+        bits = part.split()
+        if len(bits) >= 2 and bits[0] not in have:
+            missing.append(f"{bits[0]} {' '.join(bits[1:])}")
+    if missing:
+        spark.sql(f"ALTER TABLE {table} ADD COLUMNS ({', '.join(missing)})")
 
 
 def new_run_id(prefix):

@@ -38,19 +38,29 @@ def table_info(spark, table):
     """Spec, sort order and properties via the Iceberg Java API (py4j)."""
     info = {"partitioned": True, "spec": None, "spec_id": None, "sort_order": None,
             "sort_order_id": None, "sort_defined": False, "format_version": None,
-            "properties": {}, "error": None}
+            "properties": {}, "error": None, "uuid": None, "partition_fields": []}
     try:
         jt = spark._jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark._jsparkSession, table)
         spec = jt.spec()
         info["spec"] = spec.toString().replace("\n", " ")
         info["spec_id"] = spec.specId()
         info["partitioned"] = not spec.isUnpartitioned()
+        schema = jt.schema()
+        for pf in spec.fields().toArray():
+            src = pf.sourceId()
+            info["partition_fields"].append({
+                "name": str(pf.name()), "transform": str(pf.transform().toString()),
+                "source": str(schema.findColumnName(src)), "source_type": str(schema.findType(src))})
         so = jt.sortOrder()
         info["sort_order"] = so.toString().replace("\n", " ")
         info["sort_order_id"] = so.orderId()
         info["sort_defined"] = not so.isUnsorted()
         props = jt.properties()
         info["properties"] = {str(k): str(props.get(k)) for k in props.keySet().toArray()}
+        try:
+            info["uuid"] = str(jt.operations().current().uuid())
+        except Exception:
+            info["uuid"] = None
         try:
             info["format_version"] = int(jt.operations().current().formatVersion())
         except Exception:  # not every Table implementation exposes operations()
@@ -290,6 +300,9 @@ def table_metrics(spark, table, info, cfg, pm_rows):
     m["properties_json"] = json.dumps({k: props[k] for k in WATCHED_PROPS if k in props}, sort_keys=True)
     m["target_file_bytes"] = target
     m["load_error"] = info["error"]
+    m["table_uuid"] = info.get("uuid")
+    m["partition_fields_json"] = json.dumps(info.get("partition_fields") or [])
+    m["target_source"] = cfg.get("target_source")
     return m
 
 

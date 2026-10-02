@@ -1,11 +1,15 @@
 {
-  "_comment": "GL2.5d expectation matrix: what the symptom engine must find on each scenario table. Any active symptom not listed under 'expect' or 'allow' is unexpected. Findings held for workload evidence (needs-evidence) are ignored. Partition selectors: 'partitions' (exact set of partition values), 'newest' (only the table's newest partition), 'not_newest', 'min_value' (every flagged partition >= this value), 'count', 'min_count'. 'fresh' marks a table whose check is only valid while its newest partition is younger than the hot window; past that the result is STALE, not FAIL.",
+  "_comment": "GL2.5d/e expectation matrix: what the symptom engine must find on each scenario table. Any active symptom not listed under 'expect' or 'allow' is unexpected. Findings held for workload evidence (needs-evidence) are ignored. Partition selectors: 'partitions' (exact set of partition values), 'newest' (only the table's newest partition), 'not_newest', 'min_value' (every flagged partition >= this value), 'count', 'min_count'. 'fresh' marks a table whose check is only valid while its newest partition is younger than the hot window; past that the result is STALE, not FAIL. 'after' (optional): expectations once plan.py has applied fixes to the table (matched by table UUID, so a rebuild resets it to 'before'); an empty expect list means healthy.",
   "tables": {
     "glue.demo.s0_small_appends": {
       "expect": [
         {"symptom": "SMALL_FILES", "partitions": ["2026-09-03", "2026-09-05"]},
         {"symptom": "SNAPSHOT_BUILDUP"}
-      ]
+      ],
+      "after": {
+        "_comment": "after make gl-plan T=s0 APPLY=1: both days compacted, old snapshots expired",
+        "expect": []
+      }
     },
     "glue.demo.s1_late_arrivals": {
       "expect": [

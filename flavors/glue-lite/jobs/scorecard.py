@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 SCORECARD_DDL = """
     scan_id STRING, scored_at TIMESTAMP, table_name STRING, status STRING,
-    found STRING, missing STRING, unexpected STRING, notes STRING"""
+    found STRING, missing STRING, unexpected STRING, notes STRING, phase STRING"""
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -66,8 +66,12 @@ def _check(exp, hits, newest):
     return problems
 
 
-def score_table(table, expectation, findings, partition_rows, hot_minutes):
-    """-> dict(status, found, missing, unexpected, notes)."""
+def score_table(table, expectation, findings, partition_rows, hot_minutes, phase="before"):
+    """-> dict(status, found, missing, unexpected, notes, phase).
+
+    phase "after" = plan.py has applied fixes to this table (same table UUID)
+    since it was built; the expectation's "after" block is used if it has one.
+    """
     active = [f for f in findings if f["action"] != "needs-evidence"]
     by_symptom = {}
     for f in active:
@@ -78,7 +82,14 @@ def score_table(table, expectation, findings, partition_rows, hot_minutes):
     newest = max((v for v in values if v is not None), default=None)
 
     if expectation is None:
-        return {"status": "NOT SCORED", "found": found, "missing": [], "unexpected": [], "notes": ""}
+        return {"status": "NOT SCORED", "found": found, "missing": [], "unexpected": [], "notes": "",
+                "phase": phase}
+    fresh = expectation.get("fresh")
+    if phase == "after":
+        if "after" not in expectation:
+            return {"status": "NOT SCORED", "found": found, "missing": [], "unexpected": [],
+                    "notes": "fixed by plan.py; no 'after' expectations yet", "phase": phase}
+        expectation = expectation["after"]
 
     problems = []
     expected_names = set(expectation.get("allow", []))
@@ -89,7 +100,7 @@ def score_table(table, expectation, findings, partition_rows, hot_minutes):
 
     status = "PASS" if not problems and not unexpected else "FAIL"
     notes = ""
-    if expectation.get("fresh") and newest is not None:
+    if fresh and phase == "before" and newest is not None:
         age = values[newest].get("minutes_since_update")
         if age is not None and age >= hot_minutes:
             notes = (f"newest partition {newest} was {age:.1f} min old at scan time "
@@ -98,7 +109,7 @@ def score_table(table, expectation, findings, partition_rows, hot_minutes):
             if status == "FAIL":
                 status = "STALE"
     return {"status": status, "found": found, "missing": problems,
-            "unexpected": unexpected, "notes": notes}
+            "unexpected": unexpected, "notes": notes, "phase": phase}
 
 
 def run_scorecard(spark, scan_id, config, expectations):
@@ -110,9 +121,16 @@ def run_scorecard(spark, scan_id, config, expectations):
     tm = f"{gl.OPS_NAMESPACE}.table_metrics"
     sc = f"{gl.OPS_NAMESPACE}.scorecard"
     spark.sql(f"CREATE TABLE IF NOT EXISTS {sc} ({SCORECARD_DDL}) USING iceberg")
+    gl.ensure_columns(spark, sc, SCORECARD_DDL)
 
-    tables = sorted(r.table_name for r in
-                    spark.sql(f"SELECT DISTINCT table_name FROM {tm} WHERE scan_id = '{scan_id}'").collect())
+    tmrows = {r.table_name: r.asDict() for r in
+              spark.sql(f"SELECT * FROM {tm} WHERE scan_id = '{scan_id}'").collect()}
+    tables = sorted(tmrows)
+    fixed = set()   # table UUIDs plan.py has applied fixes to
+    if spark.catalog.tableExists(f"{gl.OPS_NAMESPACE}.actions"):
+        fixed = {r.table_uuid for r in spark.sql(
+            f"SELECT DISTINCT table_uuid FROM {gl.OPS_NAMESPACE}.actions "
+            f"WHERE status = 'ok' AND table_uuid IS NOT NULL").collect()}
     findings, parts = {}, {}
     for r in spark.sql(f"SELECT * FROM {sy} WHERE scan_id = '{scan_id}'").collect():
         findings.setdefault(r.table_name, []).append(r.asDict())
@@ -124,19 +142,22 @@ def run_scorecard(spark, scan_id, config, expectations):
     results = []
     for t in tables:
         cfg = gl.table_config(config, t)
+        phase = "after" if tmrows[t].get("table_uuid") in fixed else "before"
         res = score_table(t, exp_tables.get(t), findings.get(t, []), parts.get(t, []),
-                          float(cfg.get("hot_partition_minutes", 15)))
+                          float(cfg.get("hot_partition_minutes", 15)), phase)
         res["table_name"] = t
         results.append(res)
     for t in sorted(set(exp_tables) - set(tables)):
         results.append({"table_name": t, "status": "MISSING TABLE", "found": [], "missing": [],
-                        "unexpected": [], "notes": "not in this scan: run make gl-test-tables"})
+                        "unexpected": [], "notes": "not in this scan: run make gl-test-tables",
+                        "phase": "before"})
 
     scored = [r for r in results if r["status"] != "NOT SCORED"]
     passed = sum(1 for r in scored if r["status"] == "PASS")
     print(f"\n=== Scorecard for scan {scan_id}: {passed}/{len(scored)} scenario tables pass ===")
     for r in results:
-        print(f"  {r['status']:13} {r['table_name']:36} {', '.join(r['found']) or 'healthy'}")
+        ph = " (after fix)" if r["phase"] == "after" else ""
+        print(f"  {r['status']:13} {r['table_name']:36} {', '.join(r['found']) or 'healthy'}{ph}")
         for m in r["missing"]:
             print(f"                  missing: {m}")
         if r["unexpected"]:
@@ -146,7 +167,8 @@ def run_scorecard(spark, scan_id, config, expectations):
 
     scored_at = probes.now_utc()
     rows = [(scan_id, scored_at, r["table_name"], r["status"], ", ".join(r["found"]),
-             "; ".join(r["missing"]), ", ".join(r["unexpected"]), r["notes"]) for r in results]
+             "; ".join(r["missing"]), ", ".join(r["unexpected"]), r["notes"], r["phase"])
+            for r in results]
     spark.createDataFrame(rows, spark.table(sc).schema).writeTo(sc).append()
     return results
 

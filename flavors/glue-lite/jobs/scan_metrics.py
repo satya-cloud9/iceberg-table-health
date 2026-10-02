@@ -46,7 +46,8 @@ TABLE_METRICS_DDL = """
     filter_columns STRING, pruning_json STRING, min_pruning_efficiency DOUBLE,
     distribution_mode STRING, write_delete_mode STRING, write_update_mode STRING,
     write_merge_mode STRING, manifest_merge_enabled STRING, properties_json STRING,
-    target_file_bytes BIGINT"""
+    target_file_bytes BIGINT, target_source STRING, table_uuid STRING,
+    partition_fields_json STRING"""
 
 
 def coerce(value, data_type):
@@ -81,6 +82,8 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
     tm_table = f"{gl.OPS_NAMESPACE}.table_metrics"
     spark.sql(f"CREATE TABLE IF NOT EXISTS {pm_table} ({PARTITION_METRICS_DDL}) USING iceberg")
     spark.sql(f"CREATE TABLE IF NOT EXISTS {tm_table} ({TABLE_METRICS_DDL}) USING iceberg")
+    gl.ensure_columns(spark, pm_table, PARTITION_METRICS_DDL)
+    gl.ensure_columns(spark, tm_table, TABLE_METRICS_DDL)
     pm_schema = spark.table(pm_table).schema
     tm_schema = spark.table(tm_table).schema
 
@@ -97,6 +100,8 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
         cfg = gl.table_config(config, table)
         scanned_at = probes.now_utc()
         info = probes.table_info(spark, table)
+        cfg["target_file_bytes"], cfg["target_source"] = gl.resolve_target(
+            config, table, info.get("properties"))
         try:
             pm = probes.partition_metrics(spark, table, info, cfg)
             pm_rows = pm.collect()
@@ -108,7 +113,8 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
         except Exception as e:  # one broken table must not stop the scan
             tm = {"load_error": (info.get("error") or "") + f" | {type(e).__name__}: {e}"[:500]}
             print(f"  {table}: FAILED {tm['load_error']}", flush=True)
-        tm.update(scan_id=scan_id, scanned_at=scanned_at, table_name=table)
+        tm.update(scan_id=scan_id, scanned_at=scanned_at, table_name=table,
+                  table_uuid=info.get("uuid"), target_source=cfg["target_source"])
         spark.createDataFrame([as_row(tm, tm_schema)], tm_schema).writeTo(tm_table).append()
         summary.append(tm)
         print(f"  measured {table}", flush=True)

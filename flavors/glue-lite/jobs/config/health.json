@@ -30,6 +30,15 @@
       "over_partitioned_min_partitions": 100,
       "over_partitioned_share": 0.8,
       "min_pruning_efficiency": 0.3
+    },
+    "rewrite": {
+      "_comment": "Options plan.py puts on the CALLs. min_input_files null = min_excess_files + 1, so every flagged partition is one the rewrite will change.",
+      "min_input_files": null,
+      "max_partitions_per_run": 10,
+      "partial_progress_min_files": 500,
+      "partial_progress_max_commits": 10,
+      "max_concurrent_file_group_rewrites": 2,
+      "expire_retain_last": 5
     }
   },
   "tables": {

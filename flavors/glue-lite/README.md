@@ -254,3 +254,48 @@ make gl-scorecard           # re-score the latest scan only
 First real run (2026-10-02, scan taken ~2.7 h after the build): 6/7 PASS, s3
 STALE (today 162 min old). Unit-tested on that output plus a fresh-s3 case
 (PASS) and injected regressions (all FAIL).
+
+## GL2.5e — Fix and verify (first: S0)
+
+Detect, fix, check: the scan's findings become maintenance statements, the
+safe ones run, and the next scan must show the table healthy.
+
+```bash
+make gl-image
+make gl-scan                                       # before: s0 = SMALL_FILESx2, SNAPSHOT_BUILDUP
+make gl-bench BENCH_LABEL=before BENCH_ARGS="--table glue.demo.s0_small_appends"
+make gl-plan T=s0                                  # dry run: print the plan
+make gl-plan T=s0 APPLY=1                          # run its auto steps
+make gl-scan                                       # after: s0 should score PASS (after fix)
+make gl-bench BENCH_LABEL=after  BENCH_ARGS="--table glue.demo.s0_small_appends"
+```
+
+**`plan.py`** reads the latest scan's findings and builds, per table:
+1. `rewrite_data_files` (binpack) over the flagged partitions (`SMALL_FILES`,
+   `OVERSIZED_FILES`, `DELETE_BUILDUP`; top `max_partitions_per_run` by score
+   when `SCATTERED_SMALL_FILES`), scoped with a `where` built from the partition
+   keys and spec (day/hour/month/year/identity; bucket and truncate can't be
+   scoped and are reported). Hot partitions are never included.
+2. `rewrite_manifests` for `MANIFEST_BLOAT`.
+3. `expire_snapshots` (keep last 5) for `SNAPSHOT_BUILDUP`, last so the
+   snapshots the rewrites replaced can expire too.
+
+Options come from the same config the scan used: target size = the target the
+scan judged by; `min-input-files` = `min_excess_files` + 1 (so every flagged
+partition is one the rewrite will change); `delete-file-threshold=1` and
+`remove-dangling-deletes` when deletes are the problem; partial progress for
+large rewrites. Approval and needs-evidence findings print suggested SQL
+(spec change, sort order, property changes) but never run. With `APPLY=1`,
+each statement run is recorded in `glue.ops.actions` with the table's UUID.
+
+**Before/after in the scorecard.** A table plan.py has fixed (same UUID) is
+scored against the `after` block in `expectations.json`; rebuilding the table
+gives it a new UUID, so it goes back to `before`. s0's `after` is "healthy".
+
+**Target size per table.** The scan now uses a per-table `target_file_bytes`
+in `health.json` if set, else the table's own `write.target-file-size-bytes`,
+else the default, and records which (`target_source` in `table_metrics`).
+
+**Planning time.** The benchmark also times Iceberg's `planFiles()` for each
+day (median of the runs, after a warm-up) and records the files it planned
+(`plan_median_ms`, `planned_files` in `read_benchmarks`).
