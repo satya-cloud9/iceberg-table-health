@@ -1,0 +1,20 @@
+# kubeflow/spark-operator chart values for Glue-Lite.
+# Chart version is pinned in scripts/02-install-spark-operator.sh.
+
+spark:
+  # Only watch the Glue-Lite job namespace (created by k8s/spark-jobs.yaml).
+  jobNamespaces:
+    - spark-jobs
+  # Chart creates this service account + driver RBAC in spark-jobs; every
+  # SparkApplication's driver uses it (spec.driver.serviceAccount: spark).
+  serviceAccount:
+    create: true
+    name: spark
+  rbac:
+    create: true
+
+# Not scraped by anything in Glue-Lite (no Prometheus here); turn on again
+# for the full setup, which has kube-prometheus-stack.
+prometheus:
+  metrics:
+    enable: false

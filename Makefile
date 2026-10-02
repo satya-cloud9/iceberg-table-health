@@ -54,3 +54,24 @@ destroy:
 up: preflight install emulator-up provider-apply platform-apply tenant-apply flows
 	@echo ""
 	@echo "=== Stack is up (PROVIDER=$(PROVIDER), TENANT=$(TENANT)). Run 'make status' for endpoints. ==="
+
+# --- Glue-Lite flavor (flavors/glue-lite) --------------------------------
+# Kestra, Spark Operator, Glue, S3, Iceberg on the emulated EKS cluster --
+# no platform/tenant layers. Tear down with `make destroy` as usual.
+.PHONY: gl-spike gl-cluster gl-spark-operator gl-image gl-smoke gl-up
+
+gl-spike:
+	bash flavors/glue-lite/spike/run-glue-spike.sh
+
+gl-cluster: emulator-up provider-apply
+
+gl-spark-operator:
+	bash flavors/glue-lite/scripts/02-install-spark-operator.sh
+
+gl-image:
+	bash flavors/glue-lite/scripts/03-build-load-image.sh
+
+gl-smoke:
+	bash flavors/glue-lite/scripts/run-sql-job.sh smoke
+
+gl-up: gl-cluster gl-spark-operator gl-image gl-smoke

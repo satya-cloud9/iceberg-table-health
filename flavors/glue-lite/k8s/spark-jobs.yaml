@@ -1,0 +1,21 @@
+# Namespace every Glue-Lite Spark job runs in. The Spark Operator chart
+# (helm/spark-operator-values.yaml) creates the `spark` service account and
+# its RBAC here; this file only adds the namespace and a quota so a runaway
+# job can't take the whole node. Must exist before the chart is installed.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spark-jobs
+  labels:
+    lakehouse.io/purpose: spark-jobs
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: spark-jobs-quota
+  namespace: spark-jobs
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    pods: "10"

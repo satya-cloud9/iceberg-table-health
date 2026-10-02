@@ -1,0 +1,59 @@
+# One SparkApplication = one SQL file run by jobs/run_sql.py. Every Glue-Lite
+# job (smoke, generator, metrics, compaction) renders this same template, so
+# the catalog wiring lives in exactly one place. Kestra will render it too.
+#
+# Rendered by scripts/run-sql-job.sh with envsubst:
+#   JOB_NAME  SparkApplication name (unique per run)
+#   SQL_FILE  path inside the image, e.g. /opt/jobs/sql/smoke.sql
+#   IMAGE     Spark image (glue-lite-spark:local on Floci, ECR on EKS)
+#   AWS_ENDPOINT  where pods reach Floci (http://172.17.0.1:4566); the eks
+#                 overlay (GL4) drops the four *.endpoint / path-style lines
+#   WAREHOUSE     s3://<bucket>/warehouse
+#   AWS_REGION
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: ${JOB_NAME}
+  namespace: spark-jobs
+  labels:
+    lakehouse.io/flavor: glue-lite
+spec:
+  type: Python
+  pythonVersion: "3"
+  mode: cluster
+  image: ${IMAGE}
+  imagePullPolicy: IfNotPresent
+  mainApplicationFile: local:///opt/jobs/run_sql.py
+  arguments:
+    - ${SQL_FILE}
+  sparkVersion: "3.5.6"
+  restartPolicy:
+    type: Never
+  sparkConf:
+    spark.ui.enabled: "false"
+    spark.sql.extensions: org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+    spark.sql.catalog.glue: org.apache.iceberg.spark.SparkCatalog
+    spark.sql.catalog.glue.catalog-impl: org.apache.iceberg.aws.glue.GlueCatalog
+    spark.sql.catalog.glue.io-impl: org.apache.iceberg.aws.s3.S3FileIO
+    spark.sql.catalog.glue.warehouse: ${WAREHOUSE}
+    spark.sql.catalog.glue.client.region: ${AWS_REGION}
+    spark.sql.catalog.glue.glue.endpoint: ${AWS_ENDPOINT}
+    spark.sql.catalog.glue.s3.endpoint: ${AWS_ENDPOINT}
+    spark.sql.catalog.glue.s3.path-style-access: "true"
+    # Credentials come from the aws-creds Secret as env vars, via Spark's own
+    # secretKeyRef support (no operator webhook needed). On EKS (GL4) these
+    # lines go away and IRSA / Pod Identity provides credentials instead.
+    spark.kubernetes.driver.secretKeyRef.AWS_ACCESS_KEY_ID: aws-creds:AWS_ACCESS_KEY_ID
+    spark.kubernetes.driver.secretKeyRef.AWS_SECRET_ACCESS_KEY: aws-creds:AWS_SECRET_ACCESS_KEY
+    spark.kubernetes.executor.secretKeyRef.AWS_ACCESS_KEY_ID: aws-creds:AWS_ACCESS_KEY_ID
+    spark.kubernetes.executor.secretKeyRef.AWS_SECRET_ACCESS_KEY: aws-creds:AWS_SECRET_ACCESS_KEY
+    spark.kubernetes.driverEnv.AWS_REGION: ${AWS_REGION}
+    spark.executorEnv.AWS_REGION: ${AWS_REGION}
+  driver:
+    cores: 1
+    memory: 1g
+    serviceAccount: spark
+  executor:
+    instances: 1
+    cores: 1
+    memory: 1g
