@@ -226,3 +226,31 @@ Reports list these separately; the 2.5d scorecard ignores them.
 **Production values** (to revisit at GL4): target 512 MB, `max_snapshots`
 ~100 with age as the main trigger, `over_partitioned_min_partitions` ~1000,
 `hot_partition_minutes` ~60.
+
+## GL2.5d — Catalog scan and scorecard
+
+```bash
+make gl-image               # jobs/ changed
+make gl-scan                # metrics -> symptoms -> scorecard, one Spark job
+make gl-scan FRESH_S3=1     # rebuild s3 first, then scan (checks HOT_PARTITION)
+make gl-scorecard           # re-score the latest scan only
+```
+
+`gl_scan.py` runs the three steps in one job (one pod start) and measures
+`s3_hot_partition` first. The scorecard checks each scenario table against
+`jobs/config/expectations.json` and writes `glue.ops.scorecard`:
+
+- **PASS**: every expected symptom found where expected (partition selectors:
+  exact partitions, newest only, not newest, minimum partition value, count),
+  and no other active symptom.
+- **FAIL**: something missing, misplaced or unexpected.
+- **STALE**: s3 only. Its check needs the newest partition to be inside the hot
+  window at scan time. After 3 minutes that partition has cooled, and
+  compacting it is the right call, so the result says to rebuild rather than
+  fail. `FRESH_S3=1` does the rebuild.
+- **NOT SCORED**: tables with no expectations (`events`, smoke, spike).
+- Findings held for workload evidence are ignored.
+
+First real run (2026-10-02, scan taken ~2.7 h after the build): 6/7 PASS, s3
+STALE (today 162 min old). Unit-tested on that output plus a fresh-s3 case
+(PASS) and injected regressions (all FAIL).

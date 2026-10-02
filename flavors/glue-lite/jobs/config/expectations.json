@@ -1,0 +1,46 @@
+{
+  "_comment": "GL2.5d expectation matrix: what the symptom engine must find on each scenario table. Any active symptom not listed under 'expect' or 'allow' is unexpected. Findings held for workload evidence (needs-evidence) are ignored. Partition selectors: 'partitions' (exact set of partition values), 'newest' (only the table's newest partition), 'not_newest', 'min_value' (every flagged partition >= this value), 'count', 'min_count'. 'fresh' marks a table whose check is only valid while its newest partition is younger than the hot window; past that the result is STALE, not FAIL.",
+  "tables": {
+    "glue.demo.s0_small_appends": {
+      "expect": [
+        {"symptom": "SMALL_FILES", "partitions": ["2026-09-03", "2026-09-05"]},
+        {"symptom": "SNAPSHOT_BUILDUP"}
+      ]
+    },
+    "glue.demo.s1_late_arrivals": {
+      "expect": [
+        {"symptom": "SCATTERED_SMALL_FILES"},
+        {"symptom": "SMALL_FILES", "min_count": 3, "min_value": "2026-09-11"}
+      ]
+    },
+    "glue.demo.s2_mor_deletes": {
+      "expect": [
+        {"symptom": "DELETE_BUILDUP", "count": 7}
+      ]
+    },
+    "glue.demo.s3_hot_partition": {
+      "fresh": true,
+      "expect": [
+        {"symptom": "HOT_PARTITION", "newest": true},
+        {"symptom": "SMALL_FILES", "count": 1, "not_newest": true},
+        {"symptom": "SNAPSHOT_BUILDUP"}
+      ]
+    },
+    "glue.demo.s4_manifest_bloat": {
+      "expect": [
+        {"symptom": "MANIFEST_BLOAT"},
+        {"symptom": "SNAPSHOT_BUILDUP"}
+      ]
+    },
+    "glue.demo.s5_skewed_partition": {
+      "expect": [
+        {"symptom": "PARTITION_SKEW"}
+      ]
+    },
+    "glue.demo.s6_over_partitioned": {
+      "expect": [
+        {"symptom": "OVER_PARTITIONED"}
+      ]
+    }
+  }
+}

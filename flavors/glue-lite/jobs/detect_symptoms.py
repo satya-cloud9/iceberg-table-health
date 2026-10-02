@@ -45,25 +45,18 @@ def coerce(value, data_type):
     return value
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--scan-id", default=None, help="default: the latest scan")
-    p.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                                    "config", "health.json"))
-    a = p.parse_args()
+def latest_scan_id(spark):
+    r = spark.sql(f"SELECT max_by(scan_id, scanned_at) AS s FROM {gl.OPS_NAMESPACE}.table_metrics").collect()
+    return r[0].s if r else None
 
-    config = gl.load_config(a.config)
-    spark = SparkSession.builder.appName("gl25-detect-symptoms").getOrCreate()
+
+def run_detect(spark, scan_id, config, report=True):
+    """Apply the rules to one scan, append to glue.ops.symptoms, return the findings."""
     tm_table = f"{gl.OPS_NAMESPACE}.table_metrics"
     pm_table = f"{gl.OPS_NAMESPACE}.partition_metrics"
     sy_table = f"{gl.OPS_NAMESPACE}.symptoms"
     spark.sql(f"CREATE TABLE IF NOT EXISTS {sy_table} ({SYMPTOMS_DDL}) USING iceberg")
     schema = spark.table(sy_table).schema
-
-    scan_id = a.scan_id or spark.sql(
-        f"SELECT max_by(scan_id, scanned_at) AS s FROM {tm_table}").collect()[0].s
-    if not scan_id:
-        sys.exit("No scan found: run make gl-metrics first.")
 
     tms = [r.asDict() for r in spark.sql(f"SELECT * FROM {tm_table} WHERE scan_id = '{scan_id}'").collect()]
     parts = {}
@@ -98,14 +91,30 @@ def main():
         extra = f"   (+{len(held)} held for workload evidence)" if held else ""
         print(f"  {tm['table_name']:40} {label}{extra}")
 
-    print("\n=== Ranked findings (top 40; held ones last) ===")
-    for f in findings[:40]:
-        where = f"  [{f['partition_key']}]" if f["partition_key"] else ""
-        ev = json.loads(f["evidence_json"])
-        brief = ", ".join(f"{k}={v}" for k, v in list(ev.items())[:4])
-        print(f"  {f['action']:14} {f['severity']:6} {f['score']:7.2f}  {f['symptom']:22} "
-              f"{f['table_name']}{where}\n      {brief}\n      -> {f['remedy']}")
-    print(f"\nRecorded in {sy_table} under scan_id {scan_id}", flush=True)
+    if report:
+        print("\n=== Ranked findings (top 40; held ones last) ===")
+        for f in findings[:40]:
+            where = f"  [{f['partition_key']}]" if f["partition_key"] else ""
+            ev = json.loads(f["evidence_json"])
+            brief = ", ".join(f"{k}={v}" for k, v in list(ev.items())[:4])
+            print(f"  {f['action']:14} {f['severity']:6} {f['score']:7.2f}  {f['symptom']:22} "
+                  f"{f['table_name']}{where}\n      {brief}\n      -> {f['remedy']}")
+    print(f"Symptoms recorded in {sy_table} under scan_id {scan_id}", flush=True)
+    return findings
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--scan-id", default=None, help="default: the latest scan")
+    p.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                    "config", "health.json"))
+    a = p.parse_args()
+
+    spark = SparkSession.builder.appName("gl25-detect-symptoms").getOrCreate()
+    scan_id = a.scan_id or latest_scan_id(spark)
+    if not scan_id:
+        sys.exit("No scan found: run make gl-metrics first.")
+    run_detect(spark, scan_id, gl.load_config(a.config))
     spark.stop()
 
 

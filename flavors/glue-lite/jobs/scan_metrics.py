@@ -69,18 +69,13 @@ def as_row(values, schema):
     return tuple(coerce(values.get(f.name), f.dataType) for f in schema)
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--namespace", default="glue.demo")
-    p.add_argument("--tables", default="", help="comma-separated table names in the namespace")
-    p.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                                    "config", "health.json"))
-    p.add_argument("--scan-id", default=None)
-    a = p.parse_args()
+def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), report=True):
+    """Measure every table in the namespace (or just `tables`); return the scan_id.
 
-    config = gl.load_config(a.config)
-    scan_id = a.scan_id or gl.new_run_id("scan")
-    spark = SparkSession.builder.appName("gl25-scan-metrics").getOrCreate()
+    `priority` tables are measured first (gl-scan puts s3 first so its hot
+    partition is still inside the hot window when it is measured).
+    """
+    scan_id = scan_id or gl.new_run_id("scan")
     spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {gl.OPS_NAMESPACE}")
     pm_table = f"{gl.OPS_NAMESPACE}.partition_metrics"
     tm_table = f"{gl.OPS_NAMESPACE}.table_metrics"
@@ -89,16 +84,18 @@ def main():
     pm_schema = spark.table(pm_table).schema
     tm_schema = spark.table(tm_table).schema
 
-    wanted = {t.strip() for t in a.tables.split(",") if t.strip()}
-    names = sorted(r.tableName for r in spark.sql(f"SHOW TABLES IN {a.namespace}").collect()
+    wanted = set(tables)
+    names = sorted(r.tableName for r in spark.sql(f"SHOW TABLES IN {namespace}").collect()
                    if not wanted or r.tableName in wanted)
-    print(f"=== Scan {scan_id}: {len(names)} tables in {a.namespace} ===", flush=True)
+    first = [n for n in priority if n in names]
+    names = first + [n for n in names if n not in first]
+    print(f"=== Scan {scan_id}: {len(names)} tables in {namespace} ===", flush=True)
 
-    scanned_at = probes.now_utc()
     summary = []
     for name in names:
-        table = f"{a.namespace}.{name}"
+        table = f"{namespace}.{name}"
         cfg = gl.table_config(config, table)
+        scanned_at = probes.now_utc()
         info = probes.table_info(spark, table)
         try:
             pm = probes.partition_metrics(spark, table, info, cfg)
@@ -114,24 +111,41 @@ def main():
         tm.update(scan_id=scan_id, scanned_at=scanned_at, table_name=table)
         spark.createDataFrame([as_row(tm, tm_schema)], tm_schema).writeTo(tm_table).append()
         summary.append(tm)
+        print(f"  measured {table}", flush=True)
 
-    print("\n=== Table metrics (selected) ===", flush=True)
-    cols = ["table_name", "partitions", "data_files", "read_amplification", "skew_ratio",
-            "undersized_partition_share", "delete_files", "snapshots", "data_manifests",
-            "avg_changed_partitions_per_commit", "min_pruning_efficiency",
-            "sort_order_defined", "distribution_mode"]
-    sub = spark.table(tm_table).select(*cols).schema
-    spark.createDataFrame([as_row(s, sub) for s in summary], sub).show(100, truncate=False)
+    if report:
+        print("\n=== Table metrics (selected) ===", flush=True)
+        cols = ["table_name", "partitions", "data_files", "read_amplification", "skew_ratio",
+                "undersized_partition_share", "delete_files", "snapshots", "data_manifests",
+                "avg_changed_partitions_per_commit", "min_pruning_efficiency",
+                "sort_order_defined", "distribution_mode"]
+        sub = spark.table(tm_table).select(*cols).schema
+        spark.createDataFrame([as_row(s, sub) for s in summary], sub).show(100, truncate=False)
 
-    print("=== Partitions with excess files (top 15) ===", flush=True)
-    spark.sql(f"""
-        SELECT table_name, partition_key, data_files, excess_files,
-               delete_files_pos + delete_files_eq AS delete_files,
-               round(minutes_since_update, 1) AS minutes_since_update
-        FROM {pm_table} WHERE scan_id = '{scan_id}' AND (excess_files > 0 OR delete_files_pos > 0)
-        ORDER BY excess_files DESC, delete_files DESC LIMIT 15
-    """).show(truncate=False)
-    print(f"Recorded under scan_id {scan_id}", flush=True)
+        print("=== Partitions with excess files (top 15) ===", flush=True)
+        spark.sql(f"""
+            SELECT table_name, partition_key, data_files, excess_files,
+                   delete_files_pos + delete_files_eq AS delete_files,
+                   round(minutes_since_update, 1) AS minutes_since_update
+            FROM {pm_table} WHERE scan_id = '{scan_id}' AND (excess_files > 0 OR delete_files_pos > 0)
+            ORDER BY excess_files DESC, delete_files DESC LIMIT 15
+        """).show(truncate=False)
+    print(f"Metrics recorded under scan_id {scan_id}", flush=True)
+    return scan_id
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--namespace", default="glue.demo")
+    p.add_argument("--tables", default="", help="comma-separated table names in the namespace")
+    p.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                    "config", "health.json"))
+    p.add_argument("--scan-id", default=None)
+    a = p.parse_args()
+
+    spark = SparkSession.builder.appName("gl25-scan-metrics").getOrCreate()
+    run_scan(spark, a.namespace, gl.load_config(a.config),
+             tables=[t.strip() for t in a.tables.split(",") if t.strip()], scan_id=a.scan_id)
     spark.stop()
 
 
