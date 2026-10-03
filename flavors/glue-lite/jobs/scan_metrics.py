@@ -163,8 +163,14 @@ def reuse(spark, table, cfg, p, prev_rows, scanned_at, snapshot_source="full"):
     tm = {k: v for k, v in p.items() if k not in REUSE_DROP}
     if snapshot_source == "full":       # "ledger": the snapshot ledger fills these in (mode "on")
         tm.update(probes.snapshot_metrics(spark, table, cfg, p.get("data_bytes") or 0))
-    wm = p.get("minutes_since_writer_commit")
-    tm["minutes_since_writer_commit"] = None if wm is None else float(wm) + elapsed
+    if snapshot_source == "full":
+        # exact, not last scan's value + elapsed: that goes stale while the scan
+        # works through the tables (minutes, by the end of a scan); one read of
+        # metadata.json, like snapshot_metrics above
+        tm["minutes_since_writer_commit"] = probes.writer_minutes(spark, table)
+    else:
+        wm = p.get("minutes_since_writer_commit")     # the ledger replaces it (mode "on")
+        tm["minutes_since_writer_commit"] = None if wm is None else float(wm) + elapsed
     tm["scan_mode"] = "reused"
     return tm, rows
 
