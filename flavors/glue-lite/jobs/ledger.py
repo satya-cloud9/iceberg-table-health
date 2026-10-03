@@ -36,6 +36,8 @@ import math
 import random
 from datetime import datetime, timedelta, timezone
 
+import activity as act
+
 SNAPSHOT_LOG_DDL = """
     table_uuid STRING, table_name STRING, snapshot_id BIGINT, parent_id BIGINT,
     committed_at TIMESTAMP, ts_ms BIGINT, operation STRING, is_writer BOOLEAN,
@@ -318,6 +320,25 @@ def ensure_tables(spark, ops):
         gl.ensure_columns(spark, f"{ops}.{name}", ddl)
 
 
+def ensure_activity_tables(spark, ops):
+    import gl_common as gl
+    specs = {"partition_activity": (act.ACTIVITY_DDL, "PARTITIONED BY (days(committed_at))"),
+             "partition_state": (act.PARTITION_STATE_DDL, ""),
+             "lateness_hist": (act.LATENESS_HIST_DDL, ""),
+             "activity_state": (act.ACTIVITY_STATE_DDL, ""),
+             "incremental_check": (CHECK_DDL, "PARTITIONED BY (days(checked_at))")}
+    for name, (ddl, part) in specs.items():
+        spark.sql(f"CREATE TABLE IF NOT EXISTS {ops}.{name} ({ddl}) USING iceberg {part}")
+        gl.ensure_columns(spark, f"{ops}.{name}", ddl)
+
+
+def latest_per_uuid(spark, table):
+    rows = spark.sql(f"""
+        SELECT * FROM (SELECT s.*, row_number() OVER (PARTITION BY table_uuid ORDER BY updated_at DESC) AS rn
+                       FROM {table} s) WHERE rn = 1""").collect()
+    return {r.table_uuid: r.asDict() for r in rows}
+
+
 def load_states(spark, ops):
     rows = spark.sql(f"""
         SELECT * FROM (SELECT s.*, row_number() OVER (PARTITION BY table_uuid ORDER BY updated_at DESC) AS rn
@@ -348,7 +369,17 @@ class Ledger:
         self.retention_days = int(inc.get("retention_days", 365))
         self.results = []          # per table: (table, agree, n_checks, disagreements, ingested, event)
         # rows written once at the end of the scan (one Iceberg commit per ops table, not per table)
-        self.pending = {"snapshot_log": [], "commit_gap_hist": [], "ledger_state": [], "incremental_check": []}
+        self.pending = {"snapshot_log": [], "commit_gap_hist": [], "ledger_state": [], "incremental_check": [],
+                        "partition_activity": [], "lateness_hist": [], "activity_state": []}
+        self.pstate_updates = []   # partition_state rows, merged once at the end
+        self.mode2 = mode_of(config, "partition_activity")
+        if self.mode2 == "on":     # family 2 only reports in this patch; "on" behaves like shadow
+            self.mode2 = "shadow"
+        self.results2 = []
+        self.pstate_cache = {}
+        if self.mode2 != "off":
+            ensure_activity_tables(spark, self.ops)
+            self.act_states = latest_per_uuid(spark, f"{self.ops}.activity_state")
         if self.mode != "off":
             ensure_tables(spark, self.ops)
             self.states = load_states(spark, self.ops)
@@ -358,14 +389,20 @@ class Ledger:
                 WHERE family = 'snapshot_ledger' GROUP BY table_uuid""").collect()}
 
     # -- per table ---------------------------------------------------------
-    def process(self, table, uuid, tm, cfg, full_fn=None):
+    def process(self, table, uuid, tm, cfg, full_fn=None, live_keys=None, partitioned=True):
+        """Family 1 (snapshot ledger) and family 2 (partition activity) for one table."""
+        if not uuid or (self.mode == "off" and self.mode2 == "off"):
+            return
+        snaps, current, versions = read_snapshots(self.spark, table)
+        if self.mode != "off":
+            self._family1(table, uuid, tm, cfg, full_fn, snaps, current, versions)
+        if self.mode2 != "off":
+            self._family2(table, uuid, tm, cfg, snaps, live_keys or [], partitioned)
+
+    def _family1(self, table, uuid, tm, cfg, full_fn, snaps, current, versions):
         """Ingest new snapshots, compute ledger metrics, compare (shadow / spot
         check / reconcile), and in "on" mode put the ledger values into tm."""
-        if self.mode == "off" or not uuid:
-            return
-        from scan_metrics import as_row
         spark, ops = self.spark, self.ops
-        snaps, current, versions = read_snapshots(spark, table)
         state = self.states.get(uuid)
 
         def in_ledger(sid):
@@ -421,7 +458,7 @@ class Ledger:
             exact = self._exact_p95(uuid)
             full = tm
             if self.mode == "on" and full_fn is not None:   # spot check: tm holds no full values
-                full = dict(full_fn(), minutes_since_writer_commit=tm.get("minutes_since_writer_commit"))
+                full = full_fn()
             res = compare(full, led, stored, ref, (exact, p95_edge, n_gaps))
             why = "shadow" if self.mode == "shadow" else "spot-check/reconcile"
             for m, f, l, ok, note in res:
@@ -439,6 +476,144 @@ class Ledger:
             else:
                 tm.update({k: v for k, v in led.items() if k in COMPARED})
         self.results.append((table, not disagreements, n_checks, disagreements, len(rows), event))
+
+    # -- family 2 ----------------------------------------------------------
+    def _family2(self, table, uuid, tm, cfg, snaps, live_keys, partitioned):
+        spark, ops = self.spark, self.ops
+        now = datetime.now(timezone.utc)
+        now_ms = int(now.timestamp() * 1000)
+        st = self.act_states.get(uuid)
+        if st is None:
+            new_snaps, event = sorted(snaps, key=lambda x: (x["ts_ms"], x["snapshot_id"])), "bootstrap"
+        else:
+            new_snaps = sorted((x for x in snaps if x["ts_ms"] > st["last_ts_ms"]
+                                or (x["ts_ms"] == st["last_ts_ms"] and x["snapshot_id"] != st["last_snapshot_id"])),
+                               key=lambda x: (x["ts_ms"], x["snapshot_id"]))
+            event = "new" if new_snaps else "unchanged"
+
+        rows = []
+        if new_snaps:
+            files = act.read_activity(spark, table, [x["snapshot_id"] for x in new_snaps])
+            for x in new_snaps:
+                rows += act.aggregate(x, files.get(x["snapshot_id"], []))
+        state = self._partition_state(uuid)
+        changed, reopens = act.update_state(state, rows)
+        state.update(changed)
+        for r in rows:
+            self.pending["partition_activity"].append(dict(
+                r, table_uuid=uuid, table_name=table, scan_id=self.scan_id,
+                committed_at=datetime.fromtimestamp(r["ts_ms"] / 1000.0, timezone.utc)))
+        counts = {}
+        for r in rows:
+            if r["lateness_h"] is not None:
+                key = (datetime.fromtimestamp(r["ts_ms"] / 1000.0, timezone.utc).date(), act.late_bucket(r["lateness_h"]))
+                counts[key] = counts.get(key, 0) + 1
+        for (d, b), n in counts.items():
+            self.pending["lateness_hist"].append({"table_uuid": uuid, "day": d, "bucket_max_h": b,
+                                                  "batches": n, "scan_id": self.scan_id})
+        for pk, v in changed.items():
+            self.pstate_updates.append(dict(v, table_uuid=uuid, partition_key=pk, updated_at=now,
+                                            scan_id=self.scan_id))
+        if new_snaps:
+            last = new_snaps[-1]
+            self.pending["activity_state"].append({"table_uuid": uuid, "table_name": table, "updated_at": now,
+                                                   "last_ts_ms": last["ts_ms"], "last_snapshot_id": last["snapshot_id"],
+                                                   "event": event, "scan_id": self.scan_id})
+            self.act_states[uuid] = {"last_ts_ms": last["ts_ms"], "last_snapshot_id": last["snapshot_id"]}
+
+        hot = float(cfg.get("hot_partition_minutes", 15))
+        live = set(live_keys)
+        led_lw = {pk: v["last_write_ms"] for pk, v in state.items() if v.get("last_write_ms") is not None}
+        late_edge, n_late = self._late_p95(uuid)
+        tm["activity_new_snapshots"] = len(new_snaps)
+        tm["activity_event"] = event
+        tm["lateness_p95_h"] = late_edge
+        tm["lateness_batches_window"] = n_late
+        tm["reopened_partitions"] = sum(1 for pk in live if (state.get(pk) or {}).get("reopen_count"))
+        tm["hot_partitions_ledger"] = sum(1 for pk in live if pk in led_lw and now_ms - led_lw[pk] < hot * 60000)
+
+        # shadow comparison against all_entries
+        ref_act, ref_lw = act.full_reference(spark, table, partitioned)
+        retained = {x["snapshot_id"] for x in snaps}
+        led_act = {(r["snapshot_id"], r["partition_key"]): act.activity_tuple(r)
+                   for r in self._activity_rows(uuid, retained)}
+        oldest = min((x["ts_ms"] for x in snaps), default=None)
+        ok_a, n_a, bad_a = act.compare_activity(ref_act, led_act, retained)
+        ok_w, n_w, bad_w = act.compare_last_write(ref_lw, led_lw, live, oldest)
+        exact = self._late_exact(uuid)
+        res = [("activity", f"{n_a} (snapshot, partition) pairs", f"{len(bad_a)} differ", ok_a, "; ".join(bad_a[:5])),
+               ("last_write", f"{n_w} live partitions", f"{len(bad_w)} differ", ok_w, "; ".join(bad_w[:5]))]
+        if n_late:
+            lo = act.LATE_BUCKETS[act.LATE_BUCKETS.index(late_edge) - 1] if late_edge in act.LATE_BUCKETS[1:] else 0
+            if late_edge is None:
+                ok_l = exact is not None and exact > act.LATE_BUCKETS[-2]
+            else:
+                ok_l = exact is not None and lo - 1e-9 < exact <= late_edge
+            res.append(("lateness_p95_h", exact, f"<= {late_edge}" if late_edge is not None else "> 720",
+                        ok_l, f"{n_late} batches in the window"))
+        for m, f, l, ok, note in res:
+            self.pending["incremental_check"].append({
+                "scan_id": self.scan_id, "checked_at": now, "table_name": table, "table_uuid": uuid,
+                "family": "partition_activity", "metric": m, "full_value": None if f is None else str(f),
+                "ledger_value": None if l is None else str(l), "agree": ok,
+                "note": (note + f" [shadow; {event}]").strip()})
+        dis = [(m, f, l, note) for m, f, l, ok, note in res if not ok]
+        self.results2.append((table, not dis, len(res), dis, len(new_snaps), event, reopens))
+
+    def _partition_state(self, uuid):
+        if uuid not in self.pstate_cache:
+            self.pstate_cache[uuid] = {r["partition_key"]: {"last_write_ms": r["last_write_ms"],
+                                                            "last_compaction_ms": r["last_compaction_ms"],
+                                                            "reopen_count": r["reopen_count"] or 0}
+                                       for r in _rows(self.spark, f"SELECT * FROM {self.ops}.partition_state "
+                                                                  f"WHERE table_uuid = '{uuid}'")}
+        return self.pstate_cache[uuid]
+
+    def _activity_rows(self, uuid, ids):
+        got = _rows(self.spark, f"SELECT snapshot_id, partition_key, data_files_added, data_bytes_added, "
+                                f"delete_files_added, data_files_removed, delete_files_removed "
+                                f"FROM {self.ops}.partition_activity WHERE table_uuid = '{uuid}' "
+                                f"AND snapshot_id IN ({_ids_sql(ids)})") if ids else []
+        seen = {(r["snapshot_id"], r["partition_key"]) for r in got}
+        got += [r for r in self.pending["partition_activity"]
+                if r["table_uuid"] == uuid and r["snapshot_id"] in ids
+                and (r["snapshot_id"], r["partition_key"]) not in seen]
+        return got
+
+    def _late_p95(self, uuid):
+        counts = {}
+        for r in self.spark.sql(f"""
+                SELECT bucket_max_h, sum(batches) AS n FROM {self.ops}.lateness_hist
+                WHERE table_uuid = '{uuid}' AND day >= DATE '{self._cutoff_day()}'
+                GROUP BY bucket_max_h""").collect():
+            b = r.bucket_max_h
+            b = None if b is None else (int(b) if float(b).is_integer() else float(b))
+            counts[b] = counts.get(b, 0) + int(r.n)
+        for r in self.pending["lateness_hist"]:
+            if r["table_uuid"] == uuid and r["day"] >= self._cutoff_day():
+                counts[r["bucket_max_h"]] = counts.get(r["bucket_max_h"], 0) + r["batches"]
+        return act.hist_percentile(counts, 0.95)
+
+    def _late_exact(self, uuid):
+        cutoff = self._cutoff_day()
+        vals = [r.lateness_h for r in self.spark.sql(f"""
+            SELECT lateness_h FROM {self.ops}.partition_activity
+            WHERE table_uuid = '{uuid}' AND lateness_h IS NOT NULL
+              AND to_date(committed_at) >= DATE '{cutoff}'""").collect()]
+        vals += [r["lateness_h"] for r in self.pending["partition_activity"]
+                 if r["table_uuid"] == uuid and r["lateness_h"] is not None and r["committed_at"].date() >= cutoff]
+        return act.exact_percentile(vals, 0.95)
+
+    def merge_partition_state(self, rows):
+        """Upsert partition_state (one MERGE per scan)."""
+        from scan_metrics import as_row
+        sch = self.spark.table(f"{self.ops}.partition_state").schema
+        self.spark.createDataFrame([as_row(r, sch) for r in rows], sch).createOrReplaceTempView("gl_pstate_updates")
+        self.spark.sql(f"""
+            MERGE INTO {self.ops}.partition_state t USING gl_pstate_updates u
+            ON t.table_uuid = u.table_uuid AND t.partition_key = u.partition_key
+            WHEN MATCHED THEN UPDATE SET *
+            WHEN NOT MATCHED THEN INSERT *""")
 
     def _log_rows(self, uuid, ids, cols):
         ids = set(ids)
@@ -478,7 +653,7 @@ class Ledger:
 
     def flush(self):
         """Write the scan's ledger rows: one append per ops table."""
-        if self.mode == "off":
+        if self.mode == "off" and self.mode2 == "off":
             return
         from scan_metrics import as_row
         for name, rows in self.pending.items():
@@ -487,12 +662,28 @@ class Ledger:
                 self.spark.createDataFrame([as_row(r, sch) for r in rows], sch) \
                     .writeTo(f"{self.ops}.{name}").append()
             self.pending[name] = []
+        if self.pstate_updates:
+            self.merge_partition_state(self.pstate_updates)
+            self.pstate_updates = []
 
     # -- end of scan -------------------------------------------------------
     def report(self):
-        if self.mode == "off":
+        if self.mode == "off" and self.mode2 == "off":
             return
         self.flush()
+        if self.mode2 != "off":
+            ok2 = sum(1 for r in self.results2 if r[1])
+            snaps2 = sum(r[4] for r in self.results2)
+            reop = sum(r[6] for r in self.results2)
+            boot = sum(1 for r in self.results2 if r[5] == "bootstrap")
+            print(f"\n=== Incremental check ({self.mode2}, partition activity): {ok2}/{len(self.results2)} tables "
+                  f"agree; {snaps2} snapshots read{'; bootstrap ' + str(boot) if boot else ''}"
+                  f"{'; ' + str(reop) + ' partitions reopened' if reop else ''} ===", flush=True)
+            for table, agree, n, dis, _, event, _r in self.results2:
+                for m, f, l, note in dis:
+                    print(f"  {table.rsplit('.', 1)[-1]:26} {m}: full={f} ledger={l}  {note} [{event}]", flush=True)
+        if self.mode == "off":
+            return
         checked = [r for r in self.results if r[2]]
         ok = sum(1 for r in checked if r[1])
         ingested = sum(r[4] for r in self.results)

@@ -724,3 +724,62 @@ make gl-step STEP=expire-gap && make gl-scan    # s17 ledger-gap, first gap unkn
 make gl-sql Q="SELECT table_name, metric, full_value, ledger_value, note FROM glue.ops.incremental_check WHERE NOT agree ORDER BY checked_at DESC"
 ```
 Family 1 can switch to `on` after 5 clean scans in a row covering these.
+
+## GL2.5n — Incremental scan, family 2: partition activity (shadow); family 1 on
+
+**Family 1 is on.** The snapshot ledger passed shadow on 2026-10-03 (5 clean
+scans covering grow, compaction, rollback and an expiry gap). Reused tables no
+longer read `.snapshots`; the ledger supplies the snapshot metrics. 5% of
+tables per scan, and any table not compared for 7 days, are still compared;
+a disagreement makes that table use the full values for that scan.
+
+**Family 2: partition activity, in shadow.** For every snapshot not processed
+yet, only the manifests that snapshot wrote are read (`addedDataFiles`,
+`removedDataFiles`, `addedDeleteFiles`, `removedDeleteFiles` via the Java API),
+and kept per partition:
+
+| Table | Holds |
+|---|---|
+| `partition_activity` | One row per (snapshot, partition): data / delete files and bytes added and removed, and the batch's lateness (hours after the partition's time range ended; day, hour, month, year and identity-date partitions) |
+| `partition_state` | Per (table, partition): last writer write, last compaction, reopen count (written again after a compaction); one MERGE per scan |
+| `lateness_hist` | Lateness counts per table, day and bucket (1, 6, 24, 48, 72, 168, 720 h, longer) |
+| `activity_state` | Per table: the last snapshot processed |
+
+Partition keys are built to match `to_json(partition)` exactly (field id
+order, nulls left out, decimals keep their scale), so they join with
+`partition_metrics`.
+
+New `table_metrics` columns: `activity_new_snapshots`, `activity_event`,
+`lateness_p95_h`, `lateness_batches_window`, `reopened_partitions`,
+`hot_partitions_ledger` (live partitions whose last writer write is inside the
+hot window, from the ledger).
+
+Shadow checks (family `partition_activity` in `incremental_check`), against a
+full `all_entries` read that runs only in shadow:
+
+- `activity`: per retained snapshot and partition, files and bytes added and
+  removed must be equal
+- `last_write`: last writer write per live partition must be equal (a
+  partition last written before every retained snapshot is known only to the
+  ledger: agrees)
+- `lateness_p95_h`: the histogram bucket must contain the exact value
+
+Each scan prints:
+```
+=== Incremental check (shadow, partition activity): 21/21 tables agree; 412 snapshots read; bootstrap 21 ===
+```
+Shadow scans read `all_entries` twice per table, so they are slower; that
+goes away when family 2 is switched on. Family 2 changes no finding yet: the
+hot window still comes from the full path. Family 3 (learned windows, settle
+rule) will read `partition_state` and `lateness_hist`.
+
+Shadow sequence for family 2:
+```bash
+make gl-image
+make gl-scan                                   # bootstrap: every table's retained snapshots read
+make gl-scan                                   # unchanged: 0 snapshots read
+make gl-step STEP=grow && make gl-scan         # new files in s17's day partition
+make gl-plan T=s0 APPLY=1 && make gl-scan      # compaction: removed + added, last_compaction set
+make gl-test-tables TT_ARGS="--only s1" && make gl-scan   # late arrivals: lateness > 0
+make gl-scan FRESH_S3=1                        # hot partition: hot_partitions_ledger = 1 on s3
+```

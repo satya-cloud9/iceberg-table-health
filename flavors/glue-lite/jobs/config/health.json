@@ -59,8 +59,9 @@
     }
   },
   "incremental": {
-    "_comment": "GL2.5m incremental scan. Per family: off | shadow (full path decides, both compared in glue.ops.incremental_check) | on (ledger decides; spot_check_share of tables and any table not compared for reconcile_every_days are still compared). Families 2-4 come in later patches.",
-    "snapshot_ledger": "shadow",
+    "_comment": "GL2.5m incremental scan. Per family: off | shadow (full path decides, both compared in glue.ops.incremental_check) | on (ledger decides; spot_check_share of tables and any table not compared for reconcile_every_days are still compared). Family 1 (snapshot_ledger) passed shadow 2026-10-03 and is on; family 2 (partition_activity) reports and compares only (shadow). Families 3-4 come in later patches.",
+    "snapshot_ledger": "on",
+    "partition_activity": "shadow",
     "spot_check_share": 0.05,
     "reconcile_every_days": 7,
     "histogram_days": 30,

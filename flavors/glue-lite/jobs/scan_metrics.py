@@ -56,7 +56,9 @@ TABLE_METRICS_DDL = """
     orphan_error STRING, excess_files_total BIGINT,
     metadata_location STRING, scan_mode STRING, scan_seconds DOUBLE,
     minutes_since_writer_commit DOUBLE, orphan_scanned_at TIMESTAMP, retained_scanned_at TIMESTAMP,
-    commit_gap_p95_min DOUBLE, commit_gaps_window BIGINT, ledger_new_snapshots BIGINT, ledger_event STRING"""
+    commit_gap_p95_min DOUBLE, commit_gaps_window BIGINT, ledger_new_snapshots BIGINT, ledger_event STRING,
+    activity_new_snapshots BIGINT, activity_event STRING, lateness_p95_h DOUBLE, lateness_batches_window BIGINT,
+    reopened_partitions BIGINT, hot_partitions_ledger BIGINT"""
 
 
 def coerce(value, data_type):
@@ -253,7 +255,11 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
                     tm["orphan_error"] = f"{type(oe).__name__}: {oe}"[:500]
             try:
                 led.process(table, info.get("uuid"), tm, cfg,
-                            full_fn=lambda: probes.snapshot_metrics(spark, table, cfg, tm.get("data_bytes") or 0))
+                            full_fn=lambda: dict(probes.snapshot_metrics(spark, table, cfg, tm.get("data_bytes") or 0),
+                                                 minutes_since_writer_commit=probes.writer_minutes(spark, table)),
+                            live_keys=[r["partition_key"] if isinstance(r, dict) else r.partition_key
+                                       for r in pm_rows],
+                            partitioned=info.get("partitioned", True))
             except Exception as le:          # the ledger must never cost the table its metrics
                 tm["ledger_event"] = f"error: {type(le).__name__}: {le}"[:300]
                 print(f"  {table}: ledger skipped ({tm['ledger_event']})", flush=True)
