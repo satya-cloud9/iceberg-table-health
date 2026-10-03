@@ -47,7 +47,9 @@ TABLE_METRICS_DDL = """
     distribution_mode STRING, write_delete_mode STRING, write_update_mode STRING,
     write_merge_mode STRING, manifest_merge_enabled STRING, properties_json STRING,
     target_file_bytes BIGINT, target_source STRING, table_uuid STRING,
-    partition_fields_json STRING"""
+    partition_fields_json STRING,
+    overwrite_commits_recent BIGINT, avg_overwrite_rewrite_share DOUBLE,
+    overwrite_commits_24h BIGINT, rewritten_bytes_24h BIGINT, table_turnover_24h DOUBLE"""
 
 
 def coerce(value, data_type):

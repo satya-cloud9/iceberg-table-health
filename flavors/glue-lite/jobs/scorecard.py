@@ -3,7 +3,7 @@
 Each scenario table in config/expectations.json lists the symptoms the engine
 must find (with optional partition selectors). A table passes when every
 expected symptom is found where expected and nothing else active is found.
-Findings held for workload evidence are ignored. Tables not in the file are
+Findings held for workload evidence, and advisory ones, are ignored. Tables not in the file are
 listed but not scored.
 
 STALE: a table marked "fresh" (s3) is only checkable while its newest
@@ -76,7 +76,7 @@ def score_table(table, expectation, findings, partition_rows, hot_minutes, phase
     phase "after" = plan.py has applied fixes to this table (same table UUID)
     since it was built; the expectation's "after" block is used if it has one.
     """
-    active = [f for f in findings if f["action"] != "needs-evidence"]
+    active = [f for f in findings if f["action"] not in ("needs-evidence", "advisory")]
     by_symptom = {}
     for f in active:
         by_symptom.setdefault(f["symptom"], []).append(partition_value(f.get("partition_key")))

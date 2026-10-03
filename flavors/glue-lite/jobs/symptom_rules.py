@@ -14,12 +14,15 @@ Each finding carries an action:
   defer          would be auto, but the partition is still being written
   needs-evidence workload-dependent; held until query evidence reaches the
                  configured level (declared filter columns are not enough)
+  advisory       reported, never acted on: another finding on the table makes
+                 this remedy counterproductive (e.g. bigger files under
+                 copy-on-write churn)
 """
 import json
 import math
 import re
 
-RULE_VERSION = "2.5e-2"
+RULE_VERSION = "2.5g-1"
 
 # symptom -> (category, level, action, remedy)
 CATALOG = {
@@ -39,6 +42,10 @@ CATALOG = {
                               "expire_snapshots (retain_last / older_than per policy)"),
     "MANIFEST_BLOAT":        ("metadata", "table", "auto",
                               "rewrite_manifests; re-enable commit.manifest-merge.enabled"),
+    "REWRITE_CHURN":         ("write_config", "table", "approval",
+                              "switch MERGE/UPDATE/DELETE to merge-on-read and compact on a schedule; "
+                              "or narrow each merge (partition predicate, dbt incremental_predicates); "
+                              "or sort on the merge key so changed rows sit in few files"),
     "UNBOUNDED_RETENTION":   ("write_config", "table", "approval",
                               "set write.metadata.delete-after-commit.enabled=true and "
                               "write.metadata.previous-versions-max"),
@@ -199,6 +206,20 @@ def table_findings(table, tm, rows, th, cfg):
                             {"data_manifests": manifests, "limit": limit,
                              "manifest_merge_enabled": merge_on, "avg_manifest_bytes": avg_mb}))
 
+    # REWRITE_CHURN: overwrite commits keep rewriting a large share of the
+    # table (copy-on-write merges touching most files, frequent full
+    # refreshes). Files look healthy; the cost is in the writes.
+    n_ow = _num(tm.get("overwrite_commits_recent"))
+    share_ow = _num(tm.get("avg_overwrite_rewrite_share"), 0.0)
+    turnover = _num(tm.get("table_turnover_24h"), 0.0)
+    if (n_ow >= th.get("churn_min_commits", 5) and share_ow >= th.get("churn_rewrite_share", 0.3)
+            and turnover >= th.get("churn_turnover_24h", 2.0)):
+        mode = (tm.get("write_merge_mode") or "copy-on-write (default)")
+        out.append(_finding(table, "REWRITE_CHURN", turnover / th.get("churn_turnover_24h", 2.0),
+                            {"overwrite_commits": n_ow, "avg_rewrite_share": share_ow,
+                             "table_turnover_24h": turnover, "write_merge_mode": mode,
+                             "rewritten_bytes_24h": tm.get("rewritten_bytes_24h")}))
+
     # UNBOUNDED_RETENTION: metadata.json versions pile up with no cleanup.
     versions = _num(tm.get("metadata_versions"))
     max_versions = int(props.get("write.metadata.previous-versions-max", th["max_metadata_versions"]))
@@ -275,4 +296,12 @@ def evaluate(table, tm, rows, cfg):
         return []
     th = cfg["thresholds"]
     hot = float(cfg.get("hot_partition_minutes", 15))
-    return partition_findings(table, rows, th, hot) + table_findings(table, tm, rows, th, cfg)
+    out = partition_findings(table, rows, th, hot) + table_findings(table, tm, rows, th, cfg)
+    if any(f["symptom"] == "REWRITE_CHURN" for f in out):
+        # Bigger files make every copy-on-write merge rewrite more bytes, so
+        # don't compact toward the target while churn is the problem.
+        for f in out:
+            if f["symptom"] in ("SMALL_FILES", "SCATTERED_SMALL_FILES") and f["action"] == "auto":
+                f["action"], f["automatic"] = "advisory", False
+                f["remedy"] = "held: REWRITE_CHURN on this table; fix the write mode first (" + f["remedy"] + ")"
+    return out

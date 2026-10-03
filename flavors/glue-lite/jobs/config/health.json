@@ -30,7 +30,10 @@
       "skew_min_largest_targets": 2,
       "over_partitioned_min_partitions": 100,
       "over_partitioned_share": 0.8,
-      "min_pruning_efficiency": 0.3
+      "min_pruning_efficiency": 0.3,
+      "churn_min_commits": 5,
+      "churn_rewrite_share": 0.3,
+      "churn_turnover_24h": 2.0
     },
     "rewrite": {
       "_comment": "Options plan.py puts on the CALLs. min_input_files null = min_excess_files + 1, so every flagged partition is one the rewrite will change.",

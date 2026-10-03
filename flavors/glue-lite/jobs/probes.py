@@ -7,7 +7,7 @@ match the inventory table in the roadmap (F*, P*, M*, C*, W*).
 
 Two outputs per table:
   partition_metrics(...) -> one row per partition   (F1-F8)
-  table_metrics(...)     -> one dict for the table  (P1-P4, M1-M5, M7, M8, C1-C3, W1)
+  table_metrics(...)     -> one dict for the table  (P1-P4, M1-M5, M7, M8, C1-C3, W1, W2)
 """
 import json
 import math
@@ -267,6 +267,35 @@ def table_metrics(spark, table, info, cfg, pm_rows):
     m["avg_added_files_per_commit"] = round(float(c.files), 2) if c.files is not None else None
     m["avg_added_bytes_per_commit"] = round(float(c.bytes), 0) if c.bytes is not None else None
     m["avg_changed_partitions_per_commit"] = round(float(c.parts), 2) if c.parts is not None else None
+
+    # W2: rewrite churn from overwrite commits (copy-on-write MERGE/UPDATE/
+    # DELETE, INSERT OVERWRITE, full refreshes). Compaction is 'replace' and
+    # merge-on-read row deltas delete no data files, so neither counts.
+    # Share = data files a commit removed / data files the table had before it.
+    w = _one(spark, f"""
+        WITH o AS (
+            SELECT committed_at,
+                   CAST(coalesce(summary['deleted-data-files'], '0') AS DOUBLE) AS del_files,
+                   CAST(coalesce(summary['added-data-files'], '0') AS DOUBLE)   AS add_files,
+                   CAST(summary['total-data-files'] AS DOUBLE)                  AS total_files,
+                   CAST(coalesce(summary['removed-files-size'], '0') AS DOUBLE) AS removed_bytes
+            FROM (SELECT committed_at, operation, summary FROM {table}.snapshots
+                  ORDER BY committed_at DESC LIMIT {recent})
+            WHERE operation = 'overwrite' AND CAST(coalesce(summary['deleted-data-files'], '0') AS INT) > 0
+        )
+        SELECT count(*) AS n,
+               avg(del_files / greatest(total_files - add_files + del_files, 1)) AS share,
+               sum(CASE WHEN committed_at >= current_timestamp() - INTERVAL 24 HOURS THEN 1 ELSE 0 END) AS n24,
+               sum(CASE WHEN committed_at >= current_timestamp() - INTERVAL 24 HOURS
+                        THEN removed_bytes ELSE 0 END) AS bytes24
+        FROM o
+    """)
+    m["overwrite_commits_recent"] = int(w.n or 0)
+    m["avg_overwrite_rewrite_share"] = round(float(w.share), 3) if w.share is not None else None
+    m["overwrite_commits_24h"] = int(w.n24 or 0)
+    m["rewritten_bytes_24h"] = int(w.bytes24 or 0)
+    m["table_turnover_24h"] = (round(m["rewritten_bytes_24h"] / m["data_bytes"], 2)
+                               if m["data_bytes"] else None)
 
     # M5: manifests of the current snapshot (data manifests only)
     mf = _one(spark, f"""

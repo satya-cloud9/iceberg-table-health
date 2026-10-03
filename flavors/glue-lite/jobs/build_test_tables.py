@@ -19,6 +19,7 @@ this schema make 1 MB, so a "healthy day" of 100,000 rows is one ~3.8 MB file.
   s9_hourly_small      hours(), 2 fragmented hours of 48         -> SMALL_FILES
   s10_equality_deletes unpartitioned v2 + 10 equality-delete commits -> DELETE_BUILDUP
   s11_string_keys      identity on awkward strings ("o'neil", "a/b") -> SMALL_FILES
+  s12_cow_merge_churn  copy-on-write MERGEs of 50 rows across 30 days -> REWRITE_CHURN
 
 s3 is always built last: it ages its past day beyond the hot window, then
 writes "today", so a scan started right after sees exactly one hot partition.
@@ -298,6 +299,37 @@ def s11_string_keys(b, args):
     return t
 
 
+S12_DAYS, S12_ROWS = 30, 5_000
+
+
+def s12_cow_merge_churn(b, args):
+    """30 days, then 15 copy-on-write MERGEs that each update 50 random rows.
+    Each merge rewrites every day file holding one of those rows (~80% of
+    the table), so files stay healthy while the table is rewritten ~12x."""
+    t = f"{NS}.s12_cow_merge_churn"
+    b.create(t, "days(occurred_at)", {"format-version": "2", "write.merge.mode": "copy-on-write",
+                                      "write.update.mode": "copy-on-write",
+                                      "write.delete.mode": "copy-on-write"})
+    first = b.next_id
+    b.many_days(t, [date(2026, 9, 1) + timedelta(days=i) for i in range(S12_DAYS)], S12_ROWS)
+    b.finish(t)                                            # merges run with default distribution
+    rng = random.Random(12)
+    for i in range(15):
+        merge_random_rows(b.spark, t, first, S12_DAYS * S12_ROWS, 50, rng, f"cow-{i}")
+    return t
+
+
+def merge_random_rows(spark, table, first_id, n_ids, rows, rng, tag):
+    """MERGE that updates `rows` random existing rows (by event_id) to a new payload."""
+    ids = rng.sample(range(first_id, first_id + n_ids), rows)
+    spark.createDataFrame([(f"evt-{i}", f"{tag}-{i}") for i in ids], "event_id string, payload string") \
+        .createOrReplaceTempView("merge_src")
+    spark.sql(f"""
+        MERGE INTO {table} t USING merge_src s ON t.event_id = s.event_id
+        WHEN MATCHED THEN UPDATE SET t.payload = s.payload
+    """)
+
+
 def s3_hot_partition(b, args):
     t = f"{NS}.s3_hot_partition"
     b.create(t, "days(occurred_at)", {})
@@ -325,6 +357,7 @@ BUILDERS = {
     "s9": s9_hourly_small,
     "s10": s10_equality_deletes,
     "s11": s11_string_keys,
+    "s12": s12_cow_merge_churn,
     "s3": s3_hot_partition,      # keep last
 }
 

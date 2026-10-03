@@ -183,6 +183,31 @@
         "_comment": "proves quoting of string partition values in the WHERE",
         "expect": []
       }
+    },
+    "glue.demo.s12_cow_merge_churn": {
+      "_comment": "copy-on-write merges: files look healthy, the table is rewritten ~12x; any SMALL_FILES would be held as advisory",
+      "expect": [
+        {
+          "symptom": "REWRITE_CHURN"
+        }
+      ],
+      "after": {
+        "_comment": "after make gl-step STEP=s12-mor: merge-on-read now, so churn is gone and the cost shows up as deletes (and small files from the merged rows) - work scheduled compaction already handles",
+        "expect": [
+          {
+            "symptom": "DELETE_BUILDUP",
+            "min_count": 1
+          },
+          {
+            "symptom": "SMALL_FILES",
+            "optional": true
+          },
+          {
+            "symptom": "SCATTERED_SMALL_FILES",
+            "optional": true
+          }
+        ]
+      }
     }
   }
 }

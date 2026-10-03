@@ -59,7 +59,7 @@ up: preflight install emulator-up provider-apply platform-apply tenant-apply flo
 # Kestra, Spark Operator, Glue, S3, Iceberg on the emulated EKS cluster --
 # no platform/tenant layers. Tear down with `make destroy` as usual.
 .PHONY: gl-spike gl-cluster gl-spark-operator gl-image gl-smoke gl-up gl-generate \
-        gl-health gl-bench gl-compact gl-report gl-demo gl-test-tables gl-metrics gl-symptoms gl-scorecard gl-scan gl-plan
+        gl-health gl-bench gl-compact gl-report gl-demo gl-test-tables gl-metrics gl-symptoms gl-scorecard gl-scan gl-plan gl-step
 
 gl-spike:
 	bash flavors/glue-lite/spike/run-glue-spike.sh
@@ -122,6 +122,7 @@ gl-demo:
 #   make gl-scan FRESH_S3=1          rebuild s3 first so its hot partition is checkable (~4 min more)
 #   make gl-plan T=s0                print the fix plan for s0 from the latest scan (dry run)
 #   make gl-plan T=s0 APPLY=1        run the plan's auto steps -> glue.ops.actions
+#   make gl-step STEP=s12-mor        scripted approval step for a scenario (see scenario_step.py)
 #   make gl-bench BENCH_LABEL=before BENCH_ARGS="--table glue.demo.s0_small_appends"
 #   make gl-test-tables TT_ARGS="--only s0,s4"
 TT_ARGS ?=
@@ -131,6 +132,7 @@ SCAN_ARGS ?=
 FRESH_S3 ?=
 T ?=
 APPLY ?=
+STEP ?=
 gl-test-tables:
 	JOB_TIMEOUT_MIN=45 bash flavors/glue-lite/scripts/run-job.sh py build_test_tables.py $(TT_ARGS)
 
@@ -148,6 +150,9 @@ ifeq ($(FRESH_S3),1)
 	JOB_TIMEOUT_MIN=15 bash flavors/glue-lite/scripts/run-job.sh py build_test_tables.py --only s3
 endif
 	bash flavors/glue-lite/scripts/run-job.sh py gl_scan.py $(SCAN_ARGS)
+
+gl-step:
+	JOB_TIMEOUT_MIN=20 bash flavors/glue-lite/scripts/run-job.sh py scenario_step.py $(STEP)
 
 gl-plan:
 	bash flavors/glue-lite/scripts/run-job.sh py plan.py $(if $(T),--tables $(T)) $(if $(filter 1,$(APPLY)),--apply)

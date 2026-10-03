@@ -150,7 +150,7 @@ def plan_table(table, findings, tm, cfg):
     ident = table.split(".", 1)[1] if table.startswith("glue.") else table
     fields = json.loads(tm.get("partition_fields_json") or "[]")
     target = int(tm.get("target_file_bytes") or cfg["target_file_bytes"])
-    active = [f for f in findings if f["action"] in ("auto", "approval", "defer", "needs-evidence")]
+    active = [f for f in findings if f["action"] in ("auto", "approval", "defer", "needs-evidence", "advisory")]
     names = {f["symptom"] for f in active}
     steps = []
 
@@ -226,6 +226,11 @@ def plan_table(table, findings, tm, cfg):
                       "note": f"{len(hot)} hot partition(s) left out until writes stop: "
                               + ", ".join(f["partition_key"] for f in hot)})
 
+    held = [f for f in active if f["action"] == "advisory"]
+    if held:
+        steps.append({"kind": "hold", "auto": False, "symptoms": sorted({f["symptom"] for f in held}),
+                      "statement": "", "note": f"{len(held)} finding(s) held: {held[0]['remedy']}"})
+
     # 2. manifests
     if any(f["symptom"] == "MANIFEST_BLOAT" and f["action"] == "auto" for f in active):
         steps.append({"kind": "rewrite_manifests", "auto": True, "symptoms": ["MANIFEST_BLOAT"],
@@ -260,6 +265,9 @@ def plan_table(table, findings, tm, cfg):
                 stmt = (f"ALTER TABLE {table} REPLACE PARTITION FIELD {x['name']} WITH "
                         f"{coarser}({x['source']}); CALL glue.system.rewrite_data_files("
                         f"table => '{ident}', options => map('rewrite-all', 'true'))")
+        elif f["symptom"] == "REWRITE_CHURN":
+            stmt = (f"ALTER TABLE {table} SET TBLPROPERTIES ('write.merge.mode' = 'merge-on-read', "
+                    f"'write.update.mode' = 'merge-on-read', 'write.delete.mode' = 'merge-on-read')")
         elif f["symptom"] == "POOR_CLUSTERING" and ev.get("column"):
             stmt = (f"ALTER TABLE {table} WRITE ORDERED BY {ev['column']}; "
                     f"CALL glue.system.rewrite_data_files(table => '{ident}', strategy => 'sort')")

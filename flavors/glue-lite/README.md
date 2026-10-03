@@ -424,3 +424,48 @@ make gl-image
 make gl-plan T=s11 APPLY=1      # latest scan still shows SMALL_FILES on o'neil
 make gl-scan                    # s11 PASS (after fix)
 ```
+
+## GL2.5g — Copy-on-write churn (s12)
+
+Copy-on-write `MERGE`/`UPDATE`/`DELETE` rewrites every file holding a changed
+row. Files stay well-sized, so no file-layout rule fires, but a 50-row merge
+spread across a table can rewrite most of it on every commit.
+
+**Metric W2** (from `.snapshots`, cheap): over the recent commits, overwrite
+commits that removed data files (copy-on-write rewrites, INSERT OVERWRITE,
+full refreshes; compaction is `replace` and merge-on-read deltas remove no
+data files, so neither counts): their count, the average share of the
+table's files each one removed, and bytes removed in 24 h ÷ table size
+(`table_turnover_24h`).
+
+**`REWRITE_CHURN`** (write configuration, approval): >= 5 such commits,
+average share >= 30%, turnover >= 2x in 24 h. Suggested SQL: switch the
+merge/update/delete modes to merge-on-read; alternatives in the remedy:
+narrow each merge (partition predicate, dbt `incremental_predicates`) or sort
+on the merge key. While it's active, `SMALL_FILES`/`SCATTERED_SMALL_FILES`
+on the table become **advisory** (shown, held, never planned): bigger files
+would make every copy-on-write merge rewrite more bytes.
+
+**s12_cow_merge_churn**: 30 days, then 15 copy-on-write MERGEs of 50 random
+rows (each rewrites ~80% of the day files; ~12x turnover). Before: only
+`REWRITE_CHURN`. The fix needs approval, so `scenario_step.py s12-mor` plays
+the approver: switches to merge-on-read, expires the old snapshots (the
+copy-on-write commits would otherwise stay in the churn window), runs 10
+merge-on-read MERGEs of 1,000 rows, waits out the hot window, and records the
+approval in `glue.ops.actions`. After: no churn; `DELETE_BUILDUP` instead
+(plus small files from the merged rows) - work scheduled compaction handles.
+
+```bash
+make gl-image
+make gl-test-tables TT_ARGS="--only s12"      # waits out the hot window
+make gl-scan                                  # s12 PASS (before): REWRITE_CHURN
+make gl-plan T=s12                            # ASK: the merge-on-read ALTER
+make gl-step STEP=s12-mor                     # approve + more merges (~6 min)
+make gl-scan                                  # s12 PASS (after fix): DELETE_BUILDUP
+make gl-plan T=s12 APPLY=1                    # optional: compaction now handles it
+```
+
+Note for the work platform: Trino's Iceberg connector writes position
+deletes for row-level changes (merge-on-read) whatever the table's
+write.*.mode says, as far as I know; copy-on-write churn there would come
+from Spark-based writers. Check against their Trino version.

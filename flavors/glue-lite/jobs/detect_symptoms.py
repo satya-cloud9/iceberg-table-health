@@ -27,7 +27,7 @@ SYMPTOMS_DDL = """
     score DOUBLE, severity STRING, remedy STRING, evidence_level STRING,
     evidence_json STRING, rule_version STRING"""
 
-ACTION_ORDER = {"auto": 0, "defer": 1, "approval": 2, "needs-evidence": 3}
+ACTION_ORDER = {"auto": 0, "defer": 1, "approval": 2, "advisory": 3, "needs-evidence": 4}
 
 
 def coerce(value, data_type):
