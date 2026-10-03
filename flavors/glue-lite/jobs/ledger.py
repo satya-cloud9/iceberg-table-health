@@ -37,6 +37,7 @@ import random
 from datetime import datetime, timedelta, timezone
 
 import activity as act
+import windows as win
 
 SNAPSHOT_LOG_DDL = """
     table_uuid STRING, table_name STRING, snapshot_id BIGINT, parent_id BIGINT,
@@ -372,6 +373,7 @@ class Ledger:
         self.pending = {"snapshot_log": [], "commit_gap_hist": [], "ledger_state": [], "incremental_check": [],
                         "partition_activity": [], "lateness_hist": [], "activity_state": []}
         self.pstate_updates = []   # partition_state rows, merged once at the end
+        self.mode3 = mode_of(config, "learned_windows")
         self.mode2 = mode_of(config, "partition_activity")
         if self.mode2 == "on":     # family 2 only reports in this patch; "on" behaves like shadow
             self.mode2 = "shadow"
@@ -398,6 +400,20 @@ class Ledger:
             self._family1(table, uuid, tm, cfg, full_fn, snaps, current, versions)
         if self.mode2 != "off":
             self._family2(table, uuid, tm, cfg, snaps, live_keys or [], partitioned)
+        if self.mode3 != "off" and self.mode != "off" and self.mode2 != "off":
+            self._windows(uuid, tm, cfg)
+
+    def _windows(self, uuid, tm, cfg):
+        """Family 3 inputs, recorded per table for detect_symptoms."""
+        inc = self.config.get("incremental") or {}
+        p99, n_late = self._late_pct(uuid, 0.99)
+        tm["lateness_p99_h"] = p99
+        tm["hot_window_min"], tm["hot_window_source"] = win.learned_hot(
+            tm.get("commit_gap_p95_min"), tm.get("commit_gaps_window"),
+            float(cfg.get("hot_partition_minutes", 15)), float(inc.get("hot_cap_minutes", 1440)),
+            int(inc.get("min_samples", 20)), float(inc.get("hot_gap_factor", 2.0)))
+        tm["settle_window_h"], tm["settle_window_source"] = win.learned_settle(
+            p99, n_late, float(inc.get("settle_cap_hours", 168)), int(inc.get("min_samples", 20)))
 
     def _family1(self, table, uuid, tm, cfg, full_fn, snaps, current, versions):
         """Ingest new snapshots, compute ledger metrics, compare (shadow / spot
@@ -581,6 +597,9 @@ class Ledger:
         return got
 
     def _late_p95(self, uuid):
+        return self._late_pct(uuid, 0.95)
+
+    def _late_pct(self, uuid, q):
         counts = {}
         for r in self.spark.sql(f"""
                 SELECT bucket_max_h, sum(batches) AS n FROM {self.ops}.lateness_hist
@@ -592,7 +611,7 @@ class Ledger:
         for r in self.pending["lateness_hist"]:
             if r["table_uuid"] == uuid and r["day"] >= self._cutoff_day():
                 counts[r["bucket_max_h"]] = counts.get(r["bucket_max_h"], 0) + r["batches"]
-        return act.hist_percentile(counts, 0.95)
+        return act.hist_percentile(counts, q)
 
     def _late_exact(self, uuid):
         cutoff = self._cutoff_day()

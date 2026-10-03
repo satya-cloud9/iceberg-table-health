@@ -783,3 +783,45 @@ make gl-plan T=s0 APPLY=1 && make gl-scan      # compaction: removed + added, la
 make gl-test-tables TT_ARGS="--only s1" && make gl-scan   # late arrivals: lateness > 0
 make gl-scan FRESH_S3=1                        # hot partition: hot_partitions_ledger = 1 on s3
 ```
+
+## GL2.5o — Incremental scan, family 3: learned windows (shadow)
+
+Two waits are learned per table instead of one fixed number (`windows.py`):
+
+| Window | Learned from | Rule | Bounds |
+|---|---|---|---|
+| Hot window | Family 1's commit-gap histogram | 2 × the 95th-percentile gap between writer commits | at least `hot_partition_minutes` (floor), at most `hot_cap_minutes` (24 h); needs `min_samples` (20) gaps, else the configured value |
+| Settle window | Family 2's lateness histogram | the 99th-percentile lateness (hours after a partition's time range ended) | at most `settle_cap_hours` (7 days); time-based partitions only; needs 20 batches, else none |
+
+New rule, **SETTLING** (defer): a partition whose time range ended less than
+the settle window ago still receives late data, so a small-files-only
+compaction waits, unless the excess is already `settle_big_factor` (3) × the
+threshold. Partitions with delete buildup are not held. `plan.py` holds
+SETTLING partitions like hot ones.
+
+The learned variant takes each partition's age from family 2's
+`partition_state` (last writer write), not from the full path: the full path
+only computes per-partition age inside the configured window, so under a longer
+learned window every partition would get the table-level age and look hot.
+
+**Shadow:** detection runs the rules twice, configured windows (these decide)
+and learned windows, and records what would change in `incremental_check`
+(family `learned_windows`, `agree` = no change). Each detect prints:
+```
+=== Learned windows (shadow): 3/21 tables would change ===
+  s1_late_arrivals           hot 3 min [config floor], settle 168.0 h [learned (capped)]
+                               {"occurred_at_day":"2026-09-30"}: SMALL_FILES -> SETTLING
+```
+These aren't errors: each change is a decision to review. Family 3 goes on
+(`incremental.learned_windows: on`) once every change on the test tables is
+justified; the scenario expectations get updated then.
+
+New `table_metrics` columns: `lateness_p99_h`, `hot_window_min`,
+`hot_window_source`, `settle_window_h`, `settle_window_source`. Reopened
+partitions (written again after a compaction) are already counted per table in
+`reopened_partitions` (family 2).
+
+Run it: `make gl-image && make gl-scan`, then
+```bash
+make gl-sql Q="SELECT table_name, ledger_value AS windows, note AS changes FROM glue.ops.incremental_check WHERE family = 'learned_windows' AND NOT agree AND scan_id = (SELECT max(scan_id) FROM glue.ops.incremental_check)"
+```

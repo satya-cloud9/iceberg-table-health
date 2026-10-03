@@ -22,7 +22,7 @@ import json
 import math
 import re
 
-RULE_VERSION = "2.5h-1"
+RULE_VERSION = "2.5o-1"
 
 # symptom -> (category, level, action, remedy)
 CATALOG = {
@@ -30,6 +30,9 @@ CATALOG = {
                               "rewrite_data_files (binpack) scoped to this partition"),
     "HOT_PARTITION":         ("file_layout", "partition", "defer",
                               "wait until writes stop, then compact (still being written)"),
+    "SETTLING":              ("file_layout", "partition", "defer",
+                              "wait: late data is still expected for this partition (settle window); "
+                              "compact once it has settled, unless the excess is already large"),
     "DELETE_BUILDUP":        ("file_layout", "partition", "auto",
                               "rewrite_data_files with delete-file-threshold, then "
                               "rewrite_position_delete_files"),
@@ -130,7 +133,11 @@ def coarser_spec_hint(spec):
     return "drop or coarsen the partition transform"
 
 
-def partition_findings(table, rows, th, hot_minutes):
+def partition_findings(table, rows, th, hot_minutes, settle_hours=None, settle_big_factor=3.0):
+    """settle_hours (GL2.5o, learned from lateness): a partition whose time range
+    ended less than that long ago still receives late data, so small-file-only
+    compaction waits (SETTLING) unless the excess is already settle_big_factor x
+    the threshold. Needs r['hours_since_end'] (time-based partitions only)."""
     out = []
     min_excess = th["min_excess_files"]
     for r in rows:
@@ -161,6 +168,15 @@ def partition_findings(table, rows, th, hot_minutes):
             out.append(_finding(table, "HOT_PARTITION", max(excess / min_excess, 1.0), ev, key,
                                 remedy=f"wait: last write {ev['minutes_since_update']} min ago "
                                        f"(< {hot_minutes}); compact after it cools"))
+            continue
+        since_end = r.get("hours_since_end")
+        if (small and not deletes and settle_hours and since_end is not None
+                and since_end < settle_hours and excess < settle_big_factor * min_excess):
+            ev = dict(ev, hours_since_partition_end=round(since_end, 1), settle_hours=settle_hours)
+            out.append(_finding(table, "SETTLING", excess / min_excess, ev, key,
+                                remedy=f"wait: partition ended {ev['hours_since_partition_end']} h ago and late "
+                                       f"data lands for up to {settle_hours} h; compact after, or now if the "
+                                       f"excess reaches {int(settle_big_factor * min_excess)} files"))
             continue
         if small:
             out.append(_finding(table, "SMALL_FILES", excess / min_excess, ev, key))
@@ -363,7 +379,9 @@ def evaluate(table, tm, rows, cfg, history=None, actions=None):
         return []
     th = cfg["thresholds"]
     hot = float(cfg.get("hot_partition_minutes", 15))
-    out = partition_findings(table, rows, th, hot) + table_findings(table, tm, rows, th, cfg)
+    out = (partition_findings(table, rows, th, hot, cfg.get("settle_hours"),
+                              float(cfg.get("settle_big_factor", 3.0)))
+           + table_findings(table, tm, rows, th, cfg))
     if history or actions:
         out += trend_findings(table, history or [], actions or [], th)
     if any(f["symptom"] == "REWRITE_CHURN" for f in out):

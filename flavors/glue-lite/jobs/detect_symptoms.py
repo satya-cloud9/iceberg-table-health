@@ -20,6 +20,8 @@ from pyspark.sql import SparkSession
 import gl_common as gl
 import probes
 import symptom_rules
+import windows as win
+from ledger import CHECK_DDL, mode_of
 
 SYMPTOMS_DDL = """
     scan_id STRING, detected_at TIMESTAMP, table_name STRING, partition_key STRING,
@@ -77,6 +79,49 @@ def load_history(spark, tms, scan_id):
     return history, actions
 
 
+def load_partition_state(spark, tms):
+    """Family 2's per-partition state, by table UUID (empty when family 2 never ran)."""
+    ps = f"{gl.OPS_NAMESPACE}.partition_state"
+    uuids = sorted({t["table_uuid"] for t in tms if t.get("table_uuid")})
+    if not uuids or not spark.catalog.tableExists(ps):
+        return {}
+    out = {}
+    ids = ", ".join(f"'{u}'" for u in uuids)
+    for r in spark.sql(f"SELECT table_uuid, partition_key, last_write_ms FROM {ps} "
+                       f"WHERE table_uuid IN ({ids})").collect():
+        out.setdefault(r.table_uuid, {})[r.partition_key] = {"last_write_ms": r.last_write_ms}
+    return out
+
+
+def record_window_changes(spark, scan_id, at, mode, changes, report=True):
+    """What the learned windows change, per table (glue.ops.incremental_check,
+    family learned_windows; agree = no change)."""
+    ic = f"{gl.OPS_NAMESPACE}.incremental_check"
+    spark.sql(f"CREATE TABLE IF NOT EXISTS {ic} ({CHECK_DDL}) USING iceberg")
+    schema = spark.table(ic).schema
+    rows = []
+    for tm, d in changes:
+        windows = (f"hot {tm.get('hot_window_min')} min ({tm.get('hot_window_source')}); "
+                   f"settle {tm.get('settle_window_h')} h ({tm.get('settle_window_source')})")
+        rows.append(tuple(coerce(v, c.dataType) for v, c in zip(
+            [scan_id, at, tm["table_name"], tm.get("table_uuid"), "learned_windows", "findings",
+             "configured windows", windows, not d, "; ".join(d)[:2000]], schema)))
+    if rows:
+        spark.createDataFrame(rows, schema).writeTo(ic).append()
+    changed = [(tm, d) for tm, d in changes if d]
+    print(f"\n=== Learned windows ({mode}): {len(changed)}/{len(changes)} tables would change"
+          f"{'' if mode == 'shadow' else ' (applied)'} ===", flush=True)
+    if report:
+        for tm, d in changes:
+            if not d and tm.get("hot_window_source", "").startswith("config"):
+                continue
+            name = tm["table_name"].rsplit(".", 1)[-1]
+            print(f"  {name:26} hot {tm.get('hot_window_min'):g} min [{tm.get('hot_window_source')}], "
+                  f"settle {tm.get('settle_window_h')} h [{tm.get('settle_window_source')}]", flush=True)
+            for line in d[:8]:
+                print(f"  {'':26}   {line}", flush=True)
+
+
 def run_detect(spark, scan_id, config, report=True):
     """Apply the rules to one scan, append to glue.ops.symptoms, return the findings."""
     tm_table = f"{gl.OPS_NAMESPACE}.table_metrics"
@@ -85,7 +130,8 @@ def run_detect(spark, scan_id, config, report=True):
     spark.sql(f"CREATE TABLE IF NOT EXISTS {sy_table} ({SYMPTOMS_DDL}) USING iceberg")
     schema = spark.table(sy_table).schema
 
-    tms = [r.asDict() for r in spark.sql(f"SELECT * FROM {tm_table} WHERE scan_id = '{scan_id}'").collect()]
+    tms = [r.asDict() for r in spark.sql(f"SELECT *, unix_millis(scanned_at) AS scanned_ms FROM {tm_table} "
+                                         f"WHERE scan_id = '{scan_id}'").collect()]
     parts = {}
     for r in spark.sql(f"SELECT * FROM {pm_table} WHERE scan_id = '{scan_id}'").collect():
         parts.setdefault(r.table_name, []).append(r.asDict())
@@ -93,11 +139,29 @@ def run_detect(spark, scan_id, config, report=True):
     history, actions = load_history(spark, tms, scan_id)
     detected_at = probes.now_utc()
     findings = []
+    mode3 = mode_of(config, "learned_windows")
+    pstate = load_partition_state(spark, tms) if mode3 != "off" else {}
+    changes = []
     for tm in sorted(tms, key=lambda t: t["table_name"]):
         table, uuid = tm["table_name"], tm.get("table_uuid")
-        findings += symptom_rules.evaluate(table, tm, parts.get(table, []),
-                                           gl.table_config(config, table),
-                                           history=history.get(uuid, []), actions=actions.get(uuid, []))
+        cfg = gl.table_config(config, table)
+        current = symptom_rules.evaluate(table, tm, parts.get(table, []), cfg,
+                                         history=history.get(uuid, []), actions=actions.get(uuid, []))
+        mine = current
+        if mode3 != "off" and uuid in pstate and tm.get("hot_window_min") is not None:
+            # GL2.5o: the same rules with learned windows and the ledger's per-partition age
+            cfg2 = dict(cfg, hot_partition_minutes=tm["hot_window_min"], settle_hours=tm.get("settle_window_h"))
+            rows2 = win.learned_rows(parts.get(table, []), pstate[uuid],
+                                     json.loads(tm.get("partition_fields_json") or "[]"), tm["scanned_ms"])
+            learned = symptom_rules.evaluate(table, tm, rows2, cfg2,
+                                             history=history.get(uuid, []), actions=actions.get(uuid, []))
+            d = win.diff(current, learned)
+            changes.append((tm, d))
+            if mode3 == "on":
+                mine = learned
+        findings += mine
+    if mode3 != "off":
+        record_window_changes(spark, scan_id, detected_at, mode3, changes, report)
 
     print(f"=== Symptoms for scan {scan_id}: {len(findings)} findings over {len(tms)} tables ===",
           flush=True)

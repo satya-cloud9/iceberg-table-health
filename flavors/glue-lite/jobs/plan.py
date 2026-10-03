@@ -264,11 +264,12 @@ def plan_table(table, findings, tm, cfg):
                                     f"options => map('rewrite-all', 'true'))"),
                       "note": "removes delete files left pointing at rewritten data files"})
 
-    hot = [f for f in active if f["symptom"] == "HOT_PARTITION"]
+    hot = [f for f in active if f["symptom"] in ("HOT_PARTITION", "SETTLING")]
     if hot:
-        steps.append({"kind": "hold", "auto": False, "symptoms": ["HOT_PARTITION"], "statement": "",
-                      "note": f"{len(hot)} hot partition(s) left out until writes stop: "
-                              + ", ".join(f["partition_key"] for f in hot)})
+        steps.append({"kind": "hold", "auto": False, "symptoms": sorted({f["symptom"] for f in hot}),
+                      "statement": "",
+                      "note": f"{len(hot)} partition(s) left out (still being written, or late data "
+                              f"still expected): " + ", ".join(f["partition_key"] for f in hot)})
 
     held = [f for f in active if f["action"] == "advisory"]
     if held:

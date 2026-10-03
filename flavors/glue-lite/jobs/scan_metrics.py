@@ -58,7 +58,9 @@ TABLE_METRICS_DDL = """
     minutes_since_writer_commit DOUBLE, orphan_scanned_at TIMESTAMP, retained_scanned_at TIMESTAMP,
     commit_gap_p95_min DOUBLE, commit_gaps_window BIGINT, ledger_new_snapshots BIGINT, ledger_event STRING,
     activity_new_snapshots BIGINT, activity_event STRING, lateness_p95_h DOUBLE, lateness_batches_window BIGINT,
-    reopened_partitions BIGINT, hot_partitions_ledger BIGINT"""
+    reopened_partitions BIGINT, hot_partitions_ledger BIGINT,
+    lateness_p99_h DOUBLE, hot_window_min DOUBLE, hot_window_source STRING,
+    settle_window_h DOUBLE, settle_window_source STRING"""
 
 
 def coerce(value, data_type):
