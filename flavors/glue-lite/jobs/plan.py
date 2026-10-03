@@ -62,7 +62,9 @@ def _literal(value, source_type):
     if value is None:
         return None
     if source_type in ("string", "uuid"):
-        return "'" + str(value).replace("'", "''") + "'"
+        # Spark SQL escapes with backslashes. A doubled quote ('o''neil') is
+        # two adjacent literals that Spark concatenates into 'oneil'.
+        return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
     if source_type == "date":
         return f"DATE '{value}'"
     if source_type.startswith("timestamp"):

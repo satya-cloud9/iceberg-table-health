@@ -404,3 +404,23 @@ make gl-scan                                            # s7-s11 PASS (after fix
 s10's equality deletes go through `GenericAppenderFactory` over py4j. If that
 class isn't in the image, the builder says so and s10's scorecard check fails
 instead of the whole build.
+
+### s11 caught a quoting bug
+
+First run: 11/12 PASS; s11 kept `SMALL_FILES` on `o'neil` after the fix.
+plan.py quoted it SQL-standard style as `'o''neil'`, but Spark SQL treats
+that as two adjacent literals and concatenates them into `'oneil'`, which
+matches nothing. Spark escapes with backslashes: `'o\'neil'`, and because
+the `where` sits inside the CALL's double-quoted string the backslash is
+escaped once more there. Verified locally with Spark through both parse
+layers for `o'neil`, `a/b`, `x=y`, a backslash and a double quote.
+
+Note for the Trino port: Trino is the opposite (standard SQL: `'o''neil'`
+is correct, backslash is not an escape), so the predicate builder needs a
+dialect switch there.
+
+```bash
+make gl-image
+make gl-plan T=s11 APPLY=1      # latest scan still shows SMALL_FILES on o'neil
+make gl-scan                    # s11 PASS (after fix)
+```
