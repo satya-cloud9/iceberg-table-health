@@ -50,6 +50,33 @@ def latest_scan_id(spark):
     return r[0].s if r else None
 
 
+def load_history(spark, tms, scan_id):
+    """Per table UUID: earlier scans (oldest first, up to the current one) and actions.
+    Bounded by the scan's own timestamp in SQL: a Python datetime written back as a
+    literal would shift by the driver's local zone."""
+    uuids = sorted({t["table_uuid"] for t in tms if t.get("table_uuid")})
+    history, actions = {}, {}
+    if not uuids:
+        return history, actions
+    ids = ", ".join(f"'{u}'" for u in uuids)
+    cols = {f.name for f in spark.table(f"{gl.OPS_NAMESPACE}.table_metrics").schema}
+    want = [c for c in ("excess_files_total", "delete_files", "data_manifests") if c in cols]
+    for r in spark.sql(f"""
+            SELECT table_uuid, scanned_at, {', '.join(want)}
+            FROM {gl.OPS_NAMESPACE}.table_metrics
+            WHERE table_uuid IN ({ids}) AND scanned_at <= (
+                SELECT max(scanned_at) FROM {gl.OPS_NAMESPACE}.table_metrics WHERE scan_id = '{scan_id}')
+            ORDER BY scanned_at""").collect():
+        history.setdefault(r.table_uuid, []).append(r.asDict())
+    if spark.catalog.tableExists(f"{gl.OPS_NAMESPACE}.actions"):
+        for r in spark.sql(f"""
+                SELECT table_uuid, started_at, kind, status, result_json
+                FROM {gl.OPS_NAMESPACE}.actions WHERE table_uuid IN ({ids})
+                ORDER BY started_at""").collect():
+            actions.setdefault(r.table_uuid, []).append(r.asDict())
+    return history, actions
+
+
 def run_detect(spark, scan_id, config, report=True):
     """Apply the rules to one scan, append to glue.ops.symptoms, return the findings."""
     tm_table = f"{gl.OPS_NAMESPACE}.table_metrics"
@@ -63,12 +90,14 @@ def run_detect(spark, scan_id, config, report=True):
     for r in spark.sql(f"SELECT * FROM {pm_table} WHERE scan_id = '{scan_id}'").collect():
         parts.setdefault(r.table_name, []).append(r.asDict())
 
+    history, actions = load_history(spark, tms, scan_id)
     detected_at = probes.now_utc()
     findings = []
     for tm in sorted(tms, key=lambda t: t["table_name"]):
-        table = tm["table_name"]
+        table, uuid = tm["table_name"], tm.get("table_uuid")
         findings += symptom_rules.evaluate(table, tm, parts.get(table, []),
-                                           gl.table_config(config, table))
+                                           gl.table_config(config, table),
+                                           history=history.get(uuid, []), actions=actions.get(uuid, []))
 
     print(f"=== Symptoms for scan {scan_id}: {len(findings)} findings over {len(tms)} tables ===",
           flush=True)

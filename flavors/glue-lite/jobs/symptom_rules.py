@@ -50,6 +50,12 @@ CATALOG = {
                               "set write.metadata.delete-after-commit.enabled=true so metadata.json "
                               "versions that fall off the log are deleted; remove_orphan_files for the "
                               "ones already left behind"),
+    "MAINTENANCE_LAG":       ("operations", "table", "approval",
+                              "maintenance is not keeping up: run plans more often or raise "
+                              "max_partitions_per_run; check what changed in the writer"),
+    "MAINTENANCE_FAILING":   ("operations", "table", "approval",
+                              "the same maintenance step keeps failing: read the error in "
+                              "glue.ops.actions and fix the cause before the next run"),
     "ORPHAN_FILES":          ("storage", "table", "approval",
                               "remove_orphan_files older than the safety age (dry run first)"),
     "PARTITION_SKEW":        ("partition_design", "table", "approval",
@@ -305,13 +311,61 @@ def table_findings(table, tm, rows, th, cfg):
     return out
 
 
-def evaluate(table, tm, rows, cfg):
+TREND_METRICS = {                 # metric -> floor below which growth isn't worth flagging
+    "excess_files_total": "trend_floor_excess_files",
+    "delete_files": "trend_floor_delete_files",
+    "data_manifests": "trend_floor_manifests",
+}
+
+
+def trend_findings(table, history, actions, th):
+    """Maintenance falling behind, from scan history and the actions log.
+
+    history: this table's table_metrics rows (same table UUID), oldest first,
+             ending with the current scan.
+    actions: this table's glue.ops.actions rows, oldest first.
+    """
+    out = []
+    n = int(th.get("trend_scans", 3))
+    pts = history[-n:]
+    if len(pts) == n:
+        span_min = (pts[-1]["scanned_at"] - pts[0]["scanned_at"]).total_seconds() / 60
+        if span_min >= th.get("trend_min_span_minutes", 0):
+            for metric, floor_key in TREND_METRICS.items():
+                vals = [p.get(metric) for p in pts]
+                if any(v is None for v in vals):
+                    continue
+                rising = all(b > a for a, b in zip(vals, vals[1:]))
+                grew = vals[-1] >= max(vals[0], 1) * (1 + th.get("trend_growth", 0.5))
+                if rising and grew and vals[-1] >= th.get(floor_key, 10):
+                    out.append(_finding(table, "MAINTENANCE_LAG", vals[-1] / max(vals[0], 1),
+                                        {"metric": metric, "values": vals, "scans": n,
+                                         "span_minutes": round(span_min, 1),
+                                         "actions_in_span": sum(1 for a in actions
+                                                                if a["started_at"] >= pts[0]["scanned_at"])}))
+                    break
+    streak = int(th.get("fail_streak", 2))
+    by_kind = {}
+    for a in actions:
+        by_kind.setdefault(a["kind"], []).append(a)
+    for kind, acts in sorted(by_kind.items()):
+        last = acts[-streak:]
+        if len(last) == streak and all(a["status"] == "failed" for a in last):
+            out.append(_finding(table, "MAINTENANCE_FAILING", float(streak),
+                                {"kind": kind, "failures_in_a_row": streak,
+                                 "last_error": (last[-1].get("result_json") or "")[:300]}))
+    return out
+
+
+def evaluate(table, tm, rows, cfg, history=None, actions=None):
     """All findings for one table. tm = table_metrics dict, rows = partition dicts."""
     if tm.get("load_error") and not rows:
         return []
     th = cfg["thresholds"]
     hot = float(cfg.get("hot_partition_minutes", 15))
     out = partition_findings(table, rows, th, hot) + table_findings(table, tm, rows, th, cfg)
+    if history or actions:
+        out += trend_findings(table, history or [], actions or [], th)
     if any(f["symptom"] == "REWRITE_CHURN" for f in out):
         # Bigger files make every copy-on-write merge rewrite more bytes, so
         # don't compact toward the target while churn is the problem.

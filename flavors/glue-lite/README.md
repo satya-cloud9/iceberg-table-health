@@ -522,3 +522,37 @@ make gl-plan T=s15 APPROVE=UNBOUNDED_RETENTION,ORPHAN_FILES
 make gl-plan T=s16 APPROVE=ORPHAN_FILES
 make gl-scan                            # s13-s16 PASS (after fix)
 ```
+
+## GL2.5i — Maintenance falling behind
+
+Two rules read history instead of a single scan, matched by table UUID (a
+rebuilt table starts a new history):
+
+- **`MAINTENANCE_LAG`**: over the last 3 scans, total excess files (new
+  `excess_files_total`), delete files or data manifests rose every time and
+  grew by >= 50%, ending above a floor (10 excess files / 5 delete files / 10
+  manifests). The evidence lists the values and how many actions ran in that
+  span, so "maintenance ran but can't keep up" and "maintenance isn't
+  running" read differently.
+- **`MAINTENANCE_FAILING`**: the last 2 actions of the same kind on a table
+  both failed. Evidence carries the last error.
+
+Both are approval-level alerts. Thresholds: `trend_*` and `fail_streak` in
+`health.json`; `trend_min_span_minutes` is 0 at test scale (production would
+want hours, so three quick scans don't count as a trend).
+
+History is bounded by the scan's own timestamp inside SQL (not a Python
+datetime literal, which shifts with the driver's time zone).
+
+**s17_growing** plus `make gl-step STEP=grow` (10 more small files on the
+fragmented day, then a hot-window wait):
+
+```bash
+make gl-image
+make gl-test-tables TT_ARGS="--only s17"
+make gl-scan                    # s17: SMALL_FILES (excess 11)
+make gl-step STEP=grow
+make gl-scan                    # excess 21
+make gl-step STEP=grow
+make gl-scan                    # excess 31: MAINTENANCE_LAG in the per-table output
+```

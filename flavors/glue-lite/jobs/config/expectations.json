@@ -265,6 +265,25 @@
         "_comment": "after APPROVE=ORPHAN_FILES: remove_orphan_files deleted the stray objects",
         "expect": []
       }
+    },
+    "glue.demo.s17_growing": {
+      "_comment": "MAINTENANCE_LAG needs three scans with excess files rising (scan / make gl-step STEP=grow / scan / grow / scan); it's optional here so every scan in that sequence passes. Check the per-table output of the third scan for it. Two grow steps add 20 commits, so SNAPSHOT_BUILDUP may appear too.",
+      "expect": [
+        {
+          "symptom": "SMALL_FILES",
+          "partitions": [
+            "2026-09-06"
+          ]
+        },
+        {
+          "symptom": "MAINTENANCE_LAG",
+          "optional": true
+        },
+        {
+          "symptom": "SNAPSHOT_BUILDUP",
+          "optional": true
+        }
+      ]
     }
   }
 }

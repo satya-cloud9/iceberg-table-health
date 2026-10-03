@@ -24,6 +24,8 @@ this schema make 1 MB, so a "healthy day" of 100,000 rows is one ~3.8 MB file.
   s14_spec_evolution   days() evolved to months() mid-life         -> MIXED_SPEC
   s15_metadata_retention previous-versions-max 5, no auto-delete   -> UNBOUNDED_RETENTION (+ orphans)
   s16_orphan_files     stray objects under the table location      -> ORPHAN_FILES
+  s17_growing          a fragmented day that `scenario_step.py grow` keeps adding to
+                       between scans, with no maintenance          -> SMALL_FILES, then MAINTENANCE_LAG
 
 Every build gets a fresh location (<warehouse>/demo.db/<table>-<stamp>):
 DROP ... PURGE only deletes files the old table still references, so reusing
@@ -386,6 +388,18 @@ def s16_orphan_files(b, args):
     return t
 
 
+S17_DAY = date(2026, 9, 6)
+
+
+def s17_growing(b, args):
+    t = f"{NS}.s17_growing"
+    b.create(t, "days(occurred_at)", {})
+    b.many_days(t, [date(2026, 9, 1) + timedelta(days=i) for i in range(5)], 100_000)
+    b.fragment(t, S17_DAY, commits=12, files_per_commit=1, rows_per_commit=300)
+    b.finish(t)
+    return t
+
+
 def s3_hot_partition(b, args):
     t = f"{NS}.s3_hot_partition"
     b.create(t, "days(occurred_at)", {})
@@ -418,6 +432,7 @@ BUILDERS = {
     "s14": s14_spec_evolution,
     "s15": s15_metadata_retention,
     "s16": s16_orphan_files,
+    "s17": s17_growing,
     "s3": s3_hot_partition,      # keep last
 }
 

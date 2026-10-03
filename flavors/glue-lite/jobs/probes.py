@@ -237,6 +237,7 @@ def table_metrics(spark, table, info, cfg, pm_rows):
     ideal = sum(int(r.ideal_files or 0) for r in pm_rows)
     m["read_amplification"] = round(m["data_files"] / ideal, 2) if ideal else None
     m["partitions_with_excess"] = sum(1 for r in pm_rows if (r.excess_files or 0) >= 1)
+    m["excess_files_total"] = sum(max(0, int(r.excess_files or 0)) for r in pm_rows)
     if sizes:
         median = sizes[len(sizes) // 2] if len(sizes) % 2 else (sizes[len(sizes) // 2 - 1] + sizes[len(sizes) // 2]) / 2
         m["skew_ratio"] = round(sizes[-1] / median, 2) if median else None

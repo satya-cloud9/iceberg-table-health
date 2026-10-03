@@ -51,7 +51,7 @@ TABLE_METRICS_DDL = """
     overwrite_commits_recent BIGINT, avg_overwrite_rewrite_share DOUBLE,
     overwrite_commits_24h BIGINT, rewritten_bytes_24h BIGINT, table_turnover_24h DOUBLE,
     orphan_files BIGINT, orphan_bytes BIGINT, listed_objects BIGINT, orphan_sample STRING,
-    orphan_error STRING"""
+    orphan_error STRING, excess_files_total BIGINT"""
 
 
 def coerce(value, data_type):

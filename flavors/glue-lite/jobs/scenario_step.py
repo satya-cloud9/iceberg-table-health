@@ -14,8 +14,15 @@ Steps:
             (and small files from the merges' new rows) - the work moves to
             scheduled compaction, which the advisor already handles.
 
+  grow      add 10 more small files to s17_growing's fragmented day, as a
+            writer would between maintenance runs that never come. Not
+            recorded as an action (it's the writer, not the advisor). Run
+            scan / grow / scan / grow / scan: excess files rise 11 -> 21 -> 31
+            and MAINTENANCE_LAG fires on the third scan.
+
 Usage (via scripts/run-job.sh py scenario_step.py ...):
   scenario_step.py s12-mor [--hot-minutes 3]
+  scenario_step.py grow [--hot-minutes 3]
 """
 import argparse
 import os
@@ -30,7 +37,7 @@ from pyspark.sql import SparkSession
 
 import gl_common as gl
 import probes
-from build_test_tables import NS, merge_random_rows
+from build_test_tables import NS, S17_DAY, Builder, merge_random_rows
 from plan import ACTIONS_DDL, run_sql
 
 
@@ -75,7 +82,19 @@ def s12_mor(spark, args):
     time.sleep(wait)
 
 
-STEPS = {"s12-mor": s12_mor}
+def grow(spark, args):
+    table = f"{NS}.s17_growing"
+    b = Builder(spark)
+    b.next_id = 50_000_000 + int(time.time()) % 1_000_000 * 100   # ids that don't clash with the build
+    b.fragment(table, S17_DAY, commits=10, files_per_commit=1, rows_per_commit=300)
+    n = spark.sql(f"SELECT count(*) AS n FROM {table}.files").collect()[0].n
+    print(f"  {table}: 10 small files added ({n} data files now)", flush=True)
+    wait = args.hot_minutes * 60 + 30
+    print(f"  waiting {wait}s so the day is past the hot window", flush=True)
+    time.sleep(wait)
+
+
+STEPS = {"s12-mor": s12_mor, "grow": grow}
 
 
 def main():
