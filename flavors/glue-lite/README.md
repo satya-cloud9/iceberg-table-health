@@ -639,3 +639,35 @@ make gl-scan                      # the property change is a new metadata versio
 make gl-plan T=s0 APPLY=1         # s0: HOLD advisor.mode=approve-only, nothing runs
 make gl-plan T=s0 APPROVE=SMALL_FILES
 ```
+
+## GL2.5l — Reading the scorecard
+
+Every test table is scored in one of two phases, and PASS means something
+different in each:
+
+| RESULT | PHASE | Means |
+|---|---|---|
+| PASS | detect | No fix has run yet; the scan found the problem the table was built with ("found as built: ..."). A healthy result here would be a FAIL: detection missed it. |
+| PASS | fixed | A fix ran (a successful row in `glue.ops.actions` for this table UUID) and the scan now finds the table healthy. |
+| FAIL | detect | Detection is wrong: something missing or unexpected. |
+| FAIL | fixed | The fix ran but the problem (or another) is still there; `remaining fix:` says what would clear it. |
+| STALE | detect | Too late to judge (s3's hot window); rebuild and scan straight after. |
+
+Rows are grouped by phase, failures first in each group. Fixed rows show
+`last fix:` (the latest successful action and its time); detect rows show
+`next:` (auto fix and the command, or which symptoms need approval). The
+header splits the count: detected as built, fixed and verified, stale, failed.
+`glue.ops.scorecard` gains a `last_fix` column.
+
+```
+=== Scorecard for scan scan-... ===
+17/18 pass: 12 detected as built, 5 fixed and verified, 1 stale
+
+RESULT  PHASE   TABLE                      OUTCOME
+-- Fixed: a fix ran; the scan must now find the table healthy ---------------
+PASS    fixed   s16_orphan_files           healthy after fix
+                                            last fix: approved:ORPHAN_FILES ok 2026-10-03 13:12 UTC
+-- Detect: no fix yet; the scan must find the problem the table was built with
+PASS    detect  s0_small_appends           found as built: SMALL_FILES x2, SNAPSHOT_BUILDUP
+                                            next: auto fix (make gl-plan T=s0 APPLY=1)
+```
