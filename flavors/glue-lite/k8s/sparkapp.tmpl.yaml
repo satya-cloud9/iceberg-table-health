@@ -11,6 +11,11 @@
 #   AWS_ENDPOINT  where pods reach Floci (http://172.17.0.1:4566); the eks
 #                 overlay (GL4) drops the four *.endpoint / path-style lines
 #   WAREHOUSE     s3://<bucket>/warehouse
+#   DRIVER_MEMORY, EXECUTOR_MEMORY, EXECUTOR_OVERHEAD, EXECUTOR_INSTANCES
+#                 sizing (defaults in run-job.sh). The executor pod's limit is
+#                 memory + overhead; Parquet/compression buffers and shuffle
+#                 use the overhead, so too little gets the pod OOM-killed even
+#                 when the Java heap is fine.
 #   AWS_REGION
 apiVersion: sparkoperator.k8s.io/v1beta2
 kind: SparkApplication
@@ -54,9 +59,10 @@ ${JOB_ARGS}
     spark.executorEnv.AWS_REGION: ${AWS_REGION}
   driver:
     cores: 1
-    memory: 1g
+    memory: ${DRIVER_MEMORY}
     serviceAccount: spark
   executor:
-    instances: 1
+    instances: ${EXECUTOR_INSTANCES}
     cores: 1
-    memory: 1g
+    memory: ${EXECUTOR_MEMORY}
+    memoryOverhead: ${EXECUTOR_OVERHEAD}
