@@ -370,6 +370,37 @@ def run_sql(spark, stmt):
     return status, result, round(time.perf_counter() - t0, 2)
 
 
+PROCEDURE_MIN_ORPHAN_MINUTES = 24 * 60   # remove_orphan_files refuses older_than < 24 h ago
+
+
+def remove_orphans_action(spark, table, older_than_ms, prefix_listing=True):
+    """remove_orphan_files through Iceberg's action API, for cutoffs younger
+    than the procedure's 24-hour floor (the test setup: orphans minutes old).
+    Same work as the CALL: list the location, keep what any retained snapshot
+    or metadata version references, delete the rest older than the cutoff.
+    -> (status, result_json_or_error, seconds)."""
+    t0 = time.perf_counter()
+    try:
+        jvm = spark._jvm
+        jt = jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark._jsparkSession, table)
+        action = (jvm.org.apache.iceberg.spark.actions.SparkActions.get(spark._jsparkSession)
+                  .deleteOrphanFiles(jt).olderThan(int(older_than_ms)))
+        if prefix_listing:
+            try:
+                action = action.usePrefixListing(True)
+            except Exception:       # older Iceberg: Hadoop listing
+                pass
+        it = action.execute().orphanFileLocations().iterator()
+        removed = []
+        while it.hasNext():
+            removed.append(str(it.next()))
+        status = "ok"
+        result = json.dumps([{"orphan_file_location_count": len(removed), "sample": removed[:5]}])
+    except Exception as e:
+        status, result = "failed", f"{type(e).__name__}: {e}"[:2000]
+    return status, result, round(time.perf_counter() - t0, 2)
+
+
 def match_tables(all_tables, wanted):
     """'s0' matches glue.demo.s0_small_appends; full or short names also work."""
     if not wanted:
@@ -447,6 +478,7 @@ def main():
                 continue
             now = datetime.now(timezone.utc)
             cutoff = now.timestamp() - float(cfg_t.get("orphan_min_age_minutes", 4320)) * 60
+            cutoff_txt = datetime.fromtimestamp(cutoff, timezone.utc).strftime('%Y-%m-%d %H:%M:%S') + "+00:00"
             text = (s["statement"]
                     .replace("{now}", f"TIMESTAMP '{now.strftime('%Y-%m-%d %H:%M:%S')}+00:00'")
                     .replace("{orphan_cutoff}", "TIMESTAMP '"
@@ -456,7 +488,15 @@ def main():
             kind = s["kind"] if s["auto"] else "approved:" + ",".join(s["symptoms"])
             for stmt in [x.strip() for x in text.split("; ") if x.strip()]:   # suggestions may hold several
                 before = current_snapshot(spark, t)
-                status, result, dur = run_sql(spark, stmt)
+                age_min = float(cfg_t.get("orphan_min_age_minutes", 4320))
+                if "remove_orphan_files" in stmt and age_min < PROCEDURE_MIN_ORPHAN_MINUTES:
+                    # Test scale: the procedure refuses a cutoff under 24 h, the action API doesn't.
+                    stmt = (f"SparkActions.deleteOrphanFiles({ident_t}).olderThan({cutoff_txt})"
+                            f".usePrefixListing(true)  -- action API: orphan_min_age_minutes={age_min:g} "
+                            f"is under the procedure's 24 h floor")
+                    status, result, dur = remove_orphans_action(spark, t, cutoff * 1000)
+                else:
+                    status, result, dur = run_sql(spark, stmt)
                 if status == "failed" and "prefix_listing" in stmt and "prefix_listing" in result:
                     stmt = stmt.replace(", prefix_listing => true", "")       # older Iceberg: no such arg
                     status, result, dur = run_sql(spark, stmt)

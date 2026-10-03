@@ -503,6 +503,13 @@ table to its `after` expectations. `remove_orphan_files` gets
 `prefix_listing => true` (FileIO listing instead of Hadoop's); if this
 Iceberg doesn't know the argument, it is retried without.
 
+The `remove_orphan_files` procedure refuses a cutoff younger than 24 hours
+(`Cannot remove orphan files with an interval less than 24 hours`). The test
+setup uses `orphan_min_age_minutes` 3, so plan.py then runs the same cleanup
+through Iceberg's action API (`SparkActions.deleteOrphanFiles(...).olderThan(...)`),
+which has no floor; the actions row records that statement. With a production
+value (days) the CALL is used, and the 24-hour floor is a guard worth keeping.
+
 **Fresh location per build.** `DROP TABLE ... PURGE` only deletes what the
 dropped table still references, so the builder now gives every build its own
 location (`<table>-<timestamp>`). Rebuild all tables once after this patch so
