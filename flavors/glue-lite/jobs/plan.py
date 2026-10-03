@@ -291,10 +291,18 @@ def plan_table(table, findings, tm, cfg):
     # 3. snapshots last, so the snapshots the rewrites replaced can expire too
     if any(f["symptom"] == "SNAPSHOT_BUILDUP" and f["action"] == "auto" for f in active):
         keep = int(rw.get("expire_retain_last", 5))
+        older, note = "{now}", f"keeps the last {keep} snapshots"
+        pre = tm.get("pre_refresh_snapshot_ms")
+        if pre and int(cfg.get("keep_full_copies", 1)) >= 1:
+            # GL2.5o+: keep the copy before the latest possible full refresh, so a bad
+            # refresh can still be rolled back (expire only what is older than it)
+            older = "TIMESTAMP '" + datetime.fromtimestamp(int(pre) / 1000.0, timezone.utc) \
+                .strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + "+00:00'"
+            note += "; keeps the snapshot before the latest possible full refresh"
         steps.append({"kind": "expire_snapshots", "auto": True, "symptoms": ["SNAPSHOT_BUILDUP"],
                       "statement": (f"CALL glue.system.expire_snapshots(table => '{ident}', "
-                                    f"older_than => {{now}}, retain_last => {keep})"),
-                      "note": f"keeps the last {keep} snapshots"})
+                                    f"older_than => {older}, retain_last => {keep})"),
+                      "note": note})
 
     # approval / needs-evidence: suggestions only
     for f in active:

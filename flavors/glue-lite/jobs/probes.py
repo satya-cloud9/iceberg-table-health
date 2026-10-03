@@ -136,6 +136,8 @@ def partition_metrics(spark, table, info, cfg, table_writer_minutes="compute"):
                                   array(0.1, 0.5, 0.9))                         AS pct,
                 sum(CASE WHEN content = 0 AND file_size_in_bytes < {small} THEN 1 ELSE 0 END)     AS small_files,
                 sum(CASE WHEN content = 0 AND file_size_in_bytes > {oversized} THEN 1 ELSE 0 END) AS oversized_files,
+                sum(CASE WHEN content = 0 AND (file_size_in_bytes < {small} OR file_size_in_bytes > {oversized})
+                         THEN file_size_in_bytes ELSE 0 END)                                AS rewrite_bytes,
                 sum(CASE WHEN content = 0 AND spec_id <> {spec_id} THEN 1 ELSE 0 END)             AS files_old_spec,
                 sum(CASE WHEN content = 0 AND sort_order_id = {sort_id} THEN 1 ELSE 0 END)        AS files_current_sort
             FROM f GROUP BY partition_key
@@ -153,6 +155,7 @@ def partition_metrics(spark, table, info, cfg, table_writer_minutes="compute"):
                CAST(pct[2] AS BIGINT) AS p90_file_bytes,
                CAST(small_files AS BIGINT)       AS small_files,
                CAST(oversized_files AS BIGINT)   AS oversized_files,
+               CAST(rewrite_bytes AS BIGINT)     AS rewrite_bytes,
                CAST(greatest(1, ceil(data_bytes / {target})) AS BIGINT)               AS ideal_files,
                CAST(data_files - greatest(1, ceil(data_bytes / {target})) AS BIGINT)  AS excess_files,
                CAST(files_old_spec AS BIGINT)     AS files_old_spec,

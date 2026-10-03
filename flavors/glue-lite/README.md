@@ -825,3 +825,79 @@ Run it: `make gl-image && make gl-scan`, then
 ```bash
 make gl-sql Q="SELECT table_name, ledger_value AS windows, note AS changes FROM glue.ops.incremental_check WHERE family = 'learned_windows' AND NOT agree AND scan_id = (SELECT max(scan_id) FROM glue.ops.incremental_check)"
 ```
+
+### GL2.5o+ — Settle rule revised: bounded re-compaction, LATE_ARRIVALS, possible full refreshes
+
+The first SETTLING rule (wait unless excess ≥ 3× the threshold) looked only at
+file counts. Re-compaction is often cheap (binpack rewrites only files outside
+the target size range, so a partition bigger than the target only rewrites its
+late small files), while waiting can hurt reads badly on a partition people
+query. Until query evidence (2.5d++) can weigh read cost against rewrite cost,
+the interim policy keeps rewrites bounded instead of waiting outright:
+
+| Inside the settle window | Outcome |
+|---|---|
+| Delete buildup | Never waits |
+| Fewer than `max_settle_compactions` (2) compactions since the partition ended | Compact (SMALL_FILES): the first compaction, plus one interim |
+| That many already | **SETTLING**: wait until the partition has settled |
+| Partition settled | Compact normally |
+
+Each settle-window finding carries its reasoning: hours since the partition
+ended, compactions so far, `p_more_late` (upper bound on the chance more late
+batches still land, from the lateness histogram) and `rewrite_bytes_now`
+(bytes binpack would rewrite: files outside the size range, new
+`partition_metrics.rewrite_bytes`). Once query evidence exists, the decision
+becomes: compact when queries/h × extra-file cost × hours left exceeds
+rewrite bytes × p_more_late.
+
+**LATE_ARRIVALS** (approval, learned windows only): 99th-percentile lateness ≥
+`late_arrivals_hours` (24) or ≥ `late_reopened_partitions` (3) partitions
+reopened. Remedies point upstream: batch late rows, narrow the incremental
+lookback, stage late data and merge once, or partition by ingestion date and
+sort by event time.
+
+**Batch labels.** Engines don't mark reloads or full refreshes, so each
+(snapshot, partition) batch is labelled from what the commit did:
+
+| Label | Rule | Lateness, reopens? |
+|---|---|---|
+| `compaction` | a `replace` commit | no |
+| `possible_full_refresh` | the commit covered > 90% of live partitions and replaced > 80% of the table's files and > 80% of its bytes (`refresh_*` thresholds) | no |
+| `rewrite` | files removed in that partition (copy-on-write, overwrite) or delete files only | no |
+| `possible_backfill` | append-only, later than the table's 99th-percentile lateness as it stood before this scan (needs 20 samples) and at least a median partition's bytes | no |
+| `on_time` / `late` | append-only, before / after the partition's range ended | **yes** |
+| `append` | append-only into a partition with no time range | — |
+
+Only `on_time` and `late` batches feed the lateness histogram, so the settle
+window measures real late data; only a `late`/`on_time` write after a
+compaction counts as a reopen. Every writer write still moves the partition's
+last write (the hot window). Labels are stored on `partition_activity.label`;
+`partition_state.last_write_label` keeps the latest per partition.
+
+What the labels drive (all in the learned-windows variant, shadow):
+
+- **Trend reset:** after a possible full refresh, `MAINTENANCE_LAG` only
+  compares scans taken since (a refresh replaces everything).
+- **FREQUENT_FULL_REFRESH** (advisory, never acted on): ≥
+  `frequent_full_refresh_min` (4) possible full refreshes in 30 days on a table
+  of ≥ `frequent_full_refresh_min_bytes` (1 GiB). It may be deliberate: the
+  table property `advisor.ack = FREQUENT_FULL_REFRESH` keeps it recorded as
+  `acknowledged` and out of plans and rankings (any symptom can be acknowledged
+  this way).
+- **Full copies kept by old snapshots:** more than `keep_full_copies` (1)
+  retained possible full refreshes raise `SNAPSHOT_BUILDUP` (evidence: copies
+  and bytes kept beyond the current table), so expiry runs sooner. The plan's
+  `expire_snapshots` keeps the snapshot before the latest possible full
+  refresh (older_than = its time), so a bad refresh can still be rolled back.
+- **SMALL_FILES remedy:** when a partition's files came from a possible full
+  refresh, the remedy points at the refresh job's file sizing, not just
+  compaction. There is no separate small-file finding: one small file per
+  partition has no excess and isn't flagged; many undersized partitions is
+  `OVER_PARTITIONED`, which depends on cross-partition queries.
+- **LATE_ARRIVALS evidence:** possible backfills and possible full refreshes in
+  the last 30 days.
+
+New `table_metrics` columns: `possible_full_refreshes_30d`,
+`possible_backfill_batches_30d`, `last_full_refresh_ms`,
+`full_refresh_avg_bytes`, `retained_full_copies`, `pre_refresh_snapshot_ms`.
+Writer attribution (2.5d+) can later turn "possible" into "confirmed".

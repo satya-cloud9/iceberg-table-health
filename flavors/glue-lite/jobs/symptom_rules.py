@@ -31,8 +31,16 @@ CATALOG = {
     "HOT_PARTITION":         ("file_layout", "partition", "defer",
                               "wait until writes stop, then compact (still being written)"),
     "SETTLING":              ("file_layout", "partition", "defer",
-                              "wait: late data is still expected for this partition (settle window); "
-                              "compact once it has settled, unless the excess is already large"),
+                              "wait: late data is still expected for this partition and it was already "
+                              "compacted inside the settle window; compact again once it has settled"),
+    "FREQUENT_FULL_REFRESH": ("write_pattern", "table", "advisory",
+                              "the table is replaced (nearly) whole again and again: consider an incremental "
+                              "load; if deliberate, acknowledge with the table property "
+                              "advisor.ack = FREQUENT_FULL_REFRESH"),
+    "LATE_ARRIVALS":         ("write_pattern", "table", "approval",
+                              "data keeps landing long after its partition ended: batch late rows, narrow "
+                              "the incremental lookback, stage late data and merge once, or partition by "
+                              "ingestion date and sort by event time"),
     "DELETE_BUILDUP":        ("file_layout", "partition", "auto",
                               "rewrite_data_files with delete-file-threshold, then "
                               "rewrite_position_delete_files"),
@@ -133,11 +141,14 @@ def coarser_spec_hint(spec):
     return "drop or coarsen the partition transform"
 
 
-def partition_findings(table, rows, th, hot_minutes, settle_hours=None, settle_big_factor=3.0):
+def partition_findings(table, rows, th, hot_minutes, settle_hours=None, max_settle_compactions=2):
     """settle_hours (GL2.5o, learned from lateness): a partition whose time range
-    ended less than that long ago still receives late data, so small-file-only
-    compaction waits (SETTLING) unless the excess is already settle_big_factor x
-    the threshold. Needs r['hours_since_end'] (time-based partitions only)."""
+    ended less than that long ago still receives late data. Interim policy until
+    query evidence can weigh read cost against rewrite cost: the first compaction
+    (and up to max_settle_compactions in all) inside the settle window is allowed,
+    later ones wait (SETTLING) until the partition has settled, so rewrites stay
+    bounded. Delete buildup never waits. Needs r['hours_since_end'] (time-based
+    partitions) and r['compactions_since_end']."""
     out = []
     min_excess = th["min_excess_files"]
     for r in rows:
@@ -170,16 +181,24 @@ def partition_findings(table, rows, th, hot_minutes, settle_hours=None, settle_b
                                        f"(< {hot_minutes}); compact after it cools"))
             continue
         since_end = r.get("hours_since_end")
-        if (small and not deletes and settle_hours and since_end is not None
-                and since_end < settle_hours and excess < settle_big_factor * min_excess):
-            ev = dict(ev, hours_since_partition_end=round(since_end, 1), settle_hours=settle_hours)
-            out.append(_finding(table, "SETTLING", excess / min_excess, ev, key,
-                                remedy=f"wait: partition ended {ev['hours_since_partition_end']} h ago and late "
-                                       f"data lands for up to {settle_hours} h; compact after, or now if the "
-                                       f"excess reaches {int(settle_big_factor * min_excess)} files"))
-            continue
+        if small and settle_hours and since_end is not None and since_end < settle_hours:
+            done = int(r.get("compactions_since_end") or 0)
+            ev = dict(ev, hours_since_partition_end=round(since_end, 1), settle_hours=settle_hours,
+                      compactions_in_settle_window=done, p_more_late=r.get("p_more_late"),
+                      rewrite_bytes_now=r.get("rewrite_bytes"))
+            if not deletes and done >= max_settle_compactions:
+                out.append(_finding(table, "SETTLING", excess / min_excess, ev, key,
+                                    remedy=f"wait: compacted {done}x since the partition ended "
+                                           f"{ev['hours_since_partition_end']} h ago and late data lands for up "
+                                           f"to {settle_hours} h; compact again after that"))
+                continue
         if small:
-            out.append(_finding(table, "SMALL_FILES", excess / min_excess, ev, key))
+            remedy = None
+            if r.get("last_write_label") == "possible_full_refresh":
+                remedy = ("written by a possible full refresh: set the refresh job's target file size or "
+                          "distribution mode, otherwise every refresh needs this compaction again; "
+                          + CATALOG["SMALL_FILES"][3])
+            out.append(_finding(table, "SMALL_FILES", excess / min_excess, ev, key, remedy=remedy))
         if deletes:
             out.append(_finding(table, "DELETE_BUILDUP",
                                 max(del_ratio / th["delete_ratio"],
@@ -373,6 +392,63 @@ def trend_findings(table, history, actions, th):
     return out
 
 
+def late_arrival_findings(table, tm, th):
+    """GL2.5o: a long settle window or partitions reopened again and again is an
+    upstream problem in its own right (the writer or the partition key)."""
+    p99, reopened = tm.get("lateness_p99_h"), _num(tm.get("reopened_partitions"))
+    long_wait = p99 is not None and float(p99) >= th.get("late_arrivals_hours", 24)
+    reopens = reopened >= th.get("late_reopened_partitions", 3)
+    if not (long_wait or reopens):
+        return []
+    ev = {"lateness_p95_h": tm.get("lateness_p95_h"), "lateness_p99_h": p99,
+          "batches_in_window": tm.get("lateness_batches_window"), "reopened_partitions": reopened,
+          "possible_backfill_batches_30d": tm.get("possible_backfill_batches_30d"),
+          "possible_full_refreshes_30d": tm.get("possible_full_refreshes_30d"),
+          "settle_window_h": tm.get("settle_window_h")}
+    score = max((float(p99) / th.get("late_arrivals_hours", 24)) if p99 is not None else 0,
+                reopened / th.get("late_reopened_partitions", 3))
+    return [_finding(table, "LATE_ARRIVALS", score, ev)]
+
+
+def refresh_findings(table, tm, th, keep_full_copies=1):
+    """GL2.5o+ (learned windows only): possible full refreshes.
+    FREQUENT_FULL_REFRESH (advisory, never acted on): the table is replaced
+    whole again and again and it is large. Full copies kept by older snapshots:
+    SNAPSHOT_BUILDUP, so expire_snapshots runs sooner (the plan keeps the copy
+    before the latest refresh, keep_full_copies)."""
+    out = []
+    n = _num(tm.get("possible_full_refreshes_30d"))
+    size = _num(tm.get("data_bytes"))
+    if (n >= th.get("frequent_full_refresh_min", 4)
+            and size >= th.get("frequent_full_refresh_min_bytes", 1073741824)):
+        out.append(_finding(table, "FREQUENT_FULL_REFRESH", n / th.get("frequent_full_refresh_min", 4),
+                            {"possible_full_refreshes_30d": n, "avg_bytes_per_refresh": tm.get("full_refresh_avg_bytes"),
+                             "data_bytes": size}))
+    copies = _num(tm.get("retained_full_copies"))
+    if copies > keep_full_copies:
+        extra = None
+        if tm.get("retained_bytes") is not None and tm.get("data_bytes") is not None:
+            extra = max(int(tm["retained_bytes"]) - int(tm["data_bytes"]), 0)
+        out.append(_finding(table, "SNAPSHOT_BUILDUP", copies / max(keep_full_copies, 1),
+                            {"retained_full_copies": copies, "keep_full_copies": keep_full_copies,
+                             "bytes_kept_beyond_current": extra, "snapshots": tm.get("snapshots")},
+                            remedy=f"{copies} earlier full copies are still referenced by old snapshots: "
+                                   f"expire_snapshots, keeping {keep_full_copies} copy before the latest refresh"))
+    return out
+
+
+def apply_acks(findings, tm):
+    """Table property advisor.ack = SYMPTOM[,SYMPTOM...]: the owner knows and it's
+    deliberate. Those findings stay recorded (action 'acknowledged') but drop
+    out of plans and the ranked list."""
+    acks = {a.strip() for a in str(_props(tm).get("advisor.ack", "")).split(",") if a.strip()}
+    for f in findings:
+        if f["symptom"] in acks:
+            f["action"], f["automatic"] = "acknowledged", False
+            f["remedy"] = "acknowledged by the owner (advisor.ack); " + f["remedy"]
+    return findings
+
+
 def evaluate(table, tm, rows, cfg, history=None, actions=None):
     """All findings for one table. tm = table_metrics dict, rows = partition dicts."""
     if tm.get("load_error") and not rows:
@@ -380,8 +456,24 @@ def evaluate(table, tm, rows, cfg, history=None, actions=None):
     th = cfg["thresholds"]
     hot = float(cfg.get("hot_partition_minutes", 15))
     out = (partition_findings(table, rows, th, hot, cfg.get("settle_hours"),
-                              float(cfg.get("settle_big_factor", 3.0)))
+                              int(cfg.get("max_settle_compactions", 2)))
            + table_findings(table, tm, rows, th, cfg))
+    if cfg.get("learned_windows"):
+        out += late_arrival_findings(table, tm, th)
+        extra = refresh_findings(table, tm, th, int(cfg.get("keep_full_copies", 1)))
+        if any(f["symptom"] == "SNAPSHOT_BUILDUP" for f in out):      # one SNAPSHOT_BUILDUP, with both reasons
+            for f in out:
+                if f["symptom"] == "SNAPSHOT_BUILDUP":
+                    for e in extra:
+                        if e["symptom"] == "SNAPSHOT_BUILDUP":
+                            ev = dict(json.loads(f["evidence_json"]), **json.loads(e["evidence_json"]))
+                            f["evidence_json"] = json.dumps(ev)
+                            f["score"] = max(f["score"], e["score"])
+            extra = [e for e in extra if e["symptom"] != "SNAPSHOT_BUILDUP"]
+        out += extra
+        if tm.get("last_full_refresh_ms") and history:
+            # trends restart after a possible full refresh (it replaces everything)
+            history = [h for h in history if (h.get("scanned_ms") or 0) >= tm["last_full_refresh_ms"]]
     if history or actions:
         out += trend_findings(table, history or [], actions or [], th)
     if any(f["symptom"] == "REWRITE_CHURN" for f in out):
@@ -391,4 +483,6 @@ def evaluate(table, tm, rows, cfg, history=None, actions=None):
             if f["symptom"] in ("SMALL_FILES", "SCATTERED_SMALL_FILES") and f["action"] == "auto":
                 f["action"], f["automatic"] = "advisory", False
                 f["remedy"] = "held: REWRITE_CHURN on this table; fix the write mode first (" + f["remedy"] + ")"
+    if cfg.get("learned_windows"):
+        apply_acks(out, tm)
     return out

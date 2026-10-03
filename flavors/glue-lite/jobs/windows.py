@@ -8,8 +8,16 @@ Two waits, learned per table instead of one fixed number:
                 floor), at most hot_cap_minutes; needs min_samples gaps
   settle window how long after a partition's time range ends late data keeps
                 landing: the 99th-percentile lateness (family 2's lateness
-                histogram), at most settle_cap_hours; time-based partitions only;
-                needs min_samples batches
+                histogram; only append-only batches labelled on_time or late
+                count, so rewrites, possible backfills and possible full
+                refreshes don't stretch it),
+                at most settle_cap_hours; time-based partitions only; needs
+                min_samples batches
+
+Inside the settle window (interim policy, until query evidence can weigh read
+cost against rewrite cost): the first compaction is allowed and up to
+max_settle_compactions in all; after that the partition waits (SETTLING). Delete
+buildup never waits. Long lateness or frequent reopens raise LATE_ARRIVALS.
 
 Per-partition age comes from family 2's partition_state (last writer write),
 not from the full path, whose per-partition age is only computed inside the
@@ -75,17 +83,35 @@ def partition_end_from_key(partition_key, fields):
     return None
 
 
-def learned_rows(rows, pstate, fields, scan_ms):
-    """Copies of the partition rows with the ledger's per-partition age and the
-    hours since the partition's time range ended."""
+def p_more_late(counts, age_h):
+    """Upper bound on the chance that another late batch still lands in a
+    partition that ended age_h ago: the share of batches in buckets whose upper
+    edge is above age_h (the histogram holds on_time / late batches only)."""
+    usable = {b: n for b, n in counts.items() if b is not None}
+    total = sum(counts.values())
+    if not total or age_h is None:
+        return None
+    later = sum(n for b, n in usable.items() if b > age_h) + counts.get(None, 0)
+    return round(later / total, 3)
+
+
+def learned_rows(rows, pstate, fields, scan_ms, compactions=None, late_counts=None):
+    """Copies of the partition rows with the ledger's per-partition age, the
+    hours since the partition's time range ended, how often it was compacted
+    since then, and the chance that more late data still comes."""
     out = []
     for r in rows:
         r = dict(r)
-        st = pstate.get(r.get("partition_key")) or {}
+        pk = r.get("partition_key")
+        st = pstate.get(pk) or {}
         lw = st.get("last_write_ms")
         r["minutes_since_update"] = None if lw is None else (scan_ms - lw) / 60000.0
-        end = partition_end_from_key(r.get("partition_key"), fields)
+        end = partition_end_from_key(pk, fields)
         r["hours_since_end"] = None if end is None else (scan_ms - end) / 3600000.0
+        r["compactions_since_end"] = (sum(1 for t in (compactions or {}).get(pk, []) if t >= end)
+                                      if end is not None else 0)
+        r["p_more_late"] = p_more_late(late_counts or {}, r["hours_since_end"])
+        r["last_write_label"] = st.get("last_write_label")
         out.append(r)
     return out
 

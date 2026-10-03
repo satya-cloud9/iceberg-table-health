@@ -83,7 +83,7 @@ def score_table(table, expectation, findings, partition_rows, hot_minutes, phase
     phase "after" = plan.py has applied fixes to this table (same table UUID)
     since it was built; the expectation's "after" block is used if it has one.
     """
-    active = [f for f in findings if f["action"] not in ("needs-evidence", "advisory")]
+    active = [f for f in findings if f["action"] not in ("needs-evidence", "advisory", "acknowledged")]
     by_symptom = {}
     for f in active:
         by_symptom.setdefault(f["symptom"], []).append(partition_value(f.get("partition_key")))

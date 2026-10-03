@@ -39,11 +39,11 @@ ACTIVITY_DDL = """
     data_files_added BIGINT, data_bytes_added BIGINT, records_added BIGINT,
     delete_files_added BIGINT, delete_bytes_added BIGINT,
     data_files_removed BIGINT, data_bytes_removed BIGINT, delete_files_removed BIGINT,
-    lateness_h DOUBLE, scan_id STRING"""
+    lateness_h DOUBLE, scan_id STRING, label STRING"""
 
 PARTITION_STATE_DDL = """
     table_uuid STRING, partition_key STRING, last_write_ms BIGINT, last_compaction_ms BIGINT,
-    reopen_count BIGINT, updated_at TIMESTAMP, scan_id STRING"""
+    reopen_count BIGINT, updated_at TIMESTAMP, scan_id STRING, last_write_label STRING"""
 
 LATENESS_HIST_DDL = """
     table_uuid STRING, day DATE, bucket_max_h DOUBLE, batches BIGINT, scan_id STRING"""
@@ -171,20 +171,92 @@ def wrote(r):
     return r["is_writer"] and (r["data_files_added"] or r["delete_files_added"])
 
 
+# Batch labels (GL2.5o+). Engines don't mark reloads, so the two "possible_"
+# labels are guesses from the commit's shape; writer attribution can confirm them later.
+APPEND_LABELS = ("on_time", "late")          # the only batches lateness and reopens are measured on
+
+
+def is_possible_full_refresh(rows, totals, live_partitions, th):
+    """A commit that replaced (nearly) the whole table: partition coverage,
+    file replacement and byte replacement all above their thresholds.
+    rows: the commit's activity rows; totals: the snapshot summary numbers
+    (total_data_files, added_data_files, deleted_data_files, total_files_size,
+    added_files_size, removed_files_size); live_partitions: partitions with files."""
+    def before(total, added, removed):
+        if total is None:
+            return None
+        return float(total) - float(added or 0) + float(removed or 0)
+    files_before = before(totals.get("total_data_files"), totals.get("added_data_files"),
+                          totals.get("deleted_data_files"))
+    bytes_before = before(totals.get("total_files_size"), totals.get("added_files_size"),
+                          totals.get("removed_files_size"))
+    if not files_before or not bytes_before:
+        return False
+    touched = sum(1 for r in rows if r["data_files_removed"] or r["data_files_added"])
+    coverage = touched / max(float(live_partitions or 0), touched, 1)
+    file_repl = float(totals.get("deleted_data_files") or 0) / files_before
+    byte_repl = float(totals.get("removed_files_size") or 0) / bytes_before
+    return (coverage >= th.get("refresh_partition_coverage", 0.9)
+            and file_repl >= th.get("refresh_file_replacement", 0.8)
+            and byte_repl >= th.get("refresh_byte_replacement", 0.8))
+
+
+def label_rows(snapshot, rows, live_partitions, baseline_p99, baseline_n, median_partition_bytes, th):
+    """Label each (snapshot, partition) batch in place; -> True when the commit is a
+    possible full refresh.
+      compaction             a 'replace' commit
+      possible_full_refresh  the commit replaced (nearly) the whole table
+      rewrite                files removed in that partition (copy-on-write, overwrite)
+                             or delete files only (merge-on-read row changes)
+      possible_backfill      append-only, later than the table's 99th-percentile
+                             lateness (as it stood before this scan, with enough
+                             samples) and at least a median partition's bytes
+      on_time / late         append-only, by whether the partition's range had ended
+      append                 append-only into a partition with no time range"""
+    if snapshot["operation"] == "replace":
+        for r in rows:
+            r["label"] = "compaction"
+        return False
+    refresh = is_possible_full_refresh(rows, snapshot, live_partitions, th)
+    for r in rows:
+        if refresh:
+            r["label"] = "possible_full_refresh"
+        elif r["data_files_removed"] or r["delete_files_removed"] or not r["data_files_added"]:
+            r["label"] = "rewrite"
+        elif r["lateness_h"] is None:
+            r["label"] = "append"
+        elif r["lateness_h"] == 0:
+            r["label"] = "on_time"
+        elif (baseline_p99 is not None and baseline_n >= th.get("min_samples", 20)
+              and r["lateness_h"] > baseline_p99
+              and median_partition_bytes and r["data_bytes_added"] >= median_partition_bytes):
+            r["label"] = "possible_backfill"
+        else:
+            r["label"] = "late"
+    return refresh
+
+
 def update_state(state, rows):
-    """state: {partition_key: {last_write_ms, last_compaction_ms, reopen_count}}
-    rows: activity rows, any order. -> (new state for touched partitions, reopens)."""
+    """state: {partition_key: {last_write_ms, last_compaction_ms, reopen_count, last_write_label}}
+    rows: activity rows, any order. -> (new state for touched partitions, reopens).
+    Every writer write moves last_write (the hot window needs it); only an
+    append-only write after a compaction counts as a reopen (late data), not a
+    rewrite, a possible backfill or a possible full refresh."""
     new, reopens = {}, 0
     for r in sorted(rows, key=lambda r: (r["ts_ms"], r["snapshot_id"])):
         pk = r["partition_key"]
         s = dict(new.get(pk) or state.get(pk) or
                  {"last_write_ms": None, "last_compaction_ms": None, "reopen_count": 0})
+        s.setdefault("reopen_count", 0)
         if wrote(r):
-            if (s["last_compaction_ms"] is not None and r["ts_ms"] > s["last_compaction_ms"]
+            label = r.get("label")
+            if ((label is None or label in APPEND_LABELS)
+                    and s["last_compaction_ms"] is not None and r["ts_ms"] > s["last_compaction_ms"]
                     and (s["last_write_ms"] is None or s["last_write_ms"] <= s["last_compaction_ms"])):
-                s["reopen_count"] += 1          # first write after a compaction
+                s["reopen_count"] = (s["reopen_count"] or 0) + 1     # first late write after a compaction
                 reopens += 1
             s["last_write_ms"] = max(s["last_write_ms"] or 0, r["ts_ms"])
+            s["last_write_label"] = label
         elif r["operation"] == "replace" and r["data_files_added"]:
             s["last_compaction_ms"] = max(s["last_compaction_ms"] or 0, r["ts_ms"])
         new[pk] = s

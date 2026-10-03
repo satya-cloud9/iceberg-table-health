@@ -391,7 +391,8 @@ class Ledger:
                 WHERE family = 'snapshot_ledger' GROUP BY table_uuid""").collect()}
 
     # -- per table ---------------------------------------------------------
-    def process(self, table, uuid, tm, cfg, full_fn=None, live_keys=None, partitioned=True):
+    def process(self, table, uuid, tm, cfg, full_fn=None, live_keys=None, partitioned=True,
+                median_partition_bytes=None):
         """Family 1 (snapshot ledger) and family 2 (partition activity) for one table."""
         if not uuid or (self.mode == "off" and self.mode2 == "off"):
             return
@@ -399,7 +400,7 @@ class Ledger:
         if self.mode != "off":
             self._family1(table, uuid, tm, cfg, full_fn, snaps, current, versions)
         if self.mode2 != "off":
-            self._family2(table, uuid, tm, cfg, snaps, live_keys or [], partitioned)
+            self._family2(table, uuid, tm, cfg, snaps, live_keys or [], partitioned, median_partition_bytes)
         if self.mode3 != "off" and self.mode != "off" and self.mode2 != "off":
             self._windows(uuid, tm, cfg)
 
@@ -494,7 +495,7 @@ class Ledger:
         self.results.append((table, not disagreements, n_checks, disagreements, len(rows), event))
 
     # -- family 2 ----------------------------------------------------------
-    def _family2(self, table, uuid, tm, cfg, snaps, live_keys, partitioned):
+    def _family2(self, table, uuid, tm, cfg, snaps, live_keys, partitioned, median_partition_bytes=None):
         spark, ops = self.spark, self.ops
         now = datetime.now(timezone.utc)
         now_ms = int(now.timestamp() * 1000)
@@ -510,8 +511,14 @@ class Ledger:
         rows = []
         if new_snaps:
             files = act.read_activity(spark, table, [x["snapshot_id"] for x in new_snaps])
+            # the table's lateness as it stood before this scan: the baseline for possible backfills
+            base_p99, base_n = self._late_pct(uuid, 0.99)
+            th = dict(cfg.get("thresholds", {}),
+                      min_samples=int((self.config.get("incremental") or {}).get("min_samples", 20)))
             for x in new_snaps:
-                rows += act.aggregate(x, files.get(x["snapshot_id"], []))
+                commit_rows = act.aggregate(x, files.get(x["snapshot_id"], []))
+                act.label_rows(x, commit_rows, len(live_keys), base_p99, base_n, median_partition_bytes, th)
+                rows += commit_rows
         state = self._partition_state(uuid)
         changed, reopens = act.update_state(state, rows)
         state.update(changed)
@@ -521,7 +528,7 @@ class Ledger:
                 committed_at=datetime.fromtimestamp(r["ts_ms"] / 1000.0, timezone.utc)))
         counts = {}
         for r in rows:
-            if r["lateness_h"] is not None:
+            if r["lateness_h"] is not None and r.get("label") in act.APPEND_LABELS:   # only real late data
                 key = (datetime.fromtimestamp(r["ts_ms"] / 1000.0, timezone.utc).date(), act.late_bucket(r["lateness_h"]))
                 counts[key] = counts.get(key, 0) + 1
         for (d, b), n in counts.items():
@@ -545,6 +552,7 @@ class Ledger:
         tm["activity_event"] = event
         tm["lateness_p95_h"] = late_edge
         tm["lateness_batches_window"] = n_late
+        tm.update(self._label_stats(uuid, snaps))
         tm["reopened_partitions"] = sum(1 for pk in live if (state.get(pk) or {}).get("reopen_count"))
         tm["hot_partitions_ledger"] = sum(1 for pk in live if pk in led_lw and now_ms - led_lw[pk] < hot * 60000)
 
@@ -615,13 +623,49 @@ class Ledger:
 
     def _late_exact(self, uuid):
         cutoff = self._cutoff_day()
+        # rows written before labels existed (label NULL) were counted into the histogram too
         vals = [r.lateness_h for r in self.spark.sql(f"""
             SELECT lateness_h FROM {self.ops}.partition_activity
             WHERE table_uuid = '{uuid}' AND lateness_h IS NOT NULL
+              AND (label IS NULL OR label IN ('on_time', 'late'))
               AND to_date(committed_at) >= DATE '{cutoff}'""").collect()]
         vals += [r["lateness_h"] for r in self.pending["partition_activity"]
-                 if r["table_uuid"] == uuid and r["lateness_h"] is not None and r["committed_at"].date() >= cutoff]
+                 if r["table_uuid"] == uuid and r["lateness_h"] is not None and r["committed_at"].date() >= cutoff
+                 and r.get("label") in act.APPEND_LABELS]
         return act.exact_percentile(vals, 0.95)
+
+    def _label_stats(self, uuid, snaps):
+        """Per table: possible full refreshes and backfills (last 30 days), the
+        retained full copies and the snapshot just before the latest refresh."""
+        since = int((datetime.now(timezone.utc) - timedelta(days=30)).timestamp() * 1000)
+        rows = _rows(self.spark, f"""
+            SELECT snapshot_id, ts_ms, label, data_bytes_added FROM {self.ops}.partition_activity
+            WHERE table_uuid = '{uuid}' AND label IN ('possible_full_refresh', 'possible_backfill')""")
+        rows += [r for r in self.pending["partition_activity"]
+                 if r["table_uuid"] == uuid and r.get("label") in ("possible_full_refresh", "possible_backfill")]
+        seen, uniq = set(), []
+        for r in rows:
+            k = (r["snapshot_id"], r.get("partition_key"), r["label"])
+            if k not in seen:
+                seen.add(k)
+                uniq.append(r)
+        refresh_ids = {r["snapshot_id"] for r in uniq if r["label"] == "possible_full_refresh"}
+        recent = {r["snapshot_id"]: r["ts_ms"] for r in uniq
+                  if r["label"] == "possible_full_refresh" and r["ts_ms"] >= since}
+        refresh_bytes = sum(int(r["data_bytes_added"] or 0) for r in uniq
+                            if r["label"] == "possible_full_refresh" and r["ts_ms"] >= since)
+        by_id = {x["snapshot_id"]: x for x in snaps}
+        retained = sorted((by_id[i] for i in refresh_ids if i in by_id), key=lambda x: x["ts_ms"])
+        latest = retained[-1] if retained else None
+        parent = by_id.get(latest["parent_id"]) if latest else None
+        return {"possible_full_refreshes_30d": len(recent),
+                "possible_backfill_batches_30d": sum(1 for r in uniq
+                                                     if r["label"] == "possible_backfill" and r["ts_ms"] >= since),
+                "last_full_refresh_ms": max(recent.values()) if recent else
+                    (max((r["ts_ms"] for r in uniq if r["label"] == "possible_full_refresh"), default=None)),
+                "full_refresh_avg_bytes": int(refresh_bytes / len(recent)) if recent else None,
+                "retained_full_copies": len(retained),
+                "pre_refresh_snapshot_ms": parent["ts_ms"] if parent else None}
 
     def merge_partition_state(self, rows):
         """Upsert partition_state (one MERGE per scan)."""

@@ -30,7 +30,7 @@ PARTITION_METRICS_DDL = """
     p10_file_bytes BIGINT, p50_file_bytes BIGINT, p90_file_bytes BIGINT,
     small_files BIGINT, oversized_files BIGINT, ideal_files BIGINT, excess_files BIGINT,
     files_old_spec BIGINT, files_current_sort BIGINT, last_updated_at TIMESTAMP,
-    minutes_since_update DOUBLE, target_file_bytes BIGINT"""
+    minutes_since_update DOUBLE, target_file_bytes BIGINT, rewrite_bytes BIGINT"""
 
 TABLE_METRICS_DDL = """
     scan_id STRING, scanned_at TIMESTAMP, table_name STRING, load_error STRING,
@@ -60,7 +60,9 @@ TABLE_METRICS_DDL = """
     activity_new_snapshots BIGINT, activity_event STRING, lateness_p95_h DOUBLE, lateness_batches_window BIGINT,
     reopened_partitions BIGINT, hot_partitions_ledger BIGINT,
     lateness_p99_h DOUBLE, hot_window_min DOUBLE, hot_window_source STRING,
-    settle_window_h DOUBLE, settle_window_source STRING"""
+    settle_window_h DOUBLE, settle_window_source STRING,
+    possible_full_refreshes_30d BIGINT, possible_backfill_batches_30d BIGINT, last_full_refresh_ms BIGINT,
+    full_refresh_avg_bytes BIGINT, retained_full_copies BIGINT, pre_refresh_snapshot_ms BIGINT"""
 
 
 def coerce(value, data_type):
@@ -151,6 +153,11 @@ def carry_orphans(tm, p):
         for k in ("orphan_files", "orphan_bytes", "listed_objects", "orphan_sample", "orphan_error",
                   "orphan_scanned_at"):
             tm.setdefault(k, p.get(k))
+
+
+def median_bytes(pm_rows):
+    sizes = sorted(int((r.get("data_bytes") if isinstance(r, dict) else r.data_bytes) or 0) for r in pm_rows)
+    return sizes[len(sizes) // 2] if sizes else None
 
 
 def reuse(spark, table, cfg, p, prev_rows, scanned_at, snapshot_source="full"):
@@ -261,7 +268,8 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
                                                  minutes_since_writer_commit=probes.writer_minutes(spark, table)),
                             live_keys=[r["partition_key"] if isinstance(r, dict) else r.partition_key
                                        for r in pm_rows],
-                            partitioned=info.get("partitioned", True))
+                            partitioned=info.get("partitioned", True),
+                            median_partition_bytes=median_bytes(pm_rows))
             except Exception as le:          # the ledger must never cost the table its metrics
                 tm["ledger_event"] = f"error: {type(le).__name__}: {le}"[:300]
                 print(f"  {table}: ledger skipped ({tm['ledger_event']})", flush=True)

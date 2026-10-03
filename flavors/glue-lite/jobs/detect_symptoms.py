@@ -29,7 +29,7 @@ SYMPTOMS_DDL = """
     score DOUBLE, severity STRING, remedy STRING, evidence_level STRING,
     evidence_json STRING, rule_version STRING"""
 
-ACTION_ORDER = {"auto": 0, "defer": 1, "approval": 2, "advisory": 3, "needs-evidence": 4}
+ACTION_ORDER = {"auto": 0, "defer": 1, "approval": 2, "advisory": 3, "needs-evidence": 4, "acknowledged": 5}
 
 
 def coerce(value, data_type):
@@ -64,7 +64,7 @@ def load_history(spark, tms, scan_id):
     cols = {f.name for f in spark.table(f"{gl.OPS_NAMESPACE}.table_metrics").schema}
     want = [c for c in ("excess_files_total", "delete_files", "data_manifests") if c in cols]
     for r in spark.sql(f"""
-            SELECT table_uuid, scanned_at, {', '.join(want)}
+            SELECT table_uuid, scanned_at, unix_millis(scanned_at) AS scanned_ms, {', '.join(want)}
             FROM {gl.OPS_NAMESPACE}.table_metrics
             WHERE table_uuid IN ({ids}) AND scanned_at <= (
                 SELECT max(scanned_at) FROM {gl.OPS_NAMESPACE}.table_metrics WHERE scan_id = '{scan_id}')
@@ -87,9 +87,45 @@ def load_partition_state(spark, tms):
         return {}
     out = {}
     ids = ", ".join(f"'{u}'" for u in uuids)
-    for r in spark.sql(f"SELECT table_uuid, partition_key, last_write_ms FROM {ps} "
+    cols = {f.name for f in spark.table(ps).schema}
+    label = "last_write_label" if "last_write_label" in cols else "CAST(NULL AS STRING) AS last_write_label"
+    for r in spark.sql(f"SELECT table_uuid, partition_key, last_write_ms, {label} FROM {ps} "
                        f"WHERE table_uuid IN ({ids})").collect():
-        out.setdefault(r.table_uuid, {})[r.partition_key] = {"last_write_ms": r.last_write_ms}
+        out.setdefault(r.table_uuid, {})[r.partition_key] = {"last_write_ms": r.last_write_ms,
+                                                             "last_write_label": r.last_write_label}
+    return out
+
+
+def _uuid_list(tms):
+    return ", ".join(f"'{u}'" for u in sorted({t["table_uuid"] for t in tms if t.get("table_uuid")}))
+
+
+def load_compactions(spark, tms):
+    """Compaction times per partition (family 2's activity rows), by table UUID."""
+    pa = f"{gl.OPS_NAMESPACE}.partition_activity"
+    ids = _uuid_list(tms)
+    if not ids or not spark.catalog.tableExists(pa):
+        return {}
+    out = {}
+    for r in spark.sql(f"SELECT table_uuid, partition_key, collect_list(ts_ms) AS ts FROM {pa} "
+                       f"WHERE table_uuid IN ({ids}) AND operation = 'replace' AND data_files_added > 0 "
+                       f"GROUP BY table_uuid, partition_key").collect():
+        out.setdefault(r.table_uuid, {})[r.partition_key] = sorted(int(t) for t in r.ts)
+    return out
+
+
+def load_late_hists(spark, tms, days=30):
+    """Lateness bucket counts over the last `days` days, by table UUID."""
+    lh = f"{gl.OPS_NAMESPACE}.lateness_hist"
+    ids = _uuid_list(tms)
+    if not ids or not spark.catalog.tableExists(lh):
+        return {}
+    out = {}
+    for r in spark.sql(f"SELECT table_uuid, bucket_max_h, sum(batches) AS n FROM {lh} WHERE table_uuid IN ({ids}) "
+                       f"AND day >= date_sub(current_date(), {days}) GROUP BY table_uuid, bucket_max_h").collect():
+        b = r.bucket_max_h
+        b = None if b is None else (int(b) if float(b).is_integer() else float(b))
+        out.setdefault(r.table_uuid, {})[b] = int(r.n)
     return out
 
 
@@ -141,6 +177,7 @@ def run_detect(spark, scan_id, config, report=True):
     findings = []
     mode3 = mode_of(config, "learned_windows")
     pstate = load_partition_state(spark, tms) if mode3 != "off" else {}
+    compactions, late_hists = (load_compactions(spark, tms), load_late_hists(spark, tms)) if mode3 != "off" else ({}, {})
     changes = []
     for tm in sorted(tms, key=lambda t: t["table_name"]):
         table, uuid = tm["table_name"], tm.get("table_uuid")
@@ -150,9 +187,11 @@ def run_detect(spark, scan_id, config, report=True):
         mine = current
         if mode3 != "off" and uuid in pstate and tm.get("hot_window_min") is not None:
             # GL2.5o: the same rules with learned windows and the ledger's per-partition age
-            cfg2 = dict(cfg, hot_partition_minutes=tm["hot_window_min"], settle_hours=tm.get("settle_window_h"))
+            cfg2 = dict(cfg, hot_partition_minutes=tm["hot_window_min"], settle_hours=tm.get("settle_window_h"),
+                        learned_windows=True)
             rows2 = win.learned_rows(parts.get(table, []), pstate[uuid],
-                                     json.loads(tm.get("partition_fields_json") or "[]"), tm["scanned_ms"])
+                                     json.loads(tm.get("partition_fields_json") or "[]"), tm["scanned_ms"],
+                                     compactions.get(uuid, {}), late_hists.get(uuid, {}))
             learned = symptom_rules.evaluate(table, tm, rows2, cfg2,
                                              history=history.get(uuid, []), actions=actions.get(uuid, []))
             d = win.diff(current, learned)
@@ -175,7 +214,8 @@ def run_detect(spark, scan_id, config, report=True):
     findings.sort(key=lambda f: (ACTION_ORDER.get(f["action"], 9), -f["score"]))
     print("\n=== Per table ===")
     for tm in sorted(tms, key=lambda t: t["table_name"]):
-        mine = [f for f in findings if f["table_name"] == tm["table_name"] and f["action"] != "needs-evidence"]
+        mine = [f for f in findings if f["table_name"] == tm["table_name"]
+                and f["action"] not in ("needs-evidence", "acknowledged")]
         held = [f for f in findings if f["table_name"] == tm["table_name"] and f["action"] == "needs-evidence"]
         names = {}
         for f in mine:
