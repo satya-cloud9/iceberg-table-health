@@ -38,7 +38,44 @@ BINPACK_SYMPTOMS = ("SMALL_FILES", "OVERSIZED_FILES", "DELETE_BUILDUP")
 ACTIONS_DDL = """
     run_id STRING, scan_id STRING, started_at TIMESTAMP, table_name STRING,
     table_uuid STRING, kind STRING, symptoms STRING, statement STRING,
-    status STRING, duration_s DOUBLE, result_json STRING"""
+    status STRING, duration_s DOUBLE, result_json STRING,
+    snapshot_before BIGINT, snapshot_after BIGINT, rollback_hint STRING"""
+
+MODES = ("auto", "approve-only", "off")
+
+
+def advisor_mode(props, cfg):
+    """Per-table opt-out. The table property advisor.mode (set by the table's
+    owner) wins over the config default advisor_mode:
+      auto          auto steps run with APPLY=1 (default)
+      approve-only  auto steps become ASK; they run only via APPROVE=<symptom>
+      off           detect and report only; plan.py runs nothing on this table
+    """
+    mode = str((props or {}).get("advisor.mode") or cfg.get("advisor_mode", "auto")).strip().lower()
+    return mode if mode in MODES else "auto"
+
+
+def action_row(schema, **fields):
+    """A glue.ops.actions row in the table's own column order (older tables
+    gain new columns at the end)."""
+    return tuple(fields.get(f.name) for f in schema)
+
+
+def current_snapshot(spark, table):
+    """The table's current snapshot id (None for an empty table), read fresh."""
+    jt = spark._jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark._jsparkSession, table)
+    jt.refresh()
+    snap = jt.currentSnapshot()
+    return None if snap is None else int(snap.snapshotId())
+
+
+def rollback_hint(ident, before, after):
+    """Only when the statement made a new snapshot; property changes don't."""
+    if before is None or after is None or before == after:
+        return None
+    return (f"CALL glue.system.rollback_to_snapshot('{ident}', {before})  "
+            f"-- undoes everything committed after it, including writers' commits; "
+            f"not possible once that snapshot is expired")
 
 
 # ---------- partition key -> WHERE predicate (pure) ----------
@@ -291,6 +328,18 @@ def plan_table(table, findings, tm, cfg):
                     f"CALL glue.system.rewrite_data_files(table => '{ident}', strategy => 'sort')")
         steps.append({"kind": "suggest", "auto": False, "symptoms": [f["symptom"]], "statement": stmt,
                       "note": f"{f['action']}: {f['remedy']}"})
+
+    # Per-table opt-out: auto steps become suggestions the owner approves.
+    mode = advisor_mode(json.loads(tm.get("properties_json") or "{}"), cfg)
+    if mode != "auto" and steps:
+        for s in steps:
+            if s["auto"]:
+                s.update(auto=False, kind="suggest", planned_kind=s["kind"],
+                         note=f"advisor.mode={mode}: {s['note']}")
+        steps.insert(0, {"kind": "hold", "auto": False, "symptoms": [], "statement": "",
+                         "note": (f"advisor.mode={mode}: nothing runs on this table"
+                                  if mode == "off" else
+                                  f"advisor.mode={mode}: auto steps need APPROVE=<symptom>")})
     return steps
 
 
@@ -372,6 +421,7 @@ def main():
 
     if a.apply or approve:
         spark.sql(f"CREATE TABLE IF NOT EXISTS {ns}.actions ({ACTIONS_DDL}) USING iceberg")
+        gl.ensure_columns(spark, f"{ns}.actions", ACTIONS_DDL)
         schema = spark.table(f"{ns}.actions").schema
     records = []
     for t in tables:
@@ -386,6 +436,10 @@ def main():
             continue
         uuid = probes.table_info(spark, t).get("uuid")
         cfg_t = gl.table_config(config, t)
+        if advisor_mode(json.loads(tms[t].get("properties_json") or "{}"), cfg_t) == "off":
+            print(f"  advisor.mode=off: skipped", flush=True)
+            continue
+        ident_t = _ident(t)
         for s in steps:
             approved = (not s["auto"] and s["kind"] == "suggest" and s["statement"]
                         and approve & set(s["symptoms"]))
@@ -399,28 +453,43 @@ def main():
                              + datetime.fromtimestamp(cutoff, timezone.utc).strftime('%Y-%m-%d %H:%M:%S') + "'"))
             kind = s["kind"] if s["auto"] else "approved:" + ",".join(s["symptoms"])
             for stmt in [x.strip() for x in text.split("; ") if x.strip()]:   # suggestions may hold several
+                before = current_snapshot(spark, t)
                 status, result, dur = run_sql(spark, stmt)
                 if status == "failed" and "prefix_listing" in stmt and "prefix_listing" in result:
                     stmt = stmt.replace(", prefix_listing => true", "")       # older Iceberg: no such arg
                     status, result, dur = run_sql(spark, stmt)
-                print(f"  -> {kind}: {status} in {dur}s  {result[:300]}", flush=True)
-                records.append((run_id, scan_id, now, t, uuid, kind, ",".join(s["symptoms"]),
-                                stmt, status, float(dur), result))
+                after = current_snapshot(spark, t)
+                hint = rollback_hint(ident_t, before, after) if status == "ok" else None
+                print(f"  -> {kind}: {status} in {dur}s  snapshot {before} -> {after}  {result[:300]}",
+                      flush=True)
+                records.append(action_row(schema, run_id=run_id, scan_id=scan_id, started_at=now,
+                                          table_name=t, table_uuid=uuid, kind=kind,
+                                          symptoms=",".join(s["symptoms"]), statement=stmt, status=status,
+                                          duration_s=float(dur), result_json=result,
+                                          snapshot_before=before, snapshot_after=after, rollback_hint=hint))
                 if status != "ok":
                     break
             if status == "failed" and DANGLING in stmt and _unsupported_option(result):
                 # Older Iceberg: retry without the option (the next step,
                 # rewrite_position_delete_files, still cleans up the deletes).
                 retry = strip_dangling_option(stmt)
+                before = current_snapshot(spark, t)
                 status, result, dur = run_sql(spark, retry)
+                after = current_snapshot(spark, t)
                 print(f"  -> {s['kind']} (retry without remove-dangling-deletes): {status} in {dur}s  "
                       f"{result[:300]}", flush=True)
-                records.append((run_id, scan_id, datetime.now(timezone.utc), t, uuid, s["kind"],
-                                ",".join(s["symptoms"]), retry, status, float(dur), result))
+                records.append(action_row(schema, run_id=run_id, scan_id=scan_id,
+                                          started_at=datetime.now(timezone.utc), table_name=t,
+                                          table_uuid=uuid, kind=s["kind"], symptoms=",".join(s["symptoms"]),
+                                          statement=retry, status=status, duration_s=float(dur),
+                                          result_json=result, snapshot_before=before, snapshot_after=after,
+                                          rollback_hint=rollback_hint(ident_t, before, after)
+                                          if status == "ok" else None))
     if (a.apply or approve) and records:
         spark.createDataFrame(records, schema).writeTo(f"{ns}.actions").append()
-        print(f"\nRecorded {len(records)} actions in {ns}.actions under {run_id}. "
-              f"Run make gl-scan to check the result.", flush=True)
+        print(f"\nRecorded {len(records)} actions in {ns}.actions under {run_id} (with snapshot "
+              f"before/after and a rollback statement each). Run make gl-scan to check the result.",
+              flush=True)
     elif not (a.apply or approve):
         print("\nDry run: nothing changed. APPLY=1 runs the RUN steps; APPROVE=<SYMPTOM,...> runs "
               "the ASK steps for those symptoms.", flush=True)

@@ -5,6 +5,7 @@ so one image serves them all and a job is just a SQL file plus catalog config
 (supplied as sparkConf by the SparkApplication).
 
 Usage: run_sql.py <path-to-sql-file>
+       run_sql.py -e "<statements>"     (ad-hoc, e.g. make gl-sql Q="...")
 """
 import re
 import sys
@@ -20,11 +21,14 @@ def statements(sql_text):
 
 
 def main():
-    if len(sys.argv) != 2:
-        sys.exit("usage: run_sql.py <path-to-sql-file>")
-    path = sys.argv[1]
-    with open(path, encoding="utf-8") as f:
-        stmts = statements(f.read())
+    if len(sys.argv) == 3 and sys.argv[1] == "-e":
+        path, stmts = "inline", statements(sys.argv[2])
+    elif len(sys.argv) == 2:
+        path = sys.argv[1]
+        with open(path, encoding="utf-8") as f:
+            stmts = statements(f.read())
+    else:
+        sys.exit('usage: run_sql.py <path-to-sql-file> | run_sql.py -e "<statements>"')
 
     spark = SparkSession.builder.appName(f"run_sql:{path}").getOrCreate()
     for i, stmt in enumerate(stmts, 1):

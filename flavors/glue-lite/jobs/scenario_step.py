@@ -38,15 +38,19 @@ from pyspark.sql import SparkSession
 import gl_common as gl
 import probes
 from build_test_tables import NS, S17_DAY, Builder, merge_random_rows
-from plan import ACTIONS_DDL, run_sql
+from plan import ACTIONS_DDL, action_row, current_snapshot, rollback_hint, run_sql
 
 
-def record(spark, run_id, table, uuid, kind, symptom, stmt, status, dur, result):
+def record(spark, run_id, table, uuid, kind, symptom, stmt, status, dur, result, before=None, after=None):
     ns = gl.OPS_NAMESPACE
     spark.sql(f"CREATE TABLE IF NOT EXISTS {ns}.actions ({ACTIONS_DDL}) USING iceberg")
+    gl.ensure_columns(spark, f"{ns}.actions", ACTIONS_DDL)
     schema = spark.table(f"{ns}.actions").schema
-    spark.createDataFrame([(run_id, None, datetime.now(timezone.utc), table, uuid, kind, symptom,
-                            stmt, status, float(dur), result)], schema).writeTo(f"{ns}.actions").append()
+    row = action_row(schema, run_id=run_id, started_at=datetime.now(timezone.utc), table_name=table,
+                     table_uuid=uuid, kind=kind, symptoms=symptom, statement=stmt, status=status,
+                     duration_s=float(dur), result_json=result, snapshot_before=before, snapshot_after=after,
+                     rollback_hint=rollback_hint(table.split(".", 1)[1], before, after))
+    spark.createDataFrame([row], schema).writeTo(f"{ns}.actions").append()
 
 
 def s12_mor(spark, args):
@@ -64,9 +68,11 @@ def s12_mor(spark, args):
                              f"older_than => TIMESTAMP '{now}', retain_last => 1)"),
     ]
     for kind, stmt in steps:
+        before = current_snapshot(spark, table)
         status, result, dur = run_sql(spark, stmt)
+        after = current_snapshot(spark, table)
         print(f"  {kind}: {status} in {dur}s {result[:200]}", flush=True)
-        record(spark, run_id, table, uuid, kind, "REWRITE_CHURN", stmt, status, dur, result)
+        record(spark, run_id, table, uuid, kind, "REWRITE_CHURN", stmt, status, dur, result, before, after)
         if status != "ok":
             raise SystemExit(f"{kind} failed; stopping")
 

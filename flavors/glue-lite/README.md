@@ -592,3 +592,38 @@ scorecard.
 changed table (from the manifests added since the last scan), and finding
 changed tables in bulk from Glue `GetTables` metadata locations instead of
 loading each table - that matters most for the Trino port at 1,000+ tables.
+
+## GL2.5k — Rollback record and per-table opt-out
+
+**Rollback record.** Every statement plan.py (or a scenario step) runs now
+records the table's current snapshot id before and after it in
+`glue.ops.actions` (`snapshot_before`, `snapshot_after`), plus a ready
+`rollback_hint`, e.g.
+
+    CALL glue.system.rollback_to_snapshot('demo.s0_small_appends', 512...)
+
+It is only written when the statement made a new snapshot (property changes
+and expire_snapshots don't). Two limits are in the hint itself: rolling back
+also undoes anything writers committed after that snapshot, and it is
+impossible once the snapshot has been expired. Older actions tables gain the
+columns automatically.
+
+    SELECT started_at, table_name, kind, snapshot_before, snapshot_after, rollback_hint
+    FROM glue.ops.actions ORDER BY started_at DESC
+
+**Per-table opt-out.** The table property `advisor.mode`, set by the table's
+owner, wins over the config default `advisor_mode`:
+
+| advisor.mode | What plan.py does |
+|---|---|
+| `auto` (default) | auto steps run with `APPLY=1` |
+| `approve-only` | auto steps are shown as ASK and run only with `APPROVE=<symptom>` |
+| `off` | findings are still recorded; nothing runs on the table, not even with APPROVE |
+
+```bash
+# e.g. hand s0 to its owner for sign-off
+make gl-sql Q="ALTER TABLE glue.demo.s0_small_appends SET TBLPROPERTIES ('advisor.mode' = 'approve-only')"
+make gl-scan                      # the property change is a new metadata version, so s0 is rescanned
+make gl-plan T=s0 APPLY=1         # s0: HOLD advisor.mode=approve-only, nothing runs
+make gl-plan T=s0 APPROVE=SMALL_FILES
+```

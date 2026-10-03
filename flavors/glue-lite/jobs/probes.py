@@ -31,6 +31,7 @@ WATCHED_PROPS = [
     "commit.manifest.min-count-to-merge",
     "history.expire.max-snapshot-age-ms",
     "history.expire.min-snapshots-to-keep",
+    "advisor.mode",
 ]
 
 
