@@ -582,6 +582,11 @@ change the answer:
   listing run when due: `retained_bytes_every_hours`,
   `orphan_scan_every_hours` (0 = whenever the table changed, the test
   setting; ~24 in production). Between runs their last values are carried.
+- **Actions that commit nothing still count as a change.**
+  `remove_orphan_files` deletes objects without writing a new metadata.json,
+  so the fingerprint can't see it. Any row in `glue.ops.actions` for the
+  table (by UUID) newer than its last orphan listing re-runs the listing on
+  the next scan; `scan_mode` then says `reused+orphans`.
 - `make gl-scan SCAN_ARGS=--full` measures everything from scratch.
 
 Check it: run `make gl-scan` twice with no writes in between. The second run

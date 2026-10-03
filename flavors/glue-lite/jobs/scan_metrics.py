@@ -107,6 +107,28 @@ def load_previous(spark, tm_table, pm_table, namespace):
     return prev, parts
 
 
+def action_ages(spark):
+    """Minutes since the latest advisor action per table UUID (any status).
+    Some actions change files without a new metadata.json - remove_orphan_files
+    deletes objects but commits nothing - so an unchanged metadata location
+    does not mean the orphan count is still right."""
+    ops = gl.OPS_NAMESPACE
+    try:
+        return {r.table_uuid: float(r.age_min) for r in spark.sql(f"""
+            SELECT table_uuid,
+                   (unix_timestamp(current_timestamp()) - unix_timestamp(max(started_at))) / 60.0 AS age_min
+            FROM {ops}.actions WHERE table_uuid IS NOT NULL GROUP BY table_uuid""").collect()}
+    except Exception:          # no actions table yet
+        return {}
+
+
+def acted_since_orphan_scan(p, uuid, ages):
+    """True when an action ran after the table's last orphan listing."""
+    if not p or uuid not in ages or p.get("orphan_age_h") is None:
+        return False
+    return ages[uuid] < float(p["orphan_age_h"]) * 60.0
+
+
 def due(p, age_key, every_hours, changed=True):
     """Run an interval-gated probe? Always on first sight; otherwise when the
     interval has passed (0 = whenever the table changed)."""
@@ -172,6 +194,7 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
     print(f"=== Scan {scan_id}: {len(names)} tables in {namespace} ===", flush=True)
 
     prev, prev_parts = load_previous(spark, tm_table, pm_table, namespace)
+    ages = action_ages(spark)
     summary, modes, t_start = [], {"full": 0, "reused": 0}, time.perf_counter()
     for name in names:
         table = f"{namespace}.{name}"
@@ -206,8 +229,12 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
                 tm["minutes_since_writer_commit"] = wm
                 tm["scan_mode"] = "full"
                 carry_orphans(tm, p)
-            if cfg.get("orphan_scan", False) and due(p, "orphan_age_h", cfg.get("orphan_scan_every_hours", 24),
-                                                     changed=tm["scan_mode"] == "full"):
+            acted = acted_since_orphan_scan(p, info.get("uuid"), ages)
+            if cfg.get("orphan_scan", False) and (acted or due(
+                    p, "orphan_age_h", cfg.get("orphan_scan_every_hours", 24),
+                    changed=tm["scan_mode"] == "full")):
+                if acted and tm["scan_mode"] == "reused":
+                    tm["scan_mode"] = "reused+orphans"
                 try:
                     tm.update(probes.orphan_metrics(spark, table, cfg), orphan_error=None,
                               orphan_scanned_at=scanned_at)

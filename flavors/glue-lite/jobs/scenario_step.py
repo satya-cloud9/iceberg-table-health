@@ -65,7 +65,7 @@ def s12_mor(spark, args):
                                    f"'write.update.mode' = 'merge-on-read', "
                                    f"'write.delete.mode' = 'merge-on-read')"),
         ("expire_snapshots", f"CALL glue.system.expire_snapshots(table => '{ident}', "
-                             f"older_than => TIMESTAMP '{now}', retain_last => 1)"),
+                             f"older_than => TIMESTAMP '{now}+00:00', retain_last => 1)"),
     ]
     for kind, stmt in steps:
         before = current_snapshot(spark, table)

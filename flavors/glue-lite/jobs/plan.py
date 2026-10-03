@@ -448,9 +448,11 @@ def main():
             now = datetime.now(timezone.utc)
             cutoff = now.timestamp() - float(cfg_t.get("orphan_min_age_minutes", 4320)) * 60
             text = (s["statement"]
-                    .replace("{now}", f"TIMESTAMP '{now.strftime('%Y-%m-%d %H:%M:%S')}'")
+                    .replace("{now}", f"TIMESTAMP '{now.strftime('%Y-%m-%d %H:%M:%S')}+00:00'")
                     .replace("{orphan_cutoff}", "TIMESTAMP '"
-                             + datetime.fromtimestamp(cutoff, timezone.utc).strftime('%Y-%m-%d %H:%M:%S') + "'"))
+                             + datetime.fromtimestamp(cutoff, timezone.utc).strftime('%Y-%m-%d %H:%M:%S') + "+00:00'"))
+            # The +00:00 matters: a bare TIMESTAMP literal is read in the Spark session's
+            # time zone; off UTC, the orphan cutoff would move (later = younger files deleted).
             kind = s["kind"] if s["auto"] else "approved:" + ",".join(s["symptoms"])
             for stmt in [x.strip() for x in text.split("; ") if x.strip()]:   # suggestions may hold several
                 before = current_snapshot(spark, t)
