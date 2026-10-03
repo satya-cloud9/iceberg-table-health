@@ -469,3 +469,56 @@ Note for the work platform: Trino's Iceberg connector writes position
 deletes for row-level changes (merge-on-read) whatever the table's
 write.*.mode says, as far as I know; copy-on-write churn there would come
 from Spark-based writers. Check against their Trino version.
+
+## GL2.5h — Remaining physical gaps (s13–s16)
+
+| Table | Shape | Before | Fix |
+|---|---|---|---|
+| `s13_oversized_file` | one day written as a single ~20 MB file | `OVERSIZED_FILES` on that day | auto: binpack splits it toward the target |
+| `s14_spec_evolution` | `days()` evolved to `months()` mid-life | `MIXED_SPEC` | approval: `rewrite_data_files` with `rewrite-all` into the current spec |
+| `s15_metadata_retention` | `previous-versions-max` 5, 12 commits, no auto-delete | `UNBOUNDED_RETENTION` (+ orphaned metadata.json) | approval: `delete-after-commit` on; `remove_orphan_files` for what's already left |
+| `s16_orphan_files` | stray objects under the table location | `ORPHAN_FILES` | approval: `remove_orphan_files` |
+
+**Orphan scan (O1).** Lists every object under the table location through the
+table's FileIO (S3 prefix listing, with a trailing `/` so sibling tables
+don't match) and subtracts everything a retained snapshot or metadata version
+references: `all_files` (data and delete files), `all_manifests`, manifest
+lists, `metadata_log_entries`, the current metadata.json and statistics
+files. Objects younger than `orphan_min_age_minutes` are skipped because they
+may belong to a commit in flight: 3 minutes at test scale, days in production
+(Iceberg's own default is 3 days). It is the most expensive probe, so it can
+be switched off (`orphan_scan`); the scan-cost work runs it less often.
+
+**`UNBOUNDED_RETENTION` fixed.** It compared metadata versions to
+`previous-versions-max`, but Iceberg caps the metadata log at that number, so
+it could never fire. It now fires when the log is full and
+`delete-after-commit` is off: from then on every commit leaves the oldest
+metadata.json behind in storage. Those leftovers are what the orphan scan
+finds.
+
+**Approving a suggestion.** `make gl-plan T=<tables> APPROVE=<SYMPTOM,...>`
+runs the ASK statements for those symptoms and records them in
+`glue.ops.actions` as `approved:<symptom>`, so the scorecard switches the
+table to its `after` expectations. `remove_orphan_files` gets
+`prefix_listing => true` (FileIO listing instead of Hadoop's); if this
+Iceberg doesn't know the argument, it is retried without.
+
+**Fresh location per build.** `DROP TABLE ... PURGE` only deletes what the
+dropped table still references, so the builder now gives every build its own
+location (`<table>-<timestamp>`). Rebuild all tables once after this patch so
+no table carries leftovers from earlier builds into the orphan scan.
+
+**Spec evolution in the planner.** After evolution, old-spec partition keys
+also carry the new field as null; a null next to a set field on the same
+source column is now ignored instead of becoming `IS NULL`.
+
+```bash
+make gl-image
+make gl-test-tables                     # rebuild everything once (fresh locations)
+make gl-scan                            # s0-s16 PASS (before)
+make gl-plan T=s13 APPLY=1
+make gl-plan T=s14 APPROVE=MIXED_SPEC
+make gl-plan T=s15 APPROVE=UNBOUNDED_RETENTION,ORPHAN_FILES
+make gl-plan T=s16 APPROVE=ORPHAN_FILES
+make gl-scan                            # s13-s16 PASS (after fix)
+```

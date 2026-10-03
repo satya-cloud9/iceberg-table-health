@@ -121,10 +121,17 @@ def partition_predicate(partition_key, fields, widened=None):
     if not values:
         return "TRUE"
     by_name = {f["name"]: f for f in fields}
+    # After spec evolution a key carries every field ever used, with null for
+    # fields from the other spec ({"occurred_at_day": "2026-09-01",
+    # "occurred_at_month": null}). A null next to a non-null field on the same
+    # source column means "not in this file's spec", not IS NULL.
+    set_sources = {by_name[n]["source"] for n, v in values.items() if v is not None and n in by_name}
     parts, dropped = [], []
     for name, value in values.items():
         f = by_name.get(name)
         if f is None or f["transform"] == "void":
+            continue
+        if value is None and f["source"] in set_sources:
             continue
         p = field_predicate(f, value)
         if p is None:
@@ -268,6 +275,17 @@ def plan_table(table, findings, tm, cfg):
         elif f["symptom"] == "REWRITE_CHURN":
             stmt = (f"ALTER TABLE {table} SET TBLPROPERTIES ('write.merge.mode' = 'merge-on-read', "
                     f"'write.update.mode' = 'merge-on-read', 'write.delete.mode' = 'merge-on-read')")
+        elif f["symptom"] == "MIXED_SPEC":
+            # rewrite_data_files writes into the current spec; rewrite-all also
+            # picks files that are well sized but sit in the old layout.
+            stmt = (f"CALL glue.system.rewrite_data_files(table => '{ident}', "
+                    f"options => map('rewrite-all', 'true', 'target-file-size-bytes', '{target}'))")
+        elif f["symptom"] == "UNBOUNDED_RETENTION":
+            stmt = (f"ALTER TABLE {table} SET TBLPROPERTIES "
+                    f"('write.metadata.delete-after-commit.enabled' = 'true')")
+        elif f["symptom"] == "ORPHAN_FILES":
+            stmt = (f"CALL glue.system.remove_orphan_files(table => '{ident}', "
+                    f"older_than => {{orphan_cutoff}}, prefix_listing => true)")
         elif f["symptom"] == "POOR_CLUSTERING" and ev.get("column"):
             stmt = (f"ALTER TABLE {table} WRITE ORDERED BY {ev['column']}; "
                     f"CALL glue.system.rewrite_data_files(table => '{ident}', strategy => 'sort')")
@@ -327,6 +345,9 @@ def main():
     p.add_argument("--tables", default="", help="comma-separated, e.g. s0,s2 (default: all in the scan)")
     p.add_argument("--scan-id", default=None)
     p.add_argument("--apply", action="store_true", help="run the auto statements")
+    p.add_argument("--approve", default="",
+                   help="comma-separated symptoms whose suggested (approval) statements to run, "
+                        "e.g. MIXED_SPEC,ORPHAN_FILES; recorded in glue.ops.actions as approved")
     p.add_argument("--config", default=os.path.join(HERE, "config", "health.json"))
     a = p.parse_args()
 
@@ -344,9 +365,12 @@ def main():
 
     tables = match_tables(sorted(tms), [t.strip() for t in a.tables.split(",") if t.strip()])
     run_id = gl.new_run_id("plan")
-    print(f"=== Plan {run_id} from scan {scan_id} ({'APPLY' if a.apply else 'dry run'}) ===", flush=True)
+    approve = {x.strip().upper() for x in a.approve.split(",") if x.strip()}
+    mode = " + ".join(m for m in ("APPLY" if a.apply else "", f"APPROVE {sorted(approve)}" if approve else "")
+                      if m) or "dry run"
+    print(f"=== Plan {run_id} from scan {scan_id} ({mode}) ===", flush=True)
 
-    if a.apply:
+    if a.apply or approve:
         spark.sql(f"CREATE TABLE IF NOT EXISTS {ns}.actions ({ACTIONS_DDL}) USING iceberg")
         schema = spark.table(f"{ns}.actions").schema
     records = []
@@ -358,18 +382,32 @@ def main():
             print(f"  [{tag}] {s['kind']:18} {', '.join(s['symptoms'])}\n         {s['note']}", flush=True)
             if s["statement"]:
                 print(f"         {s['statement']}", flush=True)
-        if not a.apply:
+        if not (a.apply or approve):
             continue
         uuid = probes.table_info(spark, t).get("uuid")
+        cfg_t = gl.table_config(config, t)
         for s in steps:
-            if not s["auto"]:
+            approved = (not s["auto"] and s["kind"] == "suggest" and s["statement"]
+                        and approve & set(s["symptoms"]))
+            if not ((s["auto"] and a.apply) or approved):
                 continue
             now = datetime.now(timezone.utc)
-            stmt = s["statement"].replace("{now}", f"TIMESTAMP '{now.strftime('%Y-%m-%d %H:%M:%S')}'")
-            status, result, dur = run_sql(spark, stmt)
-            print(f"  -> {s['kind']}: {status} in {dur}s  {result[:300]}", flush=True)
-            records.append((run_id, scan_id, now, t, uuid, s["kind"], ",".join(s["symptoms"]),
-                            stmt, status, float(dur), result))
+            cutoff = now.timestamp() - float(cfg_t.get("orphan_min_age_minutes", 4320)) * 60
+            text = (s["statement"]
+                    .replace("{now}", f"TIMESTAMP '{now.strftime('%Y-%m-%d %H:%M:%S')}'")
+                    .replace("{orphan_cutoff}", "TIMESTAMP '"
+                             + datetime.fromtimestamp(cutoff, timezone.utc).strftime('%Y-%m-%d %H:%M:%S') + "'"))
+            kind = s["kind"] if s["auto"] else "approved:" + ",".join(s["symptoms"])
+            for stmt in [x.strip() for x in text.split("; ") if x.strip()]:   # suggestions may hold several
+                status, result, dur = run_sql(spark, stmt)
+                if status == "failed" and "prefix_listing" in stmt and "prefix_listing" in result:
+                    stmt = stmt.replace(", prefix_listing => true", "")       # older Iceberg: no such arg
+                    status, result, dur = run_sql(spark, stmt)
+                print(f"  -> {kind}: {status} in {dur}s  {result[:300]}", flush=True)
+                records.append((run_id, scan_id, now, t, uuid, kind, ",".join(s["symptoms"]),
+                                stmt, status, float(dur), result))
+                if status != "ok":
+                    break
             if status == "failed" and DANGLING in stmt and _unsupported_option(result):
                 # Older Iceberg: retry without the option (the next step,
                 # rewrite_position_delete_files, still cleans up the deletes).
@@ -379,12 +417,13 @@ def main():
                       f"{result[:300]}", flush=True)
                 records.append((run_id, scan_id, datetime.now(timezone.utc), t, uuid, s["kind"],
                                 ",".join(s["symptoms"]), retry, status, float(dur), result))
-    if a.apply and records:
+    if (a.apply or approve) and records:
         spark.createDataFrame(records, schema).writeTo(f"{ns}.actions").append()
         print(f"\nRecorded {len(records)} actions in {ns}.actions under {run_id}. "
               f"Run make gl-scan to check the result.", flush=True)
-    elif not a.apply:
-        print("\nDry run: nothing changed. Add APPLY=1 to run the RUN steps.", flush=True)
+    elif not (a.apply or approve):
+        print("\nDry run: nothing changed. APPLY=1 runs the RUN steps; APPROVE=<SYMPTOM,...> runs "
+              "the ASK steps for those symptoms.", flush=True)
     spark.stop()
 
 

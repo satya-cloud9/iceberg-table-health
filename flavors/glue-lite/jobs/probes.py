@@ -346,6 +346,56 @@ def table_metrics(spark, table, info, cfg, pm_rows):
     return m
 
 
+def _norm_uri(path):
+    """s3a://b/k and s3n://b/k name the same object as s3://b/k."""
+    p = str(path)
+    for scheme in ("s3a://", "s3n://"):
+        if p.startswith(scheme):
+            return "s3://" + p[len(scheme):]
+    return p
+
+
+def orphan_metrics(spark, table, cfg):
+    """O1: objects under the table location that no retained snapshot or
+    metadata version references, older than orphan_min_age_minutes (younger
+    ones may belong to a commit still in flight). Lists the location through
+    the table's FileIO (S3 prefix listing), so it costs one listing of every
+    object under the table plus the all_files / all_manifests reads; run it
+    sparingly on big tables."""
+    jvm = spark._jvm
+    jt = jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark._jsparkSession, table)
+    cur = jt.operations().current()
+    prefix = str(jt.location()).rstrip("/") + "/"          # trailing '/': not sibling tables
+    refs = {_norm_uri(cur.metadataFileLocation())}
+    for sql in (f"SELECT file_path AS p FROM {table}.all_files",
+                f"SELECT path AS p FROM {table}.all_manifests",
+                f"SELECT manifest_list AS p FROM {table}.snapshots",
+                f"SELECT file AS p FROM {table}.metadata_log_entries"):
+        refs.update(_norm_uri(r.p) for r in spark.sql(sql).collect() if r.p)
+    for getter in ("statisticsFiles", "partitionStatisticsFiles"):
+        try:
+            for sf in getattr(cur, getter)().toArray():
+                refs.add(_norm_uri(sf.path()))
+        except Exception:
+            pass
+    cutoff_ms = (now_utc().timestamp() - float(cfg.get("orphan_min_age_minutes", 4320)) * 60) * 1000
+    listed = orphans = orphan_bytes = 0
+    sample = []
+    it = jt.io().listPrefix(prefix).iterator()
+    while it.hasNext():
+        f = it.next()
+        listed += 1
+        loc = _norm_uri(f.location())
+        if loc in refs or f.createdAtMillis() > cutoff_ms:
+            continue
+        orphans += 1
+        orphan_bytes += int(f.size())
+        if len(sample) < 5:
+            sample.append(loc[len(prefix):] if loc.startswith(prefix) else loc)
+    return {"orphan_files": orphans, "orphan_bytes": orphan_bytes, "listed_objects": listed,
+            "orphan_sample": json.dumps(sample)}
+
+
 def now_utc():
     # Timezone-aware on purpose: Spark converts naive datetimes using the
     # driver's local zone, which shifts the stored instant on non-UTC hosts.

@@ -208,6 +208,63 @@
           }
         ]
       }
+    },
+    "glue.demo.s13_oversized_file": {
+      "expect": [
+        {
+          "symptom": "OVERSIZED_FILES",
+          "partitions": [
+            "2026-09-07"
+          ]
+        }
+      ],
+      "after": {
+        "_comment": "binpack splits the 20 MB file toward the 8 MB target",
+        "expect": []
+      }
+    },
+    "glue.demo.s14_spec_evolution": {
+      "expect": [
+        {
+          "symptom": "MIXED_SPEC"
+        }
+      ],
+      "after": {
+        "_comment": "after make gl-plan T=s14 APPROVE=MIXED_SPEC: everything rewritten into the monthly spec",
+        "expect": []
+      }
+    },
+    "glue.demo.s15_metadata_retention": {
+      "_comment": "the log holds 5 versions; older metadata.json files fall off it and stay in storage, so they also count as orphans",
+      "expect": [
+        {
+          "symptom": "UNBOUNDED_RETENTION"
+        },
+        {
+          "symptom": "ORPHAN_FILES",
+          "optional": true
+        }
+      ],
+      "after": {
+        "_comment": "after APPROVE=UNBOUNDED_RETENTION (delete-after-commit on); the files already left behind stay orphans until APPROVE=ORPHAN_FILES",
+        "expect": [
+          {
+            "symptom": "ORPHAN_FILES",
+            "optional": true
+          }
+        ]
+      }
+    },
+    "glue.demo.s16_orphan_files": {
+      "expect": [
+        {
+          "symptom": "ORPHAN_FILES"
+        }
+      ],
+      "after": {
+        "_comment": "after APPROVE=ORPHAN_FILES: remove_orphan_files deleted the stray objects",
+        "expect": []
+      }
     }
   }
 }

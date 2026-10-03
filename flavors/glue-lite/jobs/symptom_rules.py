@@ -22,7 +22,7 @@ import json
 import math
 import re
 
-RULE_VERSION = "2.5g-1"
+RULE_VERSION = "2.5h-1"
 
 # symptom -> (category, level, action, remedy)
 CATALOG = {
@@ -47,8 +47,11 @@ CATALOG = {
                               "or narrow each merge (partition predicate, dbt incremental_predicates); "
                               "or sort on the merge key so changed rows sit in few files"),
     "UNBOUNDED_RETENTION":   ("write_config", "table", "approval",
-                              "set write.metadata.delete-after-commit.enabled=true and "
-                              "write.metadata.previous-versions-max"),
+                              "set write.metadata.delete-after-commit.enabled=true so metadata.json "
+                              "versions that fall off the log are deleted; remove_orphan_files for the "
+                              "ones already left behind"),
+    "ORPHAN_FILES":          ("storage", "table", "approval",
+                              "remove_orphan_files older than the safety age (dry run first)"),
     "PARTITION_SKEW":        ("partition_design", "table", "approval",
                               "split the heavy key: add bucket() or a finer transform; "
                               "compact the large partition with a higher parallelism"),
@@ -220,13 +223,25 @@ def table_findings(table, tm, rows, th, cfg):
                              "table_turnover_24h": turnover, "write_merge_mode": mode,
                              "rewritten_bytes_24h": tm.get("rewritten_bytes_24h")}))
 
-    # UNBOUNDED_RETENTION: metadata.json versions pile up with no cleanup.
+    # UNBOUNDED_RETENTION: Iceberg keeps at most previous-versions-max entries
+    # in the metadata log, so the log never grows past it. Once it is full,
+    # every commit pushes the oldest metadata.json off the log; without
+    # delete-after-commit that file stays in storage for good.
     versions = _num(tm.get("metadata_versions"))
     max_versions = int(props.get("write.metadata.previous-versions-max", th["max_metadata_versions"]))
     auto_delete = str(props.get("write.metadata.delete-after-commit.enabled", "false")).lower() == "true"
-    if versions > max_versions and not auto_delete:
-        out.append(_finding(table, "UNBOUNDED_RETENTION", versions / max_versions,
-                            {"metadata_versions": versions, "previous_versions_max": max_versions}))
+    if versions >= max_versions and not auto_delete:
+        out.append(_finding(table, "UNBOUNDED_RETENTION", 1 + versions / max(1, max_versions),
+                            {"metadata_versions": versions, "previous_versions_max": max_versions,
+                             "delete_after_commit": auto_delete}))
+
+    # ORPHAN_FILES: objects under the table location nothing references.
+    orphans = _num(tm.get("orphan_files"))
+    if orphans >= th.get("min_orphan_files", 1):
+        out.append(_finding(table, "ORPHAN_FILES", 1 + orphans / 10,
+                            {"orphan_files": orphans, "orphan_bytes": tm.get("orphan_bytes"),
+                             "listed_objects": tm.get("listed_objects"),
+                             "sample": tm.get("orphan_sample")}))
 
     # PARTITION_SKEW: one partition far above the median, and big in absolute
     # terms (a skewed table of tiny partitions is not worth acting on).

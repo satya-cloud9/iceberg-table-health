@@ -49,7 +49,9 @@ TABLE_METRICS_DDL = """
     target_file_bytes BIGINT, target_source STRING, table_uuid STRING,
     partition_fields_json STRING,
     overwrite_commits_recent BIGINT, avg_overwrite_rewrite_share DOUBLE,
-    overwrite_commits_24h BIGINT, rewritten_bytes_24h BIGINT, table_turnover_24h DOUBLE"""
+    overwrite_commits_24h BIGINT, rewritten_bytes_24h BIGINT, table_turnover_24h DOUBLE,
+    orphan_files BIGINT, orphan_bytes BIGINT, listed_objects BIGINT, orphan_sample STRING,
+    orphan_error STRING"""
 
 
 def coerce(value, data_type):
@@ -112,6 +114,11 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
                      .withColumn("table_name", F.lit(table)))
             out.select(*[F.col(f.name).cast(f.dataType) for f in pm_schema]).writeTo(pm_table).append()
             tm = probes.table_metrics(spark, table, info, cfg, pm_rows)
+            if cfg.get("orphan_scan", False):
+                try:
+                    tm.update(probes.orphan_metrics(spark, table, cfg))
+                except Exception as oe:          # listing problems must not lose the table's metrics
+                    tm["orphan_error"] = f"{type(oe).__name__}: {oe}"[:500]
         except Exception as e:  # one broken table must not stop the scan
             tm = {"load_error": (info.get("error") or "") + f" | {type(e).__name__}: {e}"[:500]}
             print(f"  {table}: FAILED {tm['load_error']}", flush=True)

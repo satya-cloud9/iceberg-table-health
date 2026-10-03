@@ -20,6 +20,15 @@ this schema make 1 MB, so a "healthy day" of 100,000 rows is one ~3.8 MB file.
   s10_equality_deletes unpartitioned v2 + 10 equality-delete commits -> DELETE_BUILDUP
   s11_string_keys      identity on awkward strings ("o'neil", "a/b") -> SMALL_FILES
   s12_cow_merge_churn  copy-on-write MERGEs of 50 rows across 30 days -> REWRITE_CHURN
+  s13_oversized_file   one day written as a single ~20 MB file    -> OVERSIZED_FILES
+  s14_spec_evolution   days() evolved to months() mid-life         -> MIXED_SPEC
+  s15_metadata_retention previous-versions-max 5, no auto-delete   -> UNBOUNDED_RETENTION (+ orphans)
+  s16_orphan_files     stray objects under the table location      -> ORPHAN_FILES
+
+Every build gets a fresh location (<warehouse>/demo.db/<table>-<stamp>):
+DROP ... PURGE only deletes files the old table still references, so reusing
+the same path would leave the previous build's leftovers to show up as
+orphans in the new one.
 
 s3 is always built last: it ages its past day beyond the hot window, then
 writes "today", so a scan started right after sees exactly one hot partition.
@@ -88,11 +97,15 @@ class Builder:
         tblprops = ", ".join(f"'{k}' = '{v}'" for k, v in all_props.items())
         cols = SCHEMA_SQL + (f", {extra_cols}" if extra_cols else "")
         part = f"PARTITIONED BY ({partition_expr})" if partition_expr else ""
+        warehouse = self.spark.conf.get("spark.sql.catalog.glue.warehouse").rstrip("/")
+        ns, name = table.split(".")[1:]
+        location = f"{warehouse}/{ns}.db/{name}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
         self.spark.sql(f"DROP TABLE IF EXISTS {table} PURGE")
         self.spark.sql(f"""
             CREATE TABLE {table} ({cols})
             USING iceberg
             {part}
+            LOCATION '{location}'
             TBLPROPERTIES ({tblprops})
         """)
 
@@ -330,6 +343,49 @@ def merge_random_rows(spark, table, first_id, n_ids, rows, rng, tag):
     """)
 
 
+def s13_oversized_file(b, args):
+    t = f"{NS}.s13_oversized_file"
+    b.create(t, "days(occurred_at)", {})
+    for i in range(6):                                     # healthy days
+        b.day(t, date(2026, 9, 1) + timedelta(days=i), 100_000)
+    b.day(t, date(2026, 9, 7), 520_000)                    # ~20 MB in one file (> 180% of 8 MB)
+    b.finish(t)
+    return t
+
+
+def s14_spec_evolution(b, args):
+    t = f"{NS}.s14_spec_evolution"
+    b.create(t, "days(occurred_at)", {})
+    b.many_days(t, [date(2026, 9, 1) + timedelta(days=i) for i in range(10)], 100_000)
+    b.spark.sql(f"ALTER TABLE {t} REPLACE PARTITION FIELD occurred_at_day WITH months(occurred_at)")
+    for i in range(10, 15):                                # newer data lands in the monthly spec
+        b.day(t, date(2026, 9, 1) + timedelta(days=i), 100_000)
+    b.finish(t)
+    return t
+
+
+def s15_metadata_retention(b, args):
+    t = f"{NS}.s15_metadata_retention"
+    b.create(t, "days(occurred_at)", {"write.metadata.previous-versions-max": "5"})
+    for i in range(12):                                    # 12 healthy commits; the log keeps 5
+        b.day(t, date(2026, 9, 1) + timedelta(days=i), 100_000)
+    b.finish(t)
+    return t
+
+
+def s16_orphan_files(b, args):
+    t = f"{NS}.s16_orphan_files"
+    b.create(t, "days(occurred_at)", {})
+    b.many_days(t, [date(2026, 9, 1) + timedelta(days=i) for i in range(5)], 100_000)
+    b.finish(t)
+    jt = b.spark._jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergTable(b.spark._jsparkSession, t)
+    for i in range(5):                                     # what a crashed writer leaves behind
+        out = jt.io().newOutputFile(f"{str(jt.location()).rstrip('/')}/data/stray-{i}.parquet").create()
+        out.write(bytearray(b"not referenced by any snapshot " * 32))
+        out.close()
+    return t
+
+
 def s3_hot_partition(b, args):
     t = f"{NS}.s3_hot_partition"
     b.create(t, "days(occurred_at)", {})
@@ -358,6 +414,10 @@ BUILDERS = {
     "s10": s10_equality_deletes,
     "s11": s11_string_keys,
     "s12": s12_cow_merge_churn,
+    "s13": s13_oversized_file,
+    "s14": s14_spec_evolution,
+    "s15": s15_metadata_retention,
+    "s16": s16_orphan_files,
     "s3": s3_hot_partition,      # keep last
 }
 

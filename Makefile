@@ -123,6 +123,7 @@ gl-demo:
 #   make gl-plan T=s0                print the fix plan for s0 from the latest scan (dry run)
 #   make gl-plan T=s0 APPLY=1        run the plan's auto steps -> glue.ops.actions
 #   make gl-step STEP=s12-mor        scripted approval step for a scenario (see scenario_step.py)
+#   make gl-plan T=s14 APPROVE=MIXED_SPEC   run the plan's ASK statements for those symptoms
 #   make gl-bench BENCH_LABEL=before BENCH_ARGS="--table glue.demo.s0_small_appends"
 #   make gl-test-tables TT_ARGS="--only s0,s4"
 TT_ARGS ?=
@@ -132,6 +133,7 @@ SCAN_ARGS ?=
 FRESH_S3 ?=
 T ?=
 APPLY ?=
+APPROVE ?=
 STEP ?=
 gl-test-tables:
 	JOB_TIMEOUT_MIN=45 bash flavors/glue-lite/scripts/run-job.sh py build_test_tables.py $(TT_ARGS)
@@ -155,4 +157,4 @@ gl-step:
 	JOB_TIMEOUT_MIN=20 bash flavors/glue-lite/scripts/run-job.sh py scenario_step.py $(STEP)
 
 gl-plan:
-	bash flavors/glue-lite/scripts/run-job.sh py plan.py $(if $(T),--tables $(T)) $(if $(filter 1,$(APPLY)),--apply)
+	bash flavors/glue-lite/scripts/run-job.sh py plan.py $(if $(T),--tables $(T)) $(if $(filter 1,$(APPLY)),--apply) $(if $(APPROVE),--approve $(APPROVE))
