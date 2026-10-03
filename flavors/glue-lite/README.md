@@ -671,3 +671,56 @@ PASS    fixed   s16_orphan_files           healthy after fix
 PASS    detect  s0_small_appends           found as built: SMALL_FILES x2, SNAPSHOT_BUILDUP
                                             next: auto fix (make gl-plan T=s0 APPLY=1)
 ```
+
+## GL2.5m — Incremental scan, family 1: the snapshot ledger (shadow)
+
+Design: roadmap, "Incremental metadata scan: design". This patch is family 1;
+it runs in **shadow**: the full path still decides every finding, and the
+ledger's numbers are compared against it on every scan.
+
+What it keeps (new `glue.ops` tables, written once per scan):
+
+| Table | Holds |
+|---|---|
+| `snapshot_log` | One row per snapshot ever seen, kept after `expire_snapshots`: operation, summary numbers, and the gap to the previous writer commit, computed once when the snapshot is first seen |
+| `ledger_state` | Per table UUID: the watermark (last snapshot ingested, last writer commit, the current snapshot at that scan) |
+| `commit_gap_hist` | Gap counts per table, day and bucket (1, 2, 5, 10, 15, 30, 60, 120, 360, 720, 1440, 2880, 10080 min, longer); the 95th percentile sums 30 days of buckets |
+| `incremental_check` | Per scan, table and metric: full value, ledger value, agree |
+
+Per table and scan: read the snapshots from the already loaded table (no
+extra I/O), check lineage and gaps, ingest only snapshots newer than the
+watermark, compute the snapshot metrics from the ledger, compare.
+
+Events in `table_metrics.ledger_event`: `bootstrap` (first sight or new UUID),
+`new`, `unchanged`, `lineage-break` (the previously current snapshot is no
+longer an ancestor: rollback, replaced table), `ledger-gap` (the oldest new
+snapshot's parent was never ingested: snapshots expired between scans; the gap
+before it is stored as unknown, not invented). New columns:
+`commit_gap_p95_min` (bucket edge), `commit_gaps_window`,
+`ledger_new_snapshots`, `ledger_event`.
+
+Config (`health.json` → `incremental`): `snapshot_ledger` off | shadow | on;
+in `on`, reused tables skip the `.snapshots` read and use the ledger, a random
+`spot_check_share` of tables and any table not compared for
+`reconcile_every_days` are still compared, and a table that disagrees falls
+back to the full values for that scan. `retention_days` (365) bounds
+`snapshot_log`; check rows are kept 30 days.
+
+Each scan ends with:
+```
+=== Incremental check (shadow, snapshot ledger): 21/21 tables agree; 412 new snapshots ingested; bootstrap 21 ===
+```
+and one line per disagreement (table, metric, full vs ledger, note).
+
+Shadow test sequence (each edge case, then a scan):
+```bash
+make gl-image
+make gl-scan                          # bootstrap: every table ingested, all agree
+make gl-scan                          # unchanged: 0 new snapshots, all agree
+make gl-step STEP=grow && make gl-scan          # new: 10 snapshots on s17, gaps stored
+make gl-plan T=s0 APPLY=1 && make gl-scan       # replace commits: not writer commits
+make gl-step STEP=rollback && make gl-scan      # s17 lineage-break, still agrees
+make gl-step STEP=expire-gap && make gl-scan    # s17 ledger-gap, first gap unknown
+make gl-sql Q="SELECT table_name, metric, full_value, ledger_value, note FROM glue.ops.incremental_check WHERE NOT agree ORDER BY checked_at DESC"
+```
+Family 1 can switch to `on` after 5 clean scans in a row covering these.

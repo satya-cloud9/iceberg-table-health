@@ -20,6 +20,7 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
 import gl_common as gl
+import ledger as ledger_mod
 import probes
 
 PARTITION_METRICS_DDL = """
@@ -54,7 +55,8 @@ TABLE_METRICS_DDL = """
     orphan_files BIGINT, orphan_bytes BIGINT, listed_objects BIGINT, orphan_sample STRING,
     orphan_error STRING, excess_files_total BIGINT,
     metadata_location STRING, scan_mode STRING, scan_seconds DOUBLE,
-    minutes_since_writer_commit DOUBLE, orphan_scanned_at TIMESTAMP, retained_scanned_at TIMESTAMP"""
+    minutes_since_writer_commit DOUBLE, orphan_scanned_at TIMESTAMP, retained_scanned_at TIMESTAMP,
+    commit_gap_p95_min DOUBLE, commit_gaps_window BIGINT, ledger_new_snapshots BIGINT, ledger_event STRING"""
 
 
 def coerce(value, data_type):
@@ -147,7 +149,7 @@ def carry_orphans(tm, p):
             tm.setdefault(k, p.get(k))
 
 
-def reuse(spark, table, cfg, p, prev_rows, scanned_at):
+def reuse(spark, table, cfg, p, prev_rows, scanned_at, snapshot_source="full"):
     """Unchanged table (same metadata.json): copy the last scan's results and
     refresh only what moves with the clock - partition ages, and the
     snapshot-based metrics (from metadata.json, cheap)."""
@@ -159,7 +161,8 @@ def reuse(spark, table, cfg, p, prev_rows, scanned_at):
             r["minutes_since_update"] = float(r["minutes_since_update"]) + elapsed
         rows.append(r)
     tm = {k: v for k, v in p.items() if k not in REUSE_DROP}
-    tm.update(probes.snapshot_metrics(spark, table, cfg, p.get("data_bytes") or 0))
+    if snapshot_source == "full":       # "ledger": the snapshot ledger fills these in (mode "on")
+        tm.update(probes.snapshot_metrics(spark, table, cfg, p.get("data_bytes") or 0))
     wm = p.get("minutes_since_writer_commit")
     tm["minutes_since_writer_commit"] = None if wm is None else float(wm) + elapsed
     tm["scan_mode"] = "reused"
@@ -194,6 +197,8 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
     print(f"=== Scan {scan_id}: {len(names)} tables in {namespace} ===", flush=True)
 
     prev, prev_parts = load_previous(spark, tm_table, pm_table, namespace)
+    led = ledger_mod.Ledger(spark, config, scan_id)
+    snap_source = "ledger" if led.mode == "on" else "full"
     ages = action_ages(spark)
     summary, modes, t_start = [], {"full": 0, "reused": 0}, time.perf_counter()
     for name in names:
@@ -208,7 +213,7 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
         try:
             if (not full and p and info.get("metadata_location")
                     and p["metadata_location"] == info["metadata_location"]):
-                tm, pm_rows = reuse(spark, table, cfg, p, prev_parts.get(table, []), scanned_at)
+                tm, pm_rows = reuse(spark, table, cfg, p, prev_parts.get(table, []), scanned_at, snap_source)
                 rows = [dict(r, scan_id=scan_id, scanned_at=scanned_at, table_name=table) for r in pm_rows]
                 if rows:
                     spark.createDataFrame([as_row(r, pm_schema) for r in rows], pm_schema).writeTo(pm_table).append()
@@ -240,6 +245,12 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
                               orphan_scanned_at=scanned_at)
                 except Exception as oe:          # listing problems must not lose the table's metrics
                     tm["orphan_error"] = f"{type(oe).__name__}: {oe}"[:500]
+            try:
+                led.process(table, info.get("uuid"), tm, cfg,
+                            full_fn=lambda: probes.snapshot_metrics(spark, table, cfg, tm.get("data_bytes") or 0))
+            except Exception as le:          # the ledger must never cost the table its metrics
+                tm["ledger_event"] = f"error: {type(le).__name__}: {le}"[:300]
+                print(f"  {table}: ledger skipped ({tm['ledger_event']})", flush=True)
         except Exception as e:  # one broken table must not stop the scan
             tm = {"load_error": (info.get("error") or "") + f" | {type(e).__name__}: {e}"[:500],
                   "scan_mode": "failed"}
@@ -254,6 +265,7 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
         print(f"  {tm.get('scan_mode', 'full'):6} {table}  {tm['scan_seconds']:.1f}s", flush=True)
     print(f"=== {len(names)} tables in {time.perf_counter() - t_start:.1f}s: "
           + ", ".join(f"{k} {v}" for k, v in modes.items() if v) + " ===", flush=True)
+    led.report()
 
     if report:
         print("\n=== Table metrics (selected) ===", flush=True)

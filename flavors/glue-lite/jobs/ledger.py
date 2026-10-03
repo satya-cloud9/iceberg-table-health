@@ -1,0 +1,518 @@
+"""GL2.5m: incremental metadata scan, family 1 - the snapshot ledger.
+
+Every scan reads each table's metadata.json anyway (to load the table). The
+ledger keeps what it learns from it, so later scans only process snapshots
+they haven't seen:
+
+  glue.ops.snapshot_log      one row per snapshot ever seen (outlives expire_snapshots),
+                             with the gap to the previous writer commit, computed once
+  glue.ops.ledger_state      per table UUID: the watermark (last snapshot ingested,
+                             last writer commit, current snapshot at that scan)
+  glue.ops.commit_gap_hist   gap counts per table, day and bucket; percentiles sum
+                             buckets instead of sorting history
+  glue.ops.incremental_check shadow comparison: full value vs ledger value per metric
+
+Per table and scan:
+  1. read the snapshots from the loaded table (Java API, in memory: no extra I/O)
+  2. lineage check: is the current snapshot a descendant of the one current at the
+     last scan? (no -> rollback / replaced table: noted; the ledger keeps every
+     snapshot by id, so family 1 stays correct, but family 2+ will fall back to full)
+  3. gap check: does the oldest new snapshot's parent exist in the ledger? (no ->
+     snapshots expired before the ledger saw them: the first new gap is unknown)
+  4. ingest only snapshots newer than the watermark; writer commits (anything but
+     'replace') get their gap; gaps go into today's histogram bucket
+  5. compute the snapshot metrics (M1-M4, W2, writer age) from the ledger
+
+Mode (config "incremental.snapshot_ledger"): off | shadow | on. In shadow the full
+path stays authoritative and both are compared; in "on" the ledger values are
+used, with a random share of tables (spot_check_share) and any table not
+compared for reconcile_every_days still compared.
+
+Pure logic (plan_ingest, ledger_metrics, bucket helpers) has no Spark or py4j
+dependency so it is unit-tested locally.
+"""
+import json
+import math
+import random
+from datetime import datetime, timedelta, timezone
+
+SNAPSHOT_LOG_DDL = """
+    table_uuid STRING, table_name STRING, snapshot_id BIGINT, parent_id BIGINT,
+    committed_at TIMESTAMP, ts_ms BIGINT, operation STRING, is_writer BOOLEAN,
+    added_data_files BIGINT, deleted_data_files BIGINT, added_delete_files BIGINT,
+    added_files_size BIGINT, removed_files_size BIGINT, changed_partitions BIGINT,
+    total_data_files BIGINT, total_files_size BIGINT,
+    gap_min DOUBLE, gap_note STRING, scan_id STRING"""
+
+LEDGER_STATE_DDL = """
+    table_uuid STRING, table_name STRING, updated_at TIMESTAMP, last_ts_ms BIGINT,
+    last_snapshot_id BIGINT, last_writer_ts_ms BIGINT, current_snapshot_id BIGINT,
+    event STRING, scan_id STRING"""
+
+GAP_HIST_DDL = """
+    table_uuid STRING, day DATE, bucket_max_min DOUBLE, gaps BIGINT, scan_id STRING"""
+
+CHECK_DDL = """
+    scan_id STRING, checked_at TIMESTAMP, table_name STRING, table_uuid STRING,
+    family STRING, metric STRING, full_value STRING, ledger_value STRING,
+    agree BOOLEAN, note STRING"""
+
+# Upper edges in minutes; None = longer than the last edge.
+GAP_BUCKETS = [1, 2, 5, 10, 15, 30, 60, 120, 360, 720, 1440, 2880, 10080, None]
+
+SUMMARY_KEYS = {
+    "added_data_files": "added-data-files", "deleted_data_files": "deleted-data-files",
+    "added_delete_files": "added-delete-files", "added_files_size": "added-files-size",
+    "removed_files_size": "removed-files-size", "changed_partitions": "changed-partition-count",
+    "total_data_files": "total-data-files", "total_files_size": "total-files-size",
+}
+
+# Metrics both paths produce, compared in shadow.
+COMPARED = ["snapshots", "oldest_snapshot_age_h", "commits_1h", "commits_24h",
+            "avg_added_files_per_commit", "avg_added_bytes_per_commit",
+            "avg_changed_partitions_per_commit", "overwrite_commits_recent",
+            "avg_overwrite_rewrite_share", "overwrite_commits_24h", "rewritten_bytes_24h",
+            "table_turnover_24h", "metadata_versions", "minutes_since_writer_commit"]
+
+
+# ---------------------------------------------------------------- pure logic
+
+def bucket_of(gap_min):
+    for edge in GAP_BUCKETS:
+        if edge is None or gap_min <= edge:
+            return edge
+    return None
+
+
+def exact_percentile(values, q):
+    """Nearest-rank percentile (the definition the histogram uses too)."""
+    vals = sorted(v for v in values if v is not None)
+    if not vals:
+        return None
+    return vals[max(1, math.ceil(q * len(vals))) - 1]
+
+
+def hist_percentile(counts, q):
+    """counts: {bucket_edge: n}. -> (bucket upper edge, n); edge None = longer
+    than the last edge; (None, 0) when empty."""
+    total = sum(counts.values())
+    if not total:
+        return None, 0
+    k = max(1, math.ceil(q * total))
+    run = 0
+    for edge in GAP_BUCKETS:
+        run += counts.get(edge, 0)
+        if run >= k:
+            return edge, total
+    return None, total
+
+
+def bucket_lower(edge):
+    """The lower edge of a bucket (exclusive)."""
+    i = GAP_BUCKETS.index(edge)
+    return 0 if i == 0 else GAP_BUCKETS[i - 1]
+
+
+def ancestors(snaps_by_id, start_id):
+    """Snapshot ids from start back through parents that are still in metadata."""
+    out, sid = [], start_id
+    while sid is not None and sid in snaps_by_id:
+        out.append(sid)
+        sid = snaps_by_id[sid]["parent_id"]
+    return out, sid      # sid = first parent not in metadata (None = reached the root)
+
+
+def plan_ingest(snaps, state, current_id, in_ledger):
+    """Which snapshots to ingest and with which gaps.
+
+    snaps:     every snapshot in metadata: dicts with snapshot_id, parent_id, ts_ms,
+               operation and the SUMMARY_KEYS fields
+    state:     the table's ledger_state row (dict) or None
+    in_ledger: callable(snapshot_id) -> bool, consulted only when a parent is not
+               in metadata (rare)
+    -> (rows to ingest, oldest first; event string; new state dict)
+    """
+    by_id = {s["snapshot_id"]: s for s in snaps}
+    events = []
+    if not state:
+        new = sorted(snaps, key=lambda s: (s["ts_ms"], s["snapshot_id"]))
+        prev_writer = None
+        events.append("bootstrap")
+    else:
+        new = sorted((s for s in snaps
+                      if s["ts_ms"] > state["last_ts_ms"]
+                      or (s["ts_ms"] == state["last_ts_ms"]
+                          and s["snapshot_id"] != state["last_snapshot_id"]
+                          and not in_ledger(s["snapshot_id"]))),
+                     key=lambda s: (s["ts_ms"], s["snapshot_id"]))
+        prev_writer = state.get("last_writer_ts_ms")
+        # lineage: was the previously current snapshot an ancestor of the current one?
+        # (only provable when the walk back reaches the root; if it stops at an
+        # expired parent, lineage is unknown and the gap check below speaks)
+        if current_id is not None and state.get("current_snapshot_id") is not None:
+            chain, stop = ancestors(by_id, current_id)
+            if state["current_snapshot_id"] not in chain and stop is None:
+                events.append("lineage-break")
+        # gap: the oldest new snapshot's parent must be known
+        if new:
+            parent = new[0]["parent_id"]
+            if parent is not None and parent not in by_id and parent != state["last_snapshot_id"] \
+                    and not in_ledger(parent):
+                events.append("ledger-gap")
+                prev_writer = None          # the gap before the first new writer commit is unknown
+
+    rows = []
+    for s in new:
+        writer = s["operation"] != "replace"
+        gap, note = None, None
+        if writer:
+            if prev_writer is not None:
+                gap = round((s["ts_ms"] - prev_writer) / 60000.0, 4)
+            else:
+                note = "first-seen" if "bootstrap" in events else "unknown-after-gap"
+            prev_writer = s["ts_ms"]
+        rows.append(dict(s, is_writer=writer, gap_min=gap, gap_note=note))
+
+    if rows:
+        last = rows[-1]
+        new_state = {"last_ts_ms": last["ts_ms"], "last_snapshot_id": last["snapshot_id"],
+                     "last_writer_ts_ms": prev_writer, "current_snapshot_id": current_id}
+    else:
+        new_state = dict(state or {}, current_snapshot_id=current_id)
+    return rows, ",".join(events) or ("new" if rows else "unchanged"), new_state
+
+
+def _avg(vals, nd):
+    vals = [float(v) for v in vals if v is not None]
+    return round(sum(vals) / len(vals), nd) if vals else None
+
+
+def ledger_metrics(retained, ledger_rows, now_ms, recent, data_bytes, metadata_versions):
+    """The snapshot metrics, computed like probes.snapshot_metrics but from
+    ledger rows. `retained` = snapshots in metadata now (in memory; gives the
+    count and the oldest age); everything else comes from `ledger_rows`
+    restricted to retained ids, so a missing or wrong ledger row shows up as a
+    disagreement in shadow."""
+    ids = {s["snapshot_id"] for s in retained}
+    rows = sorted((r for r in ledger_rows if r["snapshot_id"] in ids),
+                  key=lambda r: (r["ts_ms"], r["snapshot_id"]), reverse=True)
+    m = {"snapshots": len(retained)}
+    m["oldest_snapshot_age_h"] = (round((now_ms - min(s["ts_ms"] for s in retained)) / 3600000.0, 2)
+                                  if retained else None)
+    m["commits_1h"] = sum(1 for r in rows if r["ts_ms"] >= now_ms - 3600000)
+    m["commits_24h"] = sum(1 for r in rows if r["ts_ms"] >= now_ms - 86400000)
+    last_n = rows[:recent]
+    m["avg_added_files_per_commit"] = _avg([r.get("added_data_files") for r in last_n], 2)
+    m["avg_added_bytes_per_commit"] = _avg([r.get("added_files_size") for r in last_n], 0)
+    m["avg_changed_partitions_per_commit"] = _avg([r.get("changed_partitions") for r in last_n], 2)
+    ow = [r for r in last_n if r["operation"] == "overwrite" and (r.get("deleted_data_files") or 0) > 0]
+    shares = []
+    for r in ow:
+        if r.get("total_data_files") is None:
+            continue
+        d, a = float(r.get("deleted_data_files") or 0), float(r.get("added_data_files") or 0)
+        shares.append(d / max(float(r["total_data_files"]) - a + d, 1))
+    m["overwrite_commits_recent"] = len(ow)
+    m["avg_overwrite_rewrite_share"] = round(sum(shares) / len(shares), 3) if shares else None
+    recent24 = [r for r in ow if r["ts_ms"] >= now_ms - 86400000]
+    m["overwrite_commits_24h"] = len(recent24)
+    m["rewritten_bytes_24h"] = int(sum(float(r.get("removed_files_size") or 0) for r in recent24))
+    m["table_turnover_24h"] = round(m["rewritten_bytes_24h"] / data_bytes, 2) if data_bytes else None
+    m["metadata_versions"] = metadata_versions
+    writers = [r["ts_ms"] for r in rows if r["is_writer"]]
+    m["minutes_since_writer_commit"] = round((now_ms - max(writers)) / 60000.0, 4) if writers else None
+    return m
+
+
+def reference_gaps(retained):
+    """Exact gaps from metadata: each writer commit vs the previous writer commit
+    still in metadata (what a lag() over .snapshots gives)."""
+    out, prev = {}, None
+    for s in sorted(retained, key=lambda s: (s["ts_ms"], s["snapshot_id"])):
+        if s["operation"] == "replace":
+            continue
+        out[s["snapshot_id"]] = None if prev is None else round((s["ts_ms"] - prev) / 60000.0, 4)
+        prev = s["ts_ms"]
+    return out
+
+
+def same(a, b, metric):
+    if a is None or b is None:
+        return a is None and b is None
+    if metric in ("minutes_since_writer_commit", "oldest_snapshot_age_h"):
+        return abs(float(a) - float(b)) <= 0.5     # minutes / hours: both read 'now' a moment apart
+    if isinstance(a, float) or isinstance(b, float):
+        return abs(float(a) - float(b)) <= max(1e-6, 1e-6 * abs(float(a)))
+    return a == b
+
+
+def compare(full, led, gaps_stored, gaps_ref, pct):
+    """-> list of (metric, full_value, ledger_value, agree, note)."""
+    out = []
+    for k in COMPARED:
+        if k in full:
+            out.append((k, full.get(k), led.get(k), same(full.get(k), led.get(k), k), ""))
+    bad = []
+    for sid, ref in gaps_ref.items():
+        st = gaps_stored.get(sid, "missing")
+        if st == "missing":
+            bad.append(f"{sid}: not in ledger")
+        elif st[0] is None and ref is None:
+            continue
+        elif st[0] is None and st[1] == "unknown-after-gap":
+            continue                        # expected: the predecessor expired unseen
+        elif ref is None and st[0] is not None:
+            continue                        # ledger knows a predecessor metadata no longer has
+        elif not same(ref, st[0], "gap"):
+            bad.append(f"{sid}: full {ref} vs ledger {st[0]}")
+    out.append(("commit_gaps", f"{len(gaps_ref)} retained writer commits", f"{len(bad)} differ",
+                not bad, "; ".join(bad[:5])))
+    exact, edge, n = pct
+    if n:
+        ok = exact is not None and (exact <= edge if edge is not None else exact > GAP_BUCKETS[-2]) \
+             and exact > (bucket_lower(edge) if edge is not None else GAP_BUCKETS[-2]) - 1e-9
+        out.append(("commit_gap_p95_min", exact, f"<= {edge}" if edge is not None else "> 10080",
+                    ok, f"{n} gaps in the window"))
+    return out
+
+
+# ---------------------------------------------------------------- Spark / py4j side
+
+def mode_of(config, family="snapshot_ledger"):
+    m = (config.get("incremental") or {}).get(family, "off")
+    return m if m in ("off", "shadow", "on") else "off"
+
+
+def read_snapshots(spark, table):
+    """All snapshots in the loaded table's metadata (no I/O beyond the load),
+    the current snapshot id and the metadata.json version count."""
+    jt = spark._jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark._jsparkSession, table)
+    snaps = []
+    it = jt.snapshots().iterator()
+    while it.hasNext():
+        s = it.next()
+        summ = s.summary()
+        row = {"snapshot_id": int(s.snapshotId()),
+               "parent_id": None if s.parentId() is None else int(s.parentId()),
+               "ts_ms": int(s.timestampMillis()), "operation": str(s.operation())}
+        for col, key in SUMMARY_KEYS.items():
+            v = summ.get(key)
+            row[col] = None if v is None else int(str(v))
+        snaps.append(row)
+    cur = jt.currentSnapshot()
+    try:
+        versions = int(jt.operations().current().previousFiles().size()) + 1
+    except Exception:
+        versions = None
+    return snaps, (None if cur is None else int(cur.snapshotId())), versions
+
+
+def ensure_tables(spark, ops):
+    import gl_common as gl
+    specs = {"snapshot_log": (SNAPSHOT_LOG_DDL, "PARTITIONED BY (days(committed_at))"),
+             "ledger_state": (LEDGER_STATE_DDL, ""),
+             "commit_gap_hist": (GAP_HIST_DDL, ""),
+             "incremental_check": (CHECK_DDL, "PARTITIONED BY (days(checked_at))")}
+    for name, (ddl, part) in specs.items():
+        spark.sql(f"CREATE TABLE IF NOT EXISTS {ops}.{name} ({ddl}) USING iceberg {part}")
+        gl.ensure_columns(spark, f"{ops}.{name}", ddl)
+
+
+def load_states(spark, ops):
+    rows = spark.sql(f"""
+        SELECT * FROM (SELECT s.*, row_number() OVER (PARTITION BY table_uuid ORDER BY updated_at DESC) AS rn
+                       FROM {ops}.ledger_state s) WHERE rn = 1""").collect()
+    return {r.table_uuid: r.asDict() for r in rows}
+
+
+def _ids_sql(ids):
+    return ", ".join(str(int(i)) for i in ids) or "NULL"
+
+
+def _rows(spark, sql):
+    return [r.asDict() for r in spark.sql(sql).collect()]
+
+
+class Ledger:
+    """One per scan: holds the states and writes the scan's rows in batches."""
+
+    def __init__(self, spark, config, scan_id):
+        import gl_common as gl
+        self.spark, self.config, self.scan_id = spark, config, scan_id
+        self.ops = gl.OPS_NAMESPACE
+        self.mode = mode_of(config)
+        inc = config.get("incremental") or {}
+        self.spot_share = float(inc.get("spot_check_share", 0.05))
+        self.reconcile_days = float(inc.get("reconcile_every_days", 7))
+        self.hist_days = int(inc.get("histogram_days", 30))
+        self.retention_days = int(inc.get("retention_days", 365))
+        self.results = []          # per table: (table, agree, n_checks, disagreements, ingested, event)
+        # rows written once at the end of the scan (one Iceberg commit per ops table, not per table)
+        self.pending = {"snapshot_log": [], "commit_gap_hist": [], "ledger_state": [], "incremental_check": []}
+        if self.mode != "off":
+            ensure_tables(spark, self.ops)
+            self.states = load_states(spark, self.ops)
+            self.last_checked = {r.table_uuid: float(r.age_d) for r in spark.sql(f"""
+                SELECT table_uuid, (unix_timestamp(current_timestamp()) - unix_timestamp(max(checked_at)))
+                       / 86400.0 AS age_d FROM {self.ops}.incremental_check
+                WHERE family = 'snapshot_ledger' GROUP BY table_uuid""").collect()}
+
+    # -- per table ---------------------------------------------------------
+    def process(self, table, uuid, tm, cfg, full_fn=None):
+        """Ingest new snapshots, compute ledger metrics, compare (shadow / spot
+        check / reconcile), and in "on" mode put the ledger values into tm."""
+        if self.mode == "off" or not uuid:
+            return
+        from scan_metrics import as_row
+        spark, ops = self.spark, self.ops
+        snaps, current, versions = read_snapshots(spark, table)
+        state = self.states.get(uuid)
+
+        def in_ledger(sid):
+            if any(r["table_uuid"] == uuid and r["snapshot_id"] == sid for r in self.pending["snapshot_log"]):
+                return True
+            return bool(spark.sql(f"SELECT 1 FROM {ops}.snapshot_log WHERE table_uuid = '{uuid}' "
+                                  f"AND snapshot_id = {int(sid)} LIMIT 1").collect())
+
+        rows, event, new_state = plan_ingest(snaps, state, current, in_ledger)
+        now = datetime.now(timezone.utc)
+        for r in rows:
+            self.pending["snapshot_log"].append(dict(
+                r, table_uuid=uuid, table_name=table, scan_id=self.scan_id,
+                committed_at=datetime.fromtimestamp(r["ts_ms"] / 1000.0, timezone.utc)))
+        counts = {}
+        for r in rows:
+            if r["gap_min"] is not None:
+                day = datetime.fromtimestamp(r["ts_ms"] / 1000.0, timezone.utc).date()
+                counts[(day, bucket_of(r["gap_min"]))] = counts.get((day, bucket_of(r["gap_min"])), 0) + 1
+        for (d, b), n in counts.items():
+            self.pending["commit_gap_hist"].append({"table_uuid": uuid, "day": d, "bucket_max_min": b,
+                                                    "gaps": n, "scan_id": self.scan_id})
+        if rows or state is None or event != "unchanged":
+            self.pending["ledger_state"].append(dict(new_state, table_uuid=uuid, table_name=table,
+                                                     updated_at=now, event=event, scan_id=self.scan_id))
+            self.states[uuid] = dict(new_state, table_uuid=uuid)
+
+        # ledger rows needed for the metrics: the newest `recent` retained snapshots
+        # plus every retained snapshot of the last 24 h (bounded by recent activity)
+        recent = int(cfg["recent_commits"])
+        now_ms = int(now.timestamp() * 1000)
+        by_ts = sorted(snaps, key=lambda s: (s["ts_ms"], s["snapshot_id"]), reverse=True)
+        need = ({s["snapshot_id"] for s in by_ts[:recent]}
+                | {s["snapshot_id"] for s in snaps if s["ts_ms"] >= now_ms - 86400000})
+        last_writer = next((s for s in by_ts if s["operation"] != "replace"), None)
+        if last_writer:
+            need.add(last_writer["snapshot_id"])
+        lrows = self._log_rows(uuid, need, "*")
+        led = ledger_metrics(snaps, lrows, now_ms, recent, tm.get("data_bytes") or 0, versions)
+        p95_edge, n_gaps = self._hist_p95(uuid)
+        tm["commit_gap_p95_min"] = p95_edge
+        tm["commit_gaps_window"] = n_gaps
+        tm["ledger_new_snapshots"] = len(rows)
+        tm["ledger_event"] = event
+
+        check = (self.mode == "shadow" or random.random() < self.spot_share
+                 or self.last_checked.get(uuid, 1e9) >= self.reconcile_days)
+        disagreements, n_checks, full = [], 0, tm
+        if check:
+            ref = reference_gaps(snaps)
+            stored = {r["snapshot_id"]: (r["gap_min"], r["gap_note"])
+                      for r in self._log_rows(uuid, ref, "snapshot_id, gap_min, gap_note")}
+            exact = self._exact_p95(uuid)
+            full = tm
+            if self.mode == "on" and full_fn is not None:   # spot check: tm holds no full values
+                full = dict(full_fn(), minutes_since_writer_commit=tm.get("minutes_since_writer_commit"))
+            res = compare(full, led, stored, ref, (exact, p95_edge, n_gaps))
+            why = "shadow" if self.mode == "shadow" else "spot-check/reconcile"
+            for m, f, l, ok, note in res:
+                self.pending["incremental_check"].append({
+                    "scan_id": self.scan_id, "checked_at": now, "table_name": table, "table_uuid": uuid,
+                    "family": "snapshot_ledger", "metric": m, "full_value": None if f is None else str(f),
+                    "ledger_value": None if l is None else str(l), "agree": ok,
+                    "note": (note + f" [{why}; {event}]").strip()})
+            n_checks = len(res)
+            disagreements = [(m, f, l, note) for m, f, l, ok, note in res if not ok]
+        if self.mode == "on":
+            if disagreements:      # don't trust the ledger for this table this scan
+                tm.update({k: v for k, v in full.items() if k in COMPARED})
+                tm["ledger_event"] = event + ",fallback-full"
+            else:
+                tm.update({k: v for k, v in led.items() if k in COMPARED})
+        self.results.append((table, not disagreements, n_checks, disagreements, len(rows), event))
+
+    def _log_rows(self, uuid, ids, cols):
+        ids = set(ids)
+        got = _rows(self.spark, f"SELECT {cols} FROM {self.ops}.snapshot_log WHERE table_uuid = '{uuid}' "
+                                f"AND snapshot_id IN ({_ids_sql(ids)})") if ids else []
+        seen = {r["snapshot_id"] for r in got}
+        got += [r for r in self.pending["snapshot_log"]
+                if r["table_uuid"] == uuid and r["snapshot_id"] in ids and r["snapshot_id"] not in seen]
+        return got
+
+    def _cutoff_day(self):
+        return (datetime.now(timezone.utc) - timedelta(days=self.hist_days)).date()
+
+    def _hist_p95(self, uuid):
+        counts = {}
+        for r in self.spark.sql(f"""
+                SELECT bucket_max_min, sum(gaps) AS n FROM {self.ops}.commit_gap_hist
+                WHERE table_uuid = '{uuid}' AND day >= DATE '{self._cutoff_day()}'
+                GROUP BY bucket_max_min""").collect():
+            b = r.bucket_max_min
+            b = None if b is None else (int(b) if float(b).is_integer() else float(b))
+            counts[b] = counts.get(b, 0) + int(r.n)
+        for r in self.pending["commit_gap_hist"]:
+            if r["table_uuid"] == uuid and r["day"] >= self._cutoff_day():
+                counts[r["bucket_max_min"]] = counts.get(r["bucket_max_min"], 0) + r["gaps"]
+        return hist_percentile(counts, 0.95)
+
+    def _exact_p95(self, uuid):
+        cutoff = self._cutoff_day()
+        vals = [r.gap_min for r in self.spark.sql(f"""
+            SELECT gap_min FROM {self.ops}.snapshot_log
+            WHERE table_uuid = '{uuid}' AND gap_min IS NOT NULL
+              AND to_date(committed_at) >= DATE '{cutoff}'""").collect()]
+        vals += [r["gap_min"] for r in self.pending["snapshot_log"]
+                 if r["table_uuid"] == uuid and r["gap_min"] is not None and r["committed_at"].date() >= cutoff]
+        return exact_percentile(vals, 0.95)
+
+    def flush(self):
+        """Write the scan's ledger rows: one append per ops table."""
+        if self.mode == "off":
+            return
+        from scan_metrics import as_row
+        for name, rows in self.pending.items():
+            if rows:
+                sch = self.spark.table(f"{self.ops}.{name}").schema
+                self.spark.createDataFrame([as_row(r, sch) for r in rows], sch) \
+                    .writeTo(f"{self.ops}.{name}").append()
+            self.pending[name] = []
+
+    # -- end of scan -------------------------------------------------------
+    def report(self):
+        if self.mode == "off":
+            return
+        self.flush()
+        checked = [r for r in self.results if r[2]]
+        ok = sum(1 for r in checked if r[1])
+        ingested = sum(r[4] for r in self.results)
+        events = {}
+        for r in self.results:
+            for e in r[5].split(","):
+                if e not in ("unchanged", "new"):
+                    events[e] = events.get(e, 0) + 1
+        ev = ", ".join(f"{k} {v}" for k, v in sorted(events.items()))
+        print(f"\n=== Incremental check ({self.mode}, snapshot ledger): {ok}/{len(checked)} tables agree; "
+              f"{ingested} new snapshots ingested{'; ' + ev if ev else ''} ===", flush=True)
+        for table, agree, n, dis, _, event in self.results:
+            for m, f, l, note in dis:
+                print(f"  {table.rsplit('.', 1)[-1]:26} {m}: full={f} ledger={l}  {note} [{event}]", flush=True)
+        try:   # keep the ops tables bounded
+            self.spark.sql(f"DELETE FROM {self.ops}.incremental_check "
+                           f"WHERE checked_at < current_timestamp() - INTERVAL 30 DAYS")
+            self.spark.sql(f"DELETE FROM {self.ops}.commit_gap_hist "
+                           f"WHERE day < date_sub(current_date(), {max(self.hist_days * 3, 90)})")
+            self.spark.sql(f"DELETE FROM {self.ops}.snapshot_log "
+                           f"WHERE committed_at < current_timestamp() - INTERVAL {self.retention_days} DAYS")
+        except Exception as e:
+            print(f"  (ledger retention cleanup skipped: {type(e).__name__})", flush=True)

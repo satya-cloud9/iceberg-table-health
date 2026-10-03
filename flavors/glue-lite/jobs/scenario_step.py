@@ -20,6 +20,11 @@ Steps:
             scan / grow / scan / grow / scan: excess files rise 11 -> 21 -> 31
             and MAINTENANCE_LAG fires on the third scan.
 
+  rollback  (GL2.5m) roll s17_growing back one snapshot: the next scan must
+            report a lineage break and the ledger must still agree.
+  expire-gap (GL2.5m) 10 commits into s17, then expire all but the current
+            snapshot before any scan: the next scan must report a ledger gap.
+
 Usage (via scripts/run-job.sh py scenario_step.py ...):
   scenario_step.py s12-mor [--hot-minutes 3]
   scenario_step.py grow [--hot-minutes 3]
@@ -100,7 +105,43 @@ def grow(spark, args):
     time.sleep(wait)
 
 
-STEPS = {"s12-mor": s12_mor, "grow": grow}
+def rollback(spark, args):
+    """GL2.5m edge case: roll s17 back one snapshot. The rolled-back snapshot
+    stays in metadata, so the next scan must report a lineage break, and the
+    ledger (which keeps every snapshot by id) must still agree with the full path.
+    Not recorded as an advisor action: it plays an operator, not the advisor."""
+    table = f"{NS}.s17_growing"
+    ident = table.split(".", 1)[1]
+    cur = current_snapshot(spark, table)
+    jt = spark._jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark._jsparkSession, table)
+    parent = jt.currentSnapshot().parentId()
+    if parent is None:
+        raise SystemExit(f"{table}: current snapshot has no parent to roll back to")
+    status, result, dur = run_sql(spark, f"CALL glue.system.rollback_to_snapshot('{ident}', {int(parent)})")
+    print(f"  {table}: rollback {cur} -> {int(parent)}: {status} {result[:200]}", flush=True)
+
+
+def expire_gap(spark, args):
+    """GL2.5m edge case: snapshots expire before the ledger sees them. Adds 10
+    commits to s17, then expires everything but the current snapshot straight
+    away, so the next scan finds a new snapshot whose parent it never ingested
+    (event ledger-gap) and must not invent the gap before it."""
+    table = f"{NS}.s17_growing"
+    ident = table.split(".", 1)[1]
+    b = Builder(spark)
+    b.next_id = 60_000_000 + int(time.time()) % 1_000_000 * 100
+    b.fragment(table, S17_DAY, commits=10, files_per_commit=1, rows_per_commit=300)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    status, result, dur = run_sql(spark, f"CALL glue.system.expire_snapshots(table => '{ident}', "
+                                         f"older_than => TIMESTAMP '{now}+00:00', retain_last => 1)")
+    print(f"  {table}: 10 commits added, then expire_snapshots(retain_last 1): {status} {result[:200]}",
+          flush=True)
+    wait = args.hot_minutes * 60 + 30
+    print(f"  waiting {wait}s so the day is past the hot window", flush=True)
+    time.sleep(wait)
+
+
+STEPS = {"s12-mor": s12_mor, "grow": grow, "rollback": rollback, "expire-gap": expire_gap}
 
 
 def main():
