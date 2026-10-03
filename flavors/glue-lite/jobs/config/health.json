@@ -1,5 +1,5 @@
 {
-  "_comment": "Table Health Advisor settings. orphan_min_age_minutes is test scale (3, the hot window); production should be days (Iceberg's remove_orphan_files default is 3 days = 4320) so in-flight writes are never counted. 'defaults' apply to every table; 'tables' overrides per table ('thresholds' merges key by key). Test scale: target file size is 8 MB (64x below Iceberg's 512 MB default) so small test tables show real symptoms. Thresholds were calibrated on the first gl-metrics run of S0-S6 (2026-10-02); production values are noted in the README.",
+  "_comment": "Table Health Advisor settings. orphan_min_age_minutes is test scale (3, the hot window); production should be days (Iceberg's remove_orphan_files default is 3 days = 4320) so in-flight writes are never counted. orphan_scan_every_hours / retained_bytes_every_hours: 0 = whenever the table changed (test); production ~24. 'defaults' apply to every table; 'tables' overrides per table ('thresholds' merges key by key). Test scale: target file size is 8 MB (64x below Iceberg's 512 MB default) so small test tables show real symptoms. Thresholds were calibrated on the first gl-metrics run of S0-S6 (2026-10-02); production values are noted in the README.",
   "defaults": {
     "target_file_bytes": 8388608,
     "small_file_ratio": 0.75,
@@ -12,6 +12,8 @@
     "workload_min_evidence": "observed",
     "orphan_scan": true,
     "orphan_min_age_minutes": 3,
+    "orphan_scan_every_hours": 0,
+    "retained_bytes_every_hours": 0,
     "thresholds": {
       "min_excess_files": 4,
       "delete_ratio": 0.05,

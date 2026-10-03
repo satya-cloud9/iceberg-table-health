@@ -120,6 +120,7 @@ gl-demo:
 #   make gl-scorecard                check the latest scan against config/expectations.json
 #   make gl-scan                     metrics + symptoms + scorecard in one job (s3 measured first)
 #   make gl-scan FRESH_S3=1          rebuild s3 first so its hot partition is checkable (~4 min more)
+#   make gl-scan SCAN_ARGS=--full    measure every table, even unchanged ones
 #   make gl-plan T=s0                print the fix plan for s0 from the latest scan (dry run)
 #   make gl-plan T=s0 APPLY=1        run the plan's auto steps -> glue.ops.actions
 #   make gl-step STEP=s12-mor        scripted approval step for a scenario (see scenario_step.py)

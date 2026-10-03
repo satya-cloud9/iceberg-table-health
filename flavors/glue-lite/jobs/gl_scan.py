@@ -30,11 +30,12 @@ def main():
     p.add_argument("--priority", default="s3_hot_partition",
                    help="comma-separated tables to measure first")
     p.add_argument("--no-scorecard", action="store_true")
+    p.add_argument("--full", action="store_true", help="measure every table, even unchanged ones")
     a = p.parse_args()
 
     config = gl.load_config(a.config)
     spark = SparkSession.builder.appName("gl25-scan").getOrCreate()
-    scan_id = run_scan(spark, a.namespace, config, report=False,
+    scan_id = run_scan(spark, a.namespace, config, report=False, full=a.full,
                        priority=[t.strip() for t in a.priority.split(",") if t.strip()])
     run_detect(spark, scan_id, config)
     if not a.no_scorecard:

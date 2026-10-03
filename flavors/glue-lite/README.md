@@ -556,3 +556,39 @@ make gl-scan                    # excess 21
 make gl-step STEP=grow
 make gl-scan                    # excess 31: MAINTENANCE_LAG in the per-table output
 ```
+
+## GL2.5j — Scan cost at scale
+
+Metadata tables are views over metadata files: `snapshots`, `history`,
+`properties` and `metadata_log_entries` read metadata.json only (cheap);
+`manifests` reads the manifest list (cheap); `files`, `entries`, `partitions`
+read every manifest of the current snapshot (grows with file count);
+`all_files` / `all_entries` read the manifests of every retained snapshot
+(most expensive). The scan now avoids the expensive ones when they can't
+change the answer:
+
+- **Unchanged tables are reused.** Iceberg never rewrites metadata in place,
+  so the metadata.json location is a fingerprint. If it matches the table's
+  last scan, the scan copies that scan's partition and table rows and only
+  refreshes what moves with the clock: partition ages (old age + time since
+  that scan) and the snapshot metrics (from metadata.json). Cost per
+  unchanged table: one table load. `scan_mode` in `table_metrics` says
+  `full`, `reused` or `failed`; `scan_seconds` records the time per table.
+- **Hot window only when it can matter.** `all_entries` (per-partition last
+  writer commit) is read only if the table's last writer commit, from
+  `snapshots`, is inside the hot window. Otherwise every partition gets the
+  table-level age, a safe lower bound.
+- **Interval-gated probes.** Retained bytes (`all_files`) and the orphan
+  listing run when due: `retained_bytes_every_hours`,
+  `orphan_scan_every_hours` (0 = whenever the table changed, the test
+  setting; ~24 in production). Between runs their last values are carried.
+- `make gl-scan SCAN_ARGS=--full` measures everything from scratch.
+
+Check it: run `make gl-scan` twice with no writes in between. The second run
+should report every table `reused` and finish much faster, with the same
+scorecard.
+
+**Not done yet (next):** rescanning only the changed partitions of a large
+changed table (from the manifests added since the last scan), and finding
+changed tables in bulk from Glue `GetTables` metadata locations instead of
+loading each table - that matters most for the Trino port at 1,000+ tables.

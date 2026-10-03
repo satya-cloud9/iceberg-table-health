@@ -38,7 +38,8 @@ def table_info(spark, table):
     """Spec, sort order and properties via the Iceberg Java API (py4j)."""
     info = {"partitioned": True, "spec": None, "spec_id": None, "sort_order": None,
             "sort_order_id": None, "sort_defined": False, "format_version": None,
-            "properties": {}, "error": None, "uuid": None, "partition_fields": []}
+            "properties": {}, "error": None, "uuid": None, "partition_fields": [],
+            "metadata_location": None}
     try:
         jt = spark._jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark._jsparkSession, table)
         spec = jt.spec()
@@ -58,6 +59,10 @@ def table_info(spark, table):
         props = jt.properties()
         info["properties"] = {str(k): str(props.get(k)) for k in props.keySet().toArray()}
         try:
+            info["metadata_location"] = str(jt.operations().current().metadataFileLocation())
+        except Exception:
+            info["metadata_location"] = None
+        try:
             info["uuid"] = str(jt.operations().current().uuid())
         except Exception:
             info["uuid"] = None
@@ -71,8 +76,17 @@ def table_info(spark, table):
     return info
 
 
-def partition_metrics(spark, table, info, cfg):
-    """F1-F8: one row per partition (delete files included)."""
+def partition_metrics(spark, table, info, cfg, table_writer_minutes="compute"):
+    """F1-F8: one row per partition (delete files included).
+
+    F6 per partition needs all_entries (every retained snapshot's manifests).
+    If the table's last writer commit is already outside the hot window, no
+    partition can be hot, so that read is skipped and every partition gets
+    the table-level age (a lower bound on its own)."""
+    if table_writer_minutes == "compute":
+        table_writer_minutes = writer_minutes(spark, table)
+    hot = float(cfg.get("hot_partition_minutes", 15))
+    per_partition_age = table_writer_minutes is not None and table_writer_minutes < hot
     target = int(cfg["target_file_bytes"])
     small = int(target * float(cfg["small_file_ratio"]))
     oversized = int(target * float(cfg["oversized_file_ratio"]))
@@ -91,10 +105,17 @@ def partition_metrics(spark, table, info, cfg):
     # expired), the last write is older than every retained snapshot and the
     # partition is not hot (minutes = NULL).
     epk = "to_json(e.data_file.partition)" if info["partitioned"] else "'{}'"
-    w_join = (f"LEFT JOIN (SELECT {epk} AS partition_key, max(s.committed_at) AS last_write "
-              f"FROM {table}.all_entries e JOIN {table}.snapshots s ON e.snapshot_id = s.snapshot_id "
-              f"WHERE e.status = 1 AND s.operation <> 'replace' GROUP BY 1) w "
-              f"ON a.partition_key = w.partition_key")
+    if per_partition_age:
+        w_join = (f"LEFT JOIN (SELECT {epk} AS partition_key, max(s.committed_at) AS last_write "
+                  f"FROM {table}.all_entries e JOIN {table}.snapshots s ON e.snapshot_id = s.snapshot_id "
+                  f"WHERE e.status = 1 AND s.operation <> 'replace' GROUP BY 1) w "
+                  f"ON a.partition_key = w.partition_key")
+        age_sql = ("CAST((unix_timestamp(current_timestamp()) - unix_timestamp(w.last_write)) / 60.0 "
+                   "AS DOUBLE)")
+    else:
+        w_join = ""
+        age_sql = ("CAST(NULL AS DOUBLE)" if table_writer_minutes is None
+                   else f"CAST({table_writer_minutes} AS DOUBLE)")
     return spark.sql(f"""
         WITH f AS (
             SELECT {pk} AS partition_key, content, file_size_in_bytes, record_count,
@@ -136,8 +157,7 @@ def partition_metrics(spark, table, info, cfg):
                CAST(files_old_spec AS BIGINT)     AS files_old_spec,
                CAST(files_current_sort AS BIGINT) AS files_current_sort,
                p.last_updated_at,
-               CAST((unix_timestamp(current_timestamp()) - unix_timestamp(w.last_write)) / 60.0
-                    AS DOUBLE) AS minutes_since_update,
+               {age_sql} AS minutes_since_update,
                CAST({target} AS BIGINT) AS target_file_bytes
         FROM a {p_join} {w_join}
         ORDER BY a.partition_key
@@ -219,34 +239,21 @@ def _pruning(spark, table, info, columns):
     return out
 
 
-def table_metrics(spark, table, info, cfg, pm_rows):
-    """P1-P4, M1-M5, M7, M8, C1-C3, W1 for one table; pm_rows = partition metric rows."""
-    target = int(cfg["target_file_bytes"])
-    undersized_limit = target * float(cfg["undersized_partition_ratio"])
+def writer_minutes(spark, table):
+    """Minutes since the last commit by a writer (anything but 'replace',
+    i.e. not compaction), from snapshots alone. None if none is left."""
+    r = _one(spark, f"""
+        SELECT (unix_timestamp(current_timestamp()) - unix_timestamp(max(committed_at))) / 60.0 AS m
+        FROM {table}.snapshots WHERE operation <> 'replace'""")
+    return None if r.m is None else float(r.m)
+
+
+def snapshot_metrics(spark, table, cfg, data_bytes):
+    """M1-M4, M7, W2: everything that comes from snapshots and the metadata
+    log, i.e. from metadata.json alone. Cheap, so a reused scan of an
+    unchanged table still refreshes these (their time windows move)."""
     recent = int(cfg["recent_commits"])
-    m = {}
-
-    # P1-P4: partition-level aggregates
-    sizes = sorted(int(r.data_bytes or 0) for r in pm_rows)
-    m["partitions"] = len(pm_rows)
-    m["data_files"] = sum(int(r.data_files or 0) for r in pm_rows)
-    m["delete_files"] = sum(int((r.delete_files_pos or 0) + (r.delete_files_eq or 0)) for r in pm_rows)
-    m["records"] = sum(int(r.records or 0) for r in pm_rows)
-    m["data_bytes"] = sum(sizes)
-    m["avg_file_bytes"] = m["data_bytes"] // m["data_files"] if m["data_files"] else 0
-    ideal = sum(int(r.ideal_files or 0) for r in pm_rows)
-    m["read_amplification"] = round(m["data_files"] / ideal, 2) if ideal else None
-    m["partitions_with_excess"] = sum(1 for r in pm_rows if (r.excess_files or 0) >= 1)
-    m["excess_files_total"] = sum(max(0, int(r.excess_files or 0)) for r in pm_rows)
-    if sizes:
-        median = sizes[len(sizes) // 2] if len(sizes) % 2 else (sizes[len(sizes) // 2 - 1] + sizes[len(sizes) // 2]) / 2
-        m["skew_ratio"] = round(sizes[-1] / median, 2) if median else None
-        top_n = max(1, math.ceil(len(sizes) * 0.01))
-        m["top1pct_share"] = round(sum(sizes[-top_n:]) / m["data_bytes"], 3) if m["data_bytes"] else None
-        m["undersized_partition_share"] = round(sum(1 for s in sizes if s < undersized_limit) / len(sizes), 3)
-    else:
-        m["skew_ratio"] = m["top1pct_share"] = m["undersized_partition_share"] = None
-
+    m = {"data_bytes": data_bytes}
     # M1-M4: snapshots and commit pattern
     s = _one(spark, f"""
         SELECT count(*) AS n,
@@ -298,6 +305,43 @@ def table_metrics(spark, table, info, cfg, pm_rows):
     m["table_turnover_24h"] = (round(m["rewritten_bytes_24h"] / m["data_bytes"], 2)
                                if m["data_bytes"] else None)
 
+    # M7: metadata.json versions still tracked
+    m["metadata_versions"] = int(_one(spark, f"SELECT count(*) AS n FROM {table}.metadata_log_entries").n)
+
+    m.pop("data_bytes", None)
+    return m
+
+
+def table_metrics(spark, table, info, cfg, pm_rows, retained=True):
+    """P1-P4, M1-M5, M7, M8, C1-C3, W1 for one table; pm_rows = partition metric rows."""
+    target = int(cfg["target_file_bytes"])
+    undersized_limit = target * float(cfg["undersized_partition_ratio"])
+    recent = int(cfg["recent_commits"])
+    m = {}
+
+    # P1-P4: partition-level aggregates
+    sizes = sorted(int(r.data_bytes or 0) for r in pm_rows)
+    m["partitions"] = len(pm_rows)
+    m["data_files"] = sum(int(r.data_files or 0) for r in pm_rows)
+    m["delete_files"] = sum(int((r.delete_files_pos or 0) + (r.delete_files_eq or 0)) for r in pm_rows)
+    m["records"] = sum(int(r.records or 0) for r in pm_rows)
+    m["data_bytes"] = sum(sizes)
+    m["avg_file_bytes"] = m["data_bytes"] // m["data_files"] if m["data_files"] else 0
+    ideal = sum(int(r.ideal_files or 0) for r in pm_rows)
+    m["read_amplification"] = round(m["data_files"] / ideal, 2) if ideal else None
+    m["partitions_with_excess"] = sum(1 for r in pm_rows if (r.excess_files or 0) >= 1)
+    m["excess_files_total"] = sum(max(0, int(r.excess_files or 0)) for r in pm_rows)
+    if sizes:
+        median = sizes[len(sizes) // 2] if len(sizes) % 2 else (sizes[len(sizes) // 2 - 1] + sizes[len(sizes) // 2]) / 2
+        m["skew_ratio"] = round(sizes[-1] / median, 2) if median else None
+        top_n = max(1, math.ceil(len(sizes) * 0.01))
+        m["top1pct_share"] = round(sum(sizes[-top_n:]) / m["data_bytes"], 3) if m["data_bytes"] else None
+        m["undersized_partition_share"] = round(sum(1 for s in sizes if s < undersized_limit) / len(sizes), 3)
+    else:
+        m["skew_ratio"] = m["top1pct_share"] = m["undersized_partition_share"] = None
+
+    m.update(snapshot_metrics(spark, table, cfg, m["data_bytes"]))
+
     # M5: manifests of the current snapshot (data manifests only)
     mf = _one(spark, f"""
         SELECT count(*) AS n, avg(length) AS avg_len
@@ -306,17 +350,18 @@ def table_metrics(spark, table, info, cfg, pm_rows):
     m["data_manifests"] = int(mf.n)
     m["avg_manifest_bytes"] = round(float(mf.avg_len), 0) if mf.avg_len is not None else None
 
-    # M7: metadata.json versions still tracked
-    m["metadata_versions"] = int(_one(spark, f"SELECT count(*) AS n FROM {table}.metadata_log_entries").n)
-
-    # M8: bytes only old snapshots reference (storage you pay for but can't query)
-    r = _one(spark, f"""
-        SELECT
-          (SELECT coalesce(sum(sz), 0) FROM
-             (SELECT file_path, max(file_size_in_bytes) AS sz FROM {table}.all_files GROUP BY file_path)) -
-          (SELECT coalesce(sum(file_size_in_bytes), 0) FROM {table}.files) AS retained
-    """)
-    m["retained_bytes"] = int(r.retained or 0)
+    # M8: bytes only old snapshots reference (storage you pay for but can't query).
+    # Reads the manifests of every retained snapshot; the scan runs it less often.
+    if not retained:
+        m["retained_bytes"] = None
+    else:
+        r = _one(spark, f"""
+            SELECT
+              (SELECT coalesce(sum(sz), 0) FROM
+                 (SELECT file_path, max(file_size_in_bytes) AS sz FROM {table}.all_files GROUP BY file_path)) -
+              (SELECT coalesce(sum(file_size_in_bytes), 0) FROM {table}.files) AS retained
+        """)
+        m["retained_bytes"] = int(r.retained or 0)
 
     # C1-C3: clustering on declared filter columns
     cols = list(cfg.get("filter_columns") or [])

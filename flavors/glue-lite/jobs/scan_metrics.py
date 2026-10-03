@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -51,7 +52,9 @@ TABLE_METRICS_DDL = """
     overwrite_commits_recent BIGINT, avg_overwrite_rewrite_share DOUBLE,
     overwrite_commits_24h BIGINT, rewritten_bytes_24h BIGINT, table_turnover_24h DOUBLE,
     orphan_files BIGINT, orphan_bytes BIGINT, listed_objects BIGINT, orphan_sample STRING,
-    orphan_error STRING, excess_files_total BIGINT"""
+    orphan_error STRING, excess_files_total BIGINT,
+    metadata_location STRING, scan_mode STRING, scan_seconds DOUBLE,
+    minutes_since_writer_commit DOUBLE, orphan_scanned_at TIMESTAMP, retained_scanned_at TIMESTAMP"""
 
 
 def coerce(value, data_type):
@@ -74,11 +77,81 @@ def as_row(values, schema):
     return tuple(coerce(values.get(f.name), f.dataType) for f in schema)
 
 
-def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), report=True):
+REUSE_DROP = {"rn", "elapsed_min", "orphan_age_h", "retained_age_h"}
+
+
+def load_previous(spark, tm_table, pm_table, namespace):
+    """Each table's latest successful scan row (with ages computed in SQL, so
+    no Python datetime round trip) and that scan's partition rows."""
+    cols = {f.name for f in spark.table(tm_table).schema}
+    if "metadata_location" not in cols:
+        return {}, {}
+    prev = {r.table_name: r.asDict() for r in spark.sql(f"""
+        SELECT * FROM (
+            SELECT t.*,
+                   row_number() OVER (PARTITION BY table_name ORDER BY scanned_at DESC) AS rn,
+                   (unix_timestamp(current_timestamp()) - unix_timestamp(scanned_at)) / 60.0 AS elapsed_min,
+                   (unix_timestamp(current_timestamp()) - unix_timestamp(orphan_scanned_at)) / 3600.0 AS orphan_age_h,
+                   (unix_timestamp(current_timestamp()) - unix_timestamp(retained_scanned_at)) / 3600.0
+                       AS retained_age_h
+            FROM {tm_table} t
+            WHERE load_error IS NULL AND metadata_location IS NOT NULL
+              AND table_name LIKE '{namespace}.%')
+        WHERE rn = 1""").collect()}
+    parts = {}
+    if prev:
+        ids = ", ".join(f"'{p['scan_id']}'" for p in prev.values())
+        for r in spark.sql(f"SELECT * FROM {pm_table} WHERE scan_id IN ({ids})").collect():
+            if prev.get(r.table_name, {}).get("scan_id") == r.scan_id:
+                parts.setdefault(r.table_name, []).append(r.asDict())
+    return prev, parts
+
+
+def due(p, age_key, every_hours, changed=True):
+    """Run an interval-gated probe? Always on first sight; otherwise when the
+    interval has passed (0 = whenever the table changed)."""
+    if not p or p.get(age_key) is None:
+        return True
+    every = float(every_hours)
+    if every == 0:
+        return changed
+    return p[age_key] >= every
+
+
+def carry_orphans(tm, p):
+    if p:
+        for k in ("orphan_files", "orphan_bytes", "listed_objects", "orphan_sample", "orphan_error",
+                  "orphan_scanned_at"):
+            tm.setdefault(k, p.get(k))
+
+
+def reuse(spark, table, cfg, p, prev_rows, scanned_at):
+    """Unchanged table (same metadata.json): copy the last scan's results and
+    refresh only what moves with the clock - partition ages, and the
+    snapshot-based metrics (from metadata.json, cheap)."""
+    elapsed = float(p.get("elapsed_min") or 0)
+    rows = []
+    for r in prev_rows:
+        r = dict(r)
+        if r.get("minutes_since_update") is not None:
+            r["minutes_since_update"] = float(r["minutes_since_update"]) + elapsed
+        rows.append(r)
+    tm = {k: v for k, v in p.items() if k not in REUSE_DROP}
+    tm.update(probes.snapshot_metrics(spark, table, cfg, p.get("data_bytes") or 0))
+    wm = p.get("minutes_since_writer_commit")
+    tm["minutes_since_writer_commit"] = None if wm is None else float(wm) + elapsed
+    tm["scan_mode"] = "reused"
+    return tm, rows
+
+
+def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), report=True, full=False):
     """Measure every table in the namespace (or just `tables`); return the scan_id.
 
     `priority` tables are measured first (gl-scan puts s3 first so its hot
     partition is still inside the hot window when it is measured).
+
+    Tables whose metadata.json location is the same as at their last scan are
+    reused (see reuse()); `full=True` measures everything from scratch.
     """
     scan_id = scan_id or gl.new_run_id("scan")
     spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {gl.OPS_NAMESPACE}")
@@ -98,35 +171,62 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
     names = first + [n for n in names if n not in first]
     print(f"=== Scan {scan_id}: {len(names)} tables in {namespace} ===", flush=True)
 
-    summary = []
+    prev, prev_parts = load_previous(spark, tm_table, pm_table, namespace)
+    summary, modes, t_start = [], {"full": 0, "reused": 0}, time.perf_counter()
     for name in names:
         table = f"{namespace}.{name}"
         cfg = gl.table_config(config, table)
         scanned_at = probes.now_utc()
+        t0 = time.perf_counter()
         info = probes.table_info(spark, table)
         cfg["target_file_bytes"], cfg["target_source"] = gl.resolve_target(
             config, table, info.get("properties"))
+        p = prev.get(table)
         try:
-            pm = probes.partition_metrics(spark, table, info, cfg)
-            pm_rows = pm.collect()
-            out = (pm.withColumn("scan_id", F.lit(scan_id))
-                     .withColumn("scanned_at", F.lit(scanned_at).cast("timestamp"))
-                     .withColumn("table_name", F.lit(table)))
-            out.select(*[F.col(f.name).cast(f.dataType) for f in pm_schema]).writeTo(pm_table).append()
-            tm = probes.table_metrics(spark, table, info, cfg, pm_rows)
-            if cfg.get("orphan_scan", False):
+            if (not full and p and info.get("metadata_location")
+                    and p["metadata_location"] == info["metadata_location"]):
+                tm, pm_rows = reuse(spark, table, cfg, p, prev_parts.get(table, []), scanned_at)
+                rows = [dict(r, scan_id=scan_id, scanned_at=scanned_at, table_name=table) for r in pm_rows]
+                if rows:
+                    spark.createDataFrame([as_row(r, pm_schema) for r in rows], pm_schema).writeTo(pm_table).append()
+            else:
+                wm = probes.writer_minutes(spark, table)
+                pm = probes.partition_metrics(spark, table, info, cfg, wm)
+                pm_rows = pm.collect()
+                out = (pm.withColumn("scan_id", F.lit(scan_id))
+                         .withColumn("scanned_at", F.lit(scanned_at).cast("timestamp"))
+                         .withColumn("table_name", F.lit(table)))
+                out.select(*[F.col(f.name).cast(f.dataType) for f in pm_schema]).writeTo(pm_table).append()
+                retained_due = due(p, "retained_age_h", cfg.get("retained_bytes_every_hours", 24))
+                tm = probes.table_metrics(spark, table, info, cfg, pm_rows, retained=retained_due)
+                if retained_due:
+                    tm["retained_scanned_at"] = scanned_at
+                elif p:
+                    tm["retained_bytes"], tm["retained_scanned_at"] = p.get("retained_bytes"), p.get("retained_scanned_at")
+                tm["minutes_since_writer_commit"] = wm
+                tm["scan_mode"] = "full"
+                carry_orphans(tm, p)
+            if cfg.get("orphan_scan", False) and due(p, "orphan_age_h", cfg.get("orphan_scan_every_hours", 24),
+                                                     changed=tm["scan_mode"] == "full"):
                 try:
-                    tm.update(probes.orphan_metrics(spark, table, cfg))
+                    tm.update(probes.orphan_metrics(spark, table, cfg), orphan_error=None,
+                              orphan_scanned_at=scanned_at)
                 except Exception as oe:          # listing problems must not lose the table's metrics
                     tm["orphan_error"] = f"{type(oe).__name__}: {oe}"[:500]
         except Exception as e:  # one broken table must not stop the scan
-            tm = {"load_error": (info.get("error") or "") + f" | {type(e).__name__}: {e}"[:500]}
+            tm = {"load_error": (info.get("error") or "") + f" | {type(e).__name__}: {e}"[:500],
+                  "scan_mode": "failed"}
             print(f"  {table}: FAILED {tm['load_error']}", flush=True)
         tm.update(scan_id=scan_id, scanned_at=scanned_at, table_name=table,
-                  table_uuid=info.get("uuid"), target_source=cfg["target_source"])
+                  table_uuid=info.get("uuid"), target_source=cfg["target_source"],
+                  metadata_location=info.get("metadata_location"),
+                  scan_seconds=round(time.perf_counter() - t0, 2))
         spark.createDataFrame([as_row(tm, tm_schema)], tm_schema).writeTo(tm_table).append()
         summary.append(tm)
-        print(f"  measured {table}", flush=True)
+        modes[tm.get("scan_mode", "full")] = modes.get(tm.get("scan_mode", "full"), 0) + 1
+        print(f"  {tm.get('scan_mode', 'full'):6} {table}  {tm['scan_seconds']:.1f}s", flush=True)
+    print(f"=== {len(names)} tables in {time.perf_counter() - t_start:.1f}s: "
+          + ", ".join(f"{k} {v}" for k, v in modes.items() if v) + " ===", flush=True)
 
     if report:
         print("\n=== Table metrics (selected) ===", flush=True)
@@ -156,11 +256,12 @@ def main():
     p.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                     "config", "health.json"))
     p.add_argument("--scan-id", default=None)
+    p.add_argument("--full", action="store_true", help="measure every table, even unchanged ones")
     a = p.parse_args()
 
     spark = SparkSession.builder.appName("gl25-scan-metrics").getOrCreate()
     run_scan(spark, a.namespace, gl.load_config(a.config),
-             tables=[t.strip() for t in a.tables.split(",") if t.strip()], scan_id=a.scan_id)
+             tables=[t.strip() for t in a.tables.split(",") if t.strip()], scan_id=a.scan_id, full=a.full)
     spark.stop()
 
 
