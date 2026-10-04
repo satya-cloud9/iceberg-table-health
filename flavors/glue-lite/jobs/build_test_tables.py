@@ -399,10 +399,17 @@ def s18_sorted_small(b, args):
     whole customer_id range, so file skipping on customer_id is poor. ~2.5x the
     target in that day, so the compaction writes several files: a sort rewrite
     gives them disjoint customer ranges (POOR_CLUSTERING clears), a binpack
-    rewrite concatenates overlapping files (it stays)."""
+    rewrite concatenates overlapping files (it stays).
+
+    LOCALLY ordered on purpose: plain WRITE ORDERED BY also sets
+    write.distribution-mode=range, so each load commit would range-split its
+    10 files on customer_id (disjoint ranges, pruning efficiency ~0.9) and the
+    table would not be poorly clustered. LOCALLY keeps the sort order in the
+    metadata but leaves distribution 'none', like a writer that sorts within
+    each task only: every small file spans the whole customer range."""
     t = f"{NS}.s18_sorted_small"
     b.create(t, "days(occurred_at)", {})
-    b.spark.sql(f"ALTER TABLE {t} WRITE ORDERED BY customer_id")
+    b.spark.sql(f"ALTER TABLE {t} WRITE LOCALLY ORDERED BY customer_id")
     for i in range(6):                                     # healthy days, one file each
         b.day(t, date(2026, 9, 1) + timedelta(days=i), 100_000)
     b.fragment(t, date(2026, 9, 7), commits=20, files_per_commit=10, rows_per_commit=26_000)
