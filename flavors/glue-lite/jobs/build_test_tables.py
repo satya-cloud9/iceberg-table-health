@@ -26,6 +26,9 @@ this schema make 1 MB, so a "healthy day" of 100,000 rows is one ~3.8 MB file.
   s16_orphan_files     stray objects under the table location      -> ORPHAN_FILES
   s17_growing          a fragmented day that `scenario_step.py grow` keeps adding to
                        between scans, with no maintenance          -> SMALL_FILES, then MAINTENANCE_LAG
+  s18_sorted_small     sort order on customer_id, one day in 200 small files whose
+                       customer ranges all overlap                -> SMALL_FILES, POOR_CLUSTERING;
+                       compaction must sort-rewrite (binpack would leave POOR_CLUSTERING)
 
 Every build gets a fresh location (<warehouse>/demo.db/<table>-<stamp>):
 DROP ... PURGE only deletes files the old table still references, so reusing
@@ -391,6 +394,22 @@ def s16_orphan_files(b, args):
 S17_DAY = date(2026, 9, 6)
 
 
+def s18_sorted_small(b, args):
+    """A table with a sort order and a fragmented day. Every small file spans the
+    whole customer_id range, so file skipping on customer_id is poor. ~2.5x the
+    target in that day, so the compaction writes several files: a sort rewrite
+    gives them disjoint customer ranges (POOR_CLUSTERING clears), a binpack
+    rewrite concatenates overlapping files (it stays)."""
+    t = f"{NS}.s18_sorted_small"
+    b.create(t, "days(occurred_at)", {})
+    b.spark.sql(f"ALTER TABLE {t} WRITE ORDERED BY customer_id")
+    for i in range(6):                                     # healthy days, one file each
+        b.day(t, date(2026, 9, 1) + timedelta(days=i), 100_000)
+    b.fragment(t, date(2026, 9, 7), commits=20, files_per_commit=10, rows_per_commit=26_000)
+    b.finish(t)
+    return t
+
+
 def s17_growing(b, args):
     t = f"{NS}.s17_growing"
     b.create(t, "days(occurred_at)", {})
@@ -433,6 +452,7 @@ BUILDERS = {
     "s15": s15_metadata_retention,
     "s16": s16_orphan_files,
     "s17": s17_growing,
+    "s18": s18_sorted_small,
     "s3": s3_hot_partition,      # keep last
 }
 

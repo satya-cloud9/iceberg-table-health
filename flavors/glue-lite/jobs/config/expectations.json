@@ -268,6 +268,24 @@
         "expect": []
       }
     },
+    "glue.demo.s18_sorted_small": {
+      "_comment": "Group 1 fix: the table has a sort order, so compaction must use the sort strategy. filter_columns_evidence is 'observed' here so POOR_CLUSTERING is scored (approval) instead of held for evidence.",
+      "expect": [
+        {
+          "symptom": "SMALL_FILES",
+          "partitions": [
+            "2026-09-07"
+          ]
+        },
+        {
+          "symptom": "POOR_CLUSTERING"
+        }
+      ],
+      "after": {
+        "_comment": "after make gl-plan T=s18 APPLY=1: the sort rewrite leaves files with disjoint customer ranges; a binpack rewrite would leave POOR_CLUSTERING",
+        "expect": []
+      }
+    },
     "glue.demo.s17_growing": {
       "_comment": "MAINTENANCE_LAG needs three scans with excess files rising (scan / make gl-step STEP=grow / scan / grow / scan); it's optional here so every scan in that sequence passes. Check the per-table output of the third scan for it. Two grow steps add 20 commits, so SNAPSHOT_BUILDUP may appear too.",
       "expect": [

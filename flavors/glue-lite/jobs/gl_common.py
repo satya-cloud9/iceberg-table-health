@@ -50,21 +50,22 @@ def table_config(config, table):
 
 
 def resolve_target(config, table, properties):
-    """Target file size for judging a table, and where it came from.
+    """Target file size for judging a table, and where it came from. The
+    writer's declared size wins (writers size their own files by it):
 
-    1. a per-table entry in health.json ("config-table")
-    2. the table's own write.target-file-size-bytes ("table-property")
+    1. the table's own write.target-file-size-bytes ("table-property")
+    2. a per-table entry in health.json ("config-table")
     3. the health.json default ("config-default")
     """
-    entry = config.get("tables", {}).get(table, {})
-    if "target_file_bytes" in entry:
-        return int(entry["target_file_bytes"]), "config-table"
     prop = (properties or {}).get("write.target-file-size-bytes")
     if prop:
         try:
             return int(prop), "table-property"
         except ValueError:
             pass
+    entry = config.get("tables", {}).get(table, {})
+    if "target_file_bytes" in entry:
+        return int(entry["target_file_bytes"]), "config-table"
     return int(config.get("defaults", {}).get("target_file_bytes", 536870912)), "config-default"
 
 

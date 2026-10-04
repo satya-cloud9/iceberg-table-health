@@ -982,3 +982,41 @@ turnover over the last 24 h, so the churn the builder created ages out a day
 later. (Production note: a 24 h turnover window misses a once-a-day
 copy-on-write job rewriting half the table; the window should follow the
 writer's cadence. On the roadmap as a calibration item.)
+
+## GL2.6a — Plan fixes from the traceability review (group 1)
+
+Five corrections to how statements are built, found while tracing each action
+to its metrics and facts (Traceability tab of the implementation strategy doc).
+
+- **Target size: the writer's property wins.** `resolve_target` now takes the
+  table's `write.target-file-size-bytes` first, then a per-table config entry,
+  then the default. Writers size their own files by the property, so the
+  advisor judges and compacts by the same number. The source is recorded in
+  `table_metrics.target_source`.
+- **Explicit rewrite band.** `rewrite_data_files` gets `min-file-size-bytes` =
+  small_file_ratio × target and `max-file-size-bytes` = oversized_file_ratio ×
+  target, so the rewrite picks exactly the files the scan flagged even if the
+  ratios change (today they equal Iceberg's own defaults, 75% and 180%).
+- **The sort order is honored.** A table with a sort order is compacted with
+  `strategy => 'sort'` (Iceberg uses the table's order); binpack would
+  concatenate sorted files unsorted and widen every file's value range.
+  Unsorted tables keep binpack.
+- **`rewrite_position_delete_files` is scoped** with the same `where` as the
+  data rewrite, instead of the whole table.
+- **POOR_CLUSTERING's suggestion** sets `WRITE ORDERED BY` only when the table
+  has no sort order yet.
+
+New scenario **s18_sorted_small**: sort order on customer_id and one day in 200
+small files that all span the full customer range. Before: SMALL_FILES and
+POOR_CLUSTERING (its filter column is declared with evidence `observed`, so the
+finding is scored). After `make gl-plan T=s18 APPLY=1`: healthy, because the
+sort rewrite writes files with disjoint ranges; a binpack rewrite would leave
+POOR_CLUSTERING.
+
+```bash
+make gl-image
+JOB_TIMEOUT_MIN=20 bash scripts/run-job.sh py build_test_tables.py --only s18
+make gl-scan                       # s18: SMALL_FILES, POOR_CLUSTERING (expected)
+make gl-plan T=s18 APPLY=1         # strategy => 'sort'
+make gl-scan                       # s18 after: PASS
+```

@@ -93,6 +93,7 @@
     "glue.demo.s3_hot_partition":     { "filter_columns": ["customer_id"] },
     "glue.demo.s4_manifest_bloat":    { "filter_columns": ["customer_id"] },
     "glue.demo.s5_skewed_partition":  { "filter_columns": ["customer_id"] },
-    "glue.demo.s6_over_partitioned":  { "filter_columns": ["customer_id"] }
+    "glue.demo.s6_over_partitioned":  { "filter_columns": ["customer_id"] },
+    "glue.demo.s18_sorted_small":     { "filter_columns": ["customer_id"], "filter_columns_evidence": "observed" }
   }
 }

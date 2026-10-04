@@ -220,7 +220,12 @@ def plan_table(table, findings, tm, cfg):
         if "SCATTERED_SMALL_FILES" in names:
             syms.append("SCATTERED_SMALL_FILES")
         min_input = rw.get("min_input_files") or int(th["min_excess_files"]) + 1
-        opts = {"target-file-size-bytes": str(target), "min-input-files": str(min_input),
+        # the band detection judged by (small / oversized ratios), passed explicitly so
+        # the rewrite picks exactly the files the scan flagged even if the ratios change
+        opts = {"target-file-size-bytes": str(target),
+                "min-file-size-bytes": str(int(target * float(cfg.get("small_file_ratio", 0.75)))),
+                "max-file-size-bytes": str(int(target * float(cfg.get("oversized_file_ratio", 1.8)))),
+                "min-input-files": str(min_input),
                 "max-concurrent-file-group-rewrites": str(rw.get("max_concurrent_file_group_rewrites", 2))}
         per_part = {}
         for f in active:
@@ -245,10 +250,15 @@ def plan_table(table, findings, tm, cfg):
             where = "" if "(TRUE)" in preds else \
                 f"where => \"{_sql_str(' OR '.join(preds))}\", "   # TRUE: whole table, no where
             opt_sql = ", ".join(f"'{k}', '{v}'" for k, v in opts.items())
+            # honor the table's sort order: binpack would concatenate sorted files
+            # unsorted and widen every output file's value range
+            strategy = "sort" if tm.get("sort_order_defined") else "binpack"
+            if strategy == "sort":
+                note.append("sort strategy: the table has a sort order")
             steps.append({
-                "kind": "rewrite_data_files", "auto": True, "symptoms": syms,
+                "kind": "rewrite_data_files", "auto": True, "symptoms": syms, "where": where,
                 "statement": (f"CALL glue.system.rewrite_data_files(table => '{ident}', "
-                              f"strategy => 'binpack', {where}"
+                              f"strategy => '{strategy}', {where}"
                               f"options => map({opt_sql}))"),
                 "note": "; ".join(note) or f"{len(chosen)} partitions, ~{files_in_scope} files"})
 
@@ -257,11 +267,13 @@ def plan_table(table, findings, tm, cfg):
     # number, so a delete file from the last DELETE still "applies" by
     # sequence number and remove-dangling-deletes keeps it. This procedure
     # drops delete rows whose data files are gone, and empty delete files.
-    if any(s["kind"] == "rewrite_data_files" and "DELETE_BUILDUP" in s["symptoms"] for s in steps):
+    rw_step = next((s for s in steps if s["kind"] == "rewrite_data_files" and "DELETE_BUILDUP" in s["symptoms"]), None)
+    if rw_step:
+        # scoped to the partitions the rewrite touched (same predicate)
         steps.append({"kind": "rewrite_position_delete_files", "auto": True,
                       "symptoms": ["DELETE_BUILDUP"],
                       "statement": (f"CALL glue.system.rewrite_position_delete_files(table => '{ident}', "
-                                    f"options => map('rewrite-all', 'true'))"),
+                                    f"{rw_step.get('where', '')}options => map('rewrite-all', 'true'))"),
                       "note": "removes delete files left pointing at rewritten data files"})
 
     hot = [f for f in active if f["symptom"] in ("HOT_PARTITION", "SETTLING")]
@@ -333,8 +345,9 @@ def plan_table(table, findings, tm, cfg):
             stmt = (f"CALL glue.system.remove_orphan_files(table => '{ident}', "
                     f"older_than => {{orphan_cutoff}}, prefix_listing => true)")
         elif f["symptom"] == "POOR_CLUSTERING" and ev.get("column"):
-            stmt = (f"ALTER TABLE {table} WRITE ORDERED BY {ev['column']}; "
-                    f"CALL glue.system.rewrite_data_files(table => '{ident}', strategy => 'sort')")
+            rewrite = f"CALL glue.system.rewrite_data_files(table => '{ident}', strategy => 'sort')"
+            stmt = rewrite if tm.get("sort_order_defined") else \
+                f"ALTER TABLE {table} WRITE ORDERED BY {ev['column']}; {rewrite}"
         steps.append({"kind": "suggest", "auto": False, "symptoms": [f["symptom"]], "statement": stmt,
                       "note": f"{f['action']}: {f['remedy']}"})
 
