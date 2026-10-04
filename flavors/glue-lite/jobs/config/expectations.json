@@ -207,7 +207,9 @@
             "optional": true
           }
         ]
-      }
+      },
+      "stale_after_hours": 24,
+      "_comment_stale": "REWRITE_CHURN needs table turnover over the last 24 h, so past 24 h after the build the scorecard says STALE (rebuild s12), not FAIL"
     },
     "glue.demo.s13_oversized_file": {
       "expect": [

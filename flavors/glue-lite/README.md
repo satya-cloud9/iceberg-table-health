@@ -901,3 +901,13 @@ New `table_metrics` columns: `possible_full_refreshes_30d`,
 `possible_backfill_batches_30d`, `last_full_refresh_ms`,
 `full_refresh_avg_bytes`, `retained_full_copies`, `pre_refresh_snapshot_ms`.
 Writer attribution (2.5d+) can later turn "possible" into "confirmed".
+
+### Scorecard: time-limited scenarios
+
+An expectation can set `stale_after_hours`: past that many hours since the
+table's last writer commit, a failing detect-phase result is STALE (with
+"rebuild it" in the note), not FAIL. s12 uses 24: `REWRITE_CHURN` needs table
+turnover over the last 24 h, so the churn the builder created ages out a day
+later. (Production note: a 24 h turnover window misses a once-a-day
+copy-on-write job rewriting half the table; the window should follow the
+writer's cadence. On the roadmap as a calibration item.)

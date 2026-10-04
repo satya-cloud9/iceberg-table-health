@@ -77,7 +77,7 @@ def _check(exp, hits, newest):
     return problems
 
 
-def score_table(table, expectation, findings, partition_rows, hot_minutes, phase="before"):
+def score_table(table, expectation, findings, partition_rows, hot_minutes, phase="before", writer_age_min=None):
     """-> dict(status, found, missing, unexpected, notes, phase).
 
     phase "after" = plan.py has applied fixes to this table (same table UUID)
@@ -119,6 +119,15 @@ def score_table(table, expectation, findings, partition_rows, hot_minutes, phase
                      f"(make gl-scan FRESH_S3=1)")
             if status == "FAIL":
                 status = "STALE"
+    # Scenarios whose symptom only holds for a while after their last write
+    # (s12: churn is measured over the last 24 h) are STALE, not FAIL, past that.
+    stale_h = expectation.get("stale_after_hours")
+    if (stale_h and phase == "before" and status == "FAIL" and writer_age_min is not None
+            and writer_age_min / 60.0 >= float(stale_h)):
+        status = "STALE"
+        notes = (f"last write was {writer_age_min / 60.0:.1f} h ago; this scenario's symptom only holds for "
+                 f"{stale_h:g} h after it: rebuild it (make gl-test-tables TT_ARGS=\"--only "
+                 f"{table.rsplit('.', 1)[-1].split('_', 1)[0]}\") and scan")
     return {"status": status, "found": found, "missing": problems,
             "unexpected": unexpected, "notes": notes, "phase": phase}
 
@@ -153,7 +162,7 @@ def outcome(r):
     if r["status"] == "NOT SCORED":
         return found or "healthy"
     if r["status"] == "STALE":
-        return "can't judge the hot window (table too old for it)"
+        return "too old to judge (see note): rebuild and scan straight after"
     if r["phase"] == "after":
         if r["status"] == "PASS":
             return f"healthy after fix{', allowed: ' + found if found else ''}"
@@ -253,7 +262,8 @@ def run_scorecard(spark, scan_id, config, expectations):
         cfg = gl.table_config(config, t)
         phase = "after" if tmrows[t].get("table_uuid") in fixed else "before"
         res = score_table(t, exp_tables.get(t), findings.get(t, []), parts.get(t, []),
-                          float(cfg.get("hot_partition_minutes", 15)), phase)
+                          float(cfg.get("hot_partition_minutes", 15)), phase,
+                          writer_age_min=tmrows[t].get("minutes_since_writer_commit"))
         res["table_name"] = t
         res["last_fix"] = last_fix.get(tmrows[t].get("table_uuid")) if phase == "after" else None
         props = json.loads(tmrows[t].get("properties_json") or "{}")
