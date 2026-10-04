@@ -97,6 +97,10 @@ def load_partition_state(spark, tms):
     return out
 
 
+def _mb(n):
+    return "n/a" if n is None else f"{n / 1048576:.1f} MiB" if n >= 104858 else f"{n / 1024:.0f} KiB"
+
+
 def _uuid_list(tms):
     return ", ".join(f"'{u}'" for u in sorted({t["table_uuid"] for t in tms if t.get("table_uuid")}))
 
@@ -153,19 +157,20 @@ def load_holds_activity(spark, tms, scan_ms, window_h, hot_cap_min):
     return out
 
 
-def record_holds_changes(spark, scan_id, at, mode, changes, report=True):
-    """What the revised holds change, per table (glue.ops.incremental_check,
-    family partition_holds; agree = no change)."""
+def record_holds_changes(spark, scan_id, at, mode, changes, report=True,
+                         family="partition_holds", title="Partition holds", baseline="today's holds"):
+    """What a variant of the rules changes, per table (glue.ops.incremental_check;
+    agree = no change). Families: partition_holds (GL2.6b), new_findings (GL2.6c)."""
     ic = f"{gl.OPS_NAMESPACE}.incremental_check"
     spark.sql(f"CREATE TABLE IF NOT EXISTS {ic} ({CHECK_DDL}) USING iceberg")
     schema = spark.table(ic).schema
     rows = [tuple(coerce(v, c.dataType) for v, c in zip(
-        [scan_id, at, tm["table_name"], tm.get("table_uuid"), "partition_holds", "findings",
-         "today's holds", note, not d, "; ".join(d)[:2000]], schema)) for tm, d, note in changes]
+        [scan_id, at, tm["table_name"], tm.get("table_uuid"), family, "findings",
+         baseline, note, not d, "; ".join(d)[:2000]], schema)) for tm, d, note in changes]
     if rows:
         spark.createDataFrame(rows, schema).writeTo(ic).append()
     changed = [c for c in changes if c[1]]
-    print(f"\n=== Partition holds ({mode}): {len(changed)}/{len(changes)} tables would change"
+    print(f"\n=== {title} ({mode}): {len(changed)}/{len(changes)} tables would change"
           f"{'' if mode == 'shadow' else ' (applied)'} ===", flush=True)
     if report:
         for tm, d, note in changed:
@@ -235,6 +240,8 @@ def run_detect(spark, scan_id, config, report=True):
                                     float(inc.get("churn_window_h", 24)), float(inc.get("hot_cap_minutes", 1440)))
                 if mode4 != "off" and tms else {})
     hold_changes = []
+    mode5 = mode_of(config, "new_findings")
+    new_changes = []
     for tm in sorted(tms, key=lambda t: t["table_name"]):
         table, uuid = tm["table_name"], tm.get("table_uuid")
         cfg = gl.table_config(config, table)
@@ -268,12 +275,26 @@ def run_detect(spark, scan_id, config, report=True):
                     f"{cfg['thresholds'].get('churn_partition_rate', 1.0):g} / {inc.get('churn_window_h', 24)} h")
             hold_changes.append((tm, d4, note))
             if mode4 == "on":
-                mine = revised
+                mine, cfg, rows_used = revised, dict(cfg, revised_holds=True), rows4
+        if mode5 != "off":
+            # GL2.6c: the same rules plus DELETE_FILE_SPRAWL, RETAINED_STORAGE, METADATA_BLOAT
+            added = symptom_rules.evaluate(table, tm, rows_used, dict(cfg, new_findings=True),
+                                           history=history.get(uuid, []), actions=actions.get(uuid, []))
+            d5 = hl.diff_actions(mine, added)
+            note = (f"old snapshots keep {_mb(tm.get('retained_bytes'))} (live {_mb(tm.get('data_bytes'))}); "
+                    f"metadata.json {_mb(tm.get('metadata_json_bytes'))}; "
+                    f"old manifests {_mb(tm.get('retained_metadata_bytes'))}")
+            new_changes.append((tm, d5, note))
+            if mode5 == "on":
+                mine = added
         findings += mine
     if mode3 != "off":
         record_window_changes(spark, scan_id, detected_at, mode3, changes, report)
     if mode4 != "off":
         record_holds_changes(spark, scan_id, detected_at, mode4, hold_changes, report)
+    if mode5 != "off":
+        record_holds_changes(spark, scan_id, detected_at, mode5, new_changes, report,
+                             family="new_findings", title="New findings", baseline="today's findings")
 
     print(f"=== Symptoms for scan {scan_id}: {len(findings)} findings over {len(tms)} tables ===",
           flush=True)

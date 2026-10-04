@@ -287,6 +287,26 @@ def plan_table(table, findings, tm, cfg, now=None):
                                     f"{rw_step.get('where', '')}options => map('rewrite-all', 'true'))"),
                       "note": "removes delete files left pointing at rewritten data files"})
 
+    # 1c. GL2.6c DELETE_FILE_SPRAWL: merge many small position delete files in
+    # the flagged partitions; no data file is rewritten. Partitions the data
+    # rewrite already covers are left to step 1b.
+    covered = {k for k, _ in chosen} if parts else set()
+    sprawl = [f for f in active if f["symptom"] == "DELETE_FILE_SPRAWL" and f["action"] == "auto"
+              and f.get("partition_key") not in covered]
+    if sprawl:
+        preds, widened = [], set()
+        for f in sprawl:
+            pr = partition_predicate(f["partition_key"], fields, widened)
+            if pr is not None and f"({pr})" not in preds:
+                preds.append(f"({pr})")
+        if preds:
+            where = "" if "(TRUE)" in preds else f"where => \"{_sql_str(' OR '.join(preds))}\", "
+            steps.append({"kind": "rewrite_position_delete_files", "auto": True,
+                          "symptoms": ["DELETE_FILE_SPRAWL"],
+                          "statement": (f"CALL glue.system.rewrite_position_delete_files(table => '{ident}', "
+                                        f"{where}options => map('rewrite-all', 'true'))"),
+                          "note": f"merges position delete files in {len(sprawl)} partition(s); no data rewrite"})
+
     hot = [f for f in active if f["symptom"] in ("HOT_PARTITION", "SETTLING")]
     if hot:
         steps.append({"kind": "hold", "auto": False, "symptoms": sorted({f["symptom"] for f in hot}),
@@ -349,6 +369,18 @@ def plan_table(table, findings, tm, cfg, now=None):
             # picks files that are well sized but sit in the old layout.
             stmt = (f"CALL glue.system.rewrite_data_files(table => '{ident}', "
                     f"options => map('rewrite-all', 'true', 'target-file-size-bytes', '{target}'))")
+        elif f["symptom"] == "RETAINED_STORAGE":
+            # expire to the configured policy now; shortening the policy is the owner's call
+            age_h = float(th.get("max_snapshot_age_h", 120))
+            keep = int(rw.get("expire_retain_last", 5))
+            cut = (now or datetime.now(timezone.utc)) - timedelta(hours=age_h)
+            stmt = (f"CALL glue.system.expire_snapshots(table => '{ident}', "
+                    f"older_than => TIMESTAMP '{cut.strftime('%Y-%m-%d %H:%M:%S')}+00:00', retain_last => {keep})")
+        elif f["symptom"] == "METADATA_BLOAT":
+            props = json.loads(tm.get("properties_json") or "{}")
+            if str(props.get("write.metadata.delete-after-commit.enabled", "false")).lower() != "true":
+                stmt = (f"ALTER TABLE {table} SET TBLPROPERTIES "
+                        f"('write.metadata.delete-after-commit.enabled' = 'true')")
         elif f["symptom"] == "UNBOUNDED_RETENTION":
             stmt = (f"ALTER TABLE {table} SET TBLPROPERTIES "
                     f"('write.metadata.delete-after-commit.enabled' = 'true')")

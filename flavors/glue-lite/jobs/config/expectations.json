@@ -185,10 +185,14 @@
       }
     },
     "glue.demo.s12_cow_merge_churn": {
-      "_comment": "copy-on-write merges: files look healthy, the table is rewritten ~12x; any SMALL_FILES would be held as advisory",
+      "_comment": "copy-on-write merges: files look healthy, the table is rewritten ~12x; any SMALL_FILES would be held as advisory. GL2.6c: old snapshots keep ~12 copies alive, so RETAINED_STORAGE (new-findings shadow) is expected once that family is on.",
       "expect": [
         {
           "symptom": "REWRITE_CHURN"
+        },
+        {
+          "symptom": "RETAINED_STORAGE",
+          "optional": true
         }
       ],
       "after": {
@@ -297,6 +301,22 @@
       ],
       "after": {
         "_comment": "after make gl-plan T=s19 APPLY=1 with today's holds: all six days compacted",
+        "expect": []
+      }
+    },
+    "glue.demo.s20_delete_sprawl": {
+      "_comment": "GL2.6c: 12 single-row DELETEs on a merge-on-read day: 12 position delete files, 0.012% of rows deleted. Healthy under today's rules; DELETE_FILE_SPRAWL in the new-findings shadow (optional here so the check holds in both modes).",
+      "expect": [
+        {
+          "symptom": "DELETE_FILE_SPRAWL",
+          "optional": true,
+          "partitions": [
+            "2026-09-01"
+          ]
+        }
+      ],
+      "after": {
+        "_comment": "after the delete files are merged (new_findings on, make gl-plan T=s20 APPLY=1)",
         "expect": []
       }
     },

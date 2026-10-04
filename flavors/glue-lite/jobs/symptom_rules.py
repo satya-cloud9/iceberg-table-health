@@ -24,7 +24,7 @@ import re
 
 import holds as hl
 
-RULE_VERSION = "2.6b-1"
+RULE_VERSION = "2.6c-1"
 
 # symptom -> (category, level, action, remedy)
 CATALOG = {
@@ -53,6 +53,16 @@ CATALOG = {
                               "upstream: batch late rows or narrow the incremental lookback"),
     "SNAPSHOT_BUILDUP":      ("metadata", "table", "auto",
                               "expire_snapshots (retain_last / older_than per policy)"),
+    "DELETE_FILE_SPRAWL":    ("file_layout", "partition", "auto",
+                              "rewrite_position_delete_files scoped to this partition: merges many small "
+                              "position delete files into few; no data file is rewritten"),
+    "RETAINED_STORAGE":      ("storage", "table", "approval",
+                              "old snapshots keep a large share of the table alive: expire to the retention "
+                              "policy now; if it stays high inside the policy, shorten the policy "
+                              "(history.expire.max-snapshot-age-ms)"),
+    "METADATA_BLOAT":        ("metadata", "table", "approval",
+                              "metadata is large: shorten the snapshot retention policy or commit less "
+                              "often upstream (every commit rewrites metadata.json and adds a manifest list)"),
     "MANIFEST_BLOAT":        ("metadata", "table", "auto",
                               "rewrite_manifests; re-enable commit.manifest-merge.enabled"),
     "REWRITE_CHURN":         ("write_config", "table", "approval",
@@ -144,7 +154,7 @@ def coarser_spec_hint(spec):
 
 
 def partition_findings(table, rows, th, hot_minutes, settle_hours=None, max_settle_compactions=2,
-                       revised_holds=False):
+                       revised_holds=False, new_findings=False):
     """revised_holds (GL2.6b, see holds.py): the hot hold applies only to
     conflicting commits or a still-filling time partition, and SMALL_FILES is
     held per partition while its M32 rewrite rate is at or above
@@ -181,6 +191,11 @@ def partition_findings(table, rows, th, hot_minutes, settle_hours=None, max_sett
         pos_deletes = del_files >= th["delete_min_files"] and del_ratio >= th["delete_ratio"]
         eq_deletes = eq_files >= th.get("eq_delete_min_files", 5)
         deletes = pos_deletes or eq_deletes
+        # GL2.6c DELETE_FILE_SPRAWL: many position delete files with few rows
+        # deleted (DELETE_BUILDUP's ratio isn't reached). Readers open every one
+        # of them; merging them is cheap and rewrites no data.
+        pos_files = _num(r.get("delete_files_pos"))
+        sprawl = new_findings and not deletes and pos_files >= th.get("delete_sprawl_min_files", 10)
         ev = {"data_files": data_files, "excess_files": excess,
               "small_files": _num(r.get("small_files")), "ideal_files": _num(r.get("ideal_files")),
               "delete_files": del_files, "delete_files_eq": eq_files, "delete_ratio": round(del_ratio, 4),
@@ -192,7 +207,7 @@ def partition_findings(table, rows, th, hot_minutes, settle_hours=None, max_sett
             if appends_continue:
                 ev.update(appends_continue=True, compact_older_than_min=hot_minutes)
 
-        if (small or deletes) and hot:
+        if (small or deletes or sprawl) and hot:
             remedy = (f"wait: {hot_reason}; compact after the hot window ({hot_minutes} min)" if hot_reason else
                       f"wait: last write {ev['minutes_since_update']} min ago "
                       f"(< {hot_minutes}); compact after it cools")
@@ -229,6 +244,9 @@ def partition_findings(table, rows, th, hot_minutes, settle_hours=None, max_sett
             out.append(_finding(table, "DELETE_BUILDUP",
                                 max(del_ratio / th["delete_ratio"],
                                     eq_files / th.get("eq_delete_min_files", 5)), ev, key))
+        if sprawl:
+            out.append(_finding(table, "DELETE_FILE_SPRAWL", pos_files / th.get("delete_sprawl_min_files", 10),
+                                dict(ev, delete_files_pos=pos_files), key))
         if _num(r.get("oversized_files")) >= th["min_oversized_files"]:
             out.append(_finding(table, "OVERSIZED_FILES",
                                 _num(r.get("oversized_files")) / th["min_oversized_files"], ev, key))
@@ -467,6 +485,38 @@ def refresh_findings(table, tm, th, keep_full_copies=1):
     return out
 
 
+def storage_findings(table, tm, th):
+    """GL2.6c, size-based bloat (Traceability: snapshot count stays evidence only;
+    an append-only stream with thousands of snapshots can keep almost nothing
+    extra alive, a copy-on-write table with forty can keep ten copies).
+    RETAINED_STORAGE (M16): bytes only old snapshots reference, over
+    retained_storage_min_bytes AND over retained_storage_min_share of the live
+    bytes. METADATA_BLOAT (M35, M36): the current metadata.json over
+    metadata_max_json_bytes, or manifests only old snapshots reference over
+    metadata_max_retained_bytes. Both are suggestions (approval)."""
+    out = []
+    live = _num(tm.get("data_bytes"))
+    kept = tm.get("retained_bytes")
+    if kept is not None and live:
+        share = kept / live
+        if (kept >= th.get("retained_storage_min_bytes", 1073741824)
+                and share >= th.get("retained_storage_min_share", 0.5)):
+            out.append(_finding(table, "RETAINED_STORAGE", share / th.get("retained_storage_min_share", 0.5),
+                                {"retained_bytes": int(kept), "live_bytes": int(live), "share": round(share, 2),
+                                 "snapshots": tm.get("snapshots"),
+                                 "oldest_snapshot_age_h": tm.get("oldest_snapshot_age_h")}))
+    js, meta = tm.get("metadata_json_bytes"), tm.get("retained_metadata_bytes")
+    max_js = th.get("metadata_max_json_bytes", 8388608)
+    max_meta = th.get("metadata_max_retained_bytes", 1073741824)
+    if (js is not None and js >= max_js) or (meta is not None and meta >= max_meta):
+        score = max((js or 0) / max_js, (meta or 0) / max_meta)
+        out.append(_finding(table, "METADATA_BLOAT", score,
+                            {"metadata_json_bytes": js, "retained_metadata_bytes": meta,
+                             "snapshots": tm.get("snapshots"), "commits_24h": tm.get("commits_24h"),
+                             "metadata_versions": tm.get("metadata_versions")}))
+    return out
+
+
 def apply_acks(findings, tm):
     """Table property advisor.ack = SYMPTOM[,SYMPTOM...]: the owner knows and it's
     deliberate. Those findings stay recorded (action 'acknowledged') but drop
@@ -486,9 +536,12 @@ def evaluate(table, tm, rows, cfg, history=None, actions=None):
     th = cfg["thresholds"]
     hot = float(cfg.get("hot_partition_minutes", 15))
     revised = bool(cfg.get("revised_holds"))
+    new = bool(cfg.get("new_findings"))
     out = (partition_findings(table, rows, th, hot, cfg.get("settle_hours"),
-                              int(cfg.get("max_settle_compactions", 2)), revised)
+                              int(cfg.get("max_settle_compactions", 2)), revised, new)
            + table_findings(table, tm, rows, th, cfg))
+    if new:
+        out += storage_findings(table, tm, th)
     if cfg.get("learned_windows"):
         out += late_arrival_findings(table, tm, th, int(cfg.get("min_batches", 20)))
         extra = refresh_findings(table, tm, th, int(cfg.get("keep_full_copies", 1)))

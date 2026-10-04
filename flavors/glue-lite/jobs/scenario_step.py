@@ -25,6 +25,15 @@ Steps:
   expire-gap (GL2.5m) 10 commits into s17, then expire all but the current
             snapshot before any scan: the next scan must report a ledger gap.
 
+  append-live (GL2.6b) a writer still appending: 3 small appends into s7_unpartitioned
+            and into s0_small_appends' 2026-09-03 (a day long ended), then scan
+            and detect those two tables in the same job, inside the hot window.
+            Today's hot hold defers both; the revised holds (shadow) should not:
+            s7 "{}" and s0 2026-09-03 HOT_PARTITION:defer -> SMALL_FILES:auto.
+            Not recorded as an action. The scan covers only these two tables, so
+            run make gl-scan afterwards (once the hot window has passed) before
+            make gl-plan, which reads the latest scan.
+
 Usage (via scripts/run-job.sh py scenario_step.py ...):
   scenario_step.py s12-mor [--hot-minutes 3]
   scenario_step.py grow [--hot-minutes 3]
@@ -141,7 +150,23 @@ def expire_gap(spark, args):
     time.sleep(wait)
 
 
-STEPS = {"s12-mor": s12_mor, "grow": grow, "rollback": rollback, "expire-gap": expire_gap}
+def append_live(spark, args):
+    from datetime import date
+    from detect_symptoms import run_detect
+    from scan_metrics import run_scan
+    b = Builder(spark)
+    b.next_id = 70_000_000 + int(time.time()) % 1_000_000 * 100
+    for t, d in ((f"{NS}.s7_unpartitioned", date(2026, 9, 2)), (f"{NS}.s0_small_appends", date(2026, 9, 3))):
+        b.fragment(t, d, commits=3, files_per_commit=1, rows_per_commit=500)
+        print(f"  {t}: 3 small appends into {d}", flush=True)
+    config = gl.load_config(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "health.json"))
+    scan_id = run_scan(spark, NS, config, tables=["s7_unpartitioned", "s0_small_appends"], report=False)
+    run_detect(spark, scan_id, config, report=False)
+    print("  look for '=== Partition holds (shadow)' above: s7 {} and s0 2026-09-03 "
+          "HOT_PARTITION:defer -> SMALL_FILES:auto", flush=True)
+
+
+STEPS = {"append-live": append_live, "s12-mor": s12_mor, "grow": grow, "rollback": rollback, "expire-gap": expire_gap}
 
 
 def main():

@@ -33,6 +33,9 @@ this schema make 1 MB, so a "healthy day" of 100,000 rows is one ~3.8 MB file.
                        time); table-level churn stays below REWRITE_CHURN
                                                                   -> SMALL_FILES x6; the revised
                        holds (GL2.6b, shadow) hold only the overwritten day (rewrite rate ~6/24 h)
+  s20_delete_sprawl    merge-on-read, one healthy day, 12 single-row DELETEs
+                                                                  -> nothing today (0.01% deleted);
+                       DELETE_FILE_SPRAWL in the new-findings shadow (12 position delete files)
 
 Every build gets a fresh location (<warehouse>/demo.db/<table>-<stamp>):
 DROP ... PURGE only deletes files the old table still references, so reusing
@@ -443,6 +446,24 @@ def s19_partition_churn(b, args):
     return t
 
 
+def s20_delete_sprawl(b, args):
+    """Many position delete files, few rows deleted (GL2.6c). A merge-on-read
+    table where an application deletes one row at a time: each DELETE commits a
+    position delete file, so a day of 100,000 rows ends with 12 delete files
+    covering 12 rows. The delete ratio (0.012%) is far under DELETE_BUILDUP's 5%,
+    so nothing fires today, yet every read of the day opens 12 delete files.
+    DELETE_FILE_SPRAWL (new-findings shadow) merges them without rewriting data."""
+    t = f"{NS}.s20_delete_sprawl"
+    b.create(t, "days(occurred_at)", {"format-version": "2", "write.delete.mode": "merge-on-read",
+                                      "write.update.mode": "merge-on-read", "write.merge.mode": "merge-on-read"})
+    first = b.next_id
+    b.day(t, date(2026, 9, 1), 100_000)
+    for i in range(12):
+        b.spark.sql(f"DELETE FROM {t} WHERE event_id = 'evt-{first + 1000 * i + 7}'")
+    b.finish(t)
+    return t
+
+
 def s17_growing(b, args):
     t = f"{NS}.s17_growing"
     b.create(t, "days(occurred_at)", {})
@@ -487,6 +508,7 @@ BUILDERS = {
     "s17": s17_growing,
     "s18": s18_sorted_small,
     "s19": s19_partition_churn,
+    "s20": s20_delete_sprawl,
     "s3": s3_hot_partition,      # keep last
 }
 

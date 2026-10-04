@@ -40,7 +40,7 @@ def table_info(spark, table):
     info = {"partitioned": True, "spec": None, "spec_id": None, "sort_order": None,
             "sort_order_id": None, "sort_defined": False, "format_version": None,
             "properties": {}, "error": None, "uuid": None, "partition_fields": [],
-            "metadata_location": None}
+            "metadata_location": None, "metadata_json_bytes": None}
     try:
         jt = spark._jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark._jsparkSession, table)
         spec = jt.spec()
@@ -63,6 +63,11 @@ def table_info(spark, table):
             info["metadata_location"] = str(jt.operations().current().metadataFileLocation())
         except Exception:
             info["metadata_location"] = None
+        if info["metadata_location"]:
+            try:                     # M35: one file-size call on the current metadata.json
+                info["metadata_json_bytes"] = int(jt.io().newInputFile(info["metadata_location"]).getLength())
+            except Exception:
+                info["metadata_json_bytes"] = None
         try:
             info["uuid"] = str(jt.operations().current().uuid())
         except Exception:
@@ -357,8 +362,17 @@ def table_metrics(spark, table, info, cfg, pm_rows, retained=True):
     # M8: bytes only old snapshots reference (storage you pay for but can't query).
     # Reads the manifests of every retained snapshot; the scan runs it less often.
     if not retained:
-        m["retained_bytes"] = None
+        m["retained_bytes"] = m["retained_metadata_bytes"] = None
     else:
+        # M36: manifests only old snapshots reference (manifest lists are not
+        # counted: their sizes need one file-size call per snapshot)
+        r = _one(spark, f"""
+            SELECT
+              (SELECT coalesce(sum(len), 0) FROM
+                 (SELECT path, max(length) AS len FROM {table}.all_manifests GROUP BY path)) -
+              (SELECT coalesce(sum(length), 0) FROM {table}.manifests) AS retained
+        """)
+        m["retained_metadata_bytes"] = max(0, int(r.retained or 0))
         r = _one(spark, f"""
             SELECT
               (SELECT coalesce(sum(sz), 0) FROM

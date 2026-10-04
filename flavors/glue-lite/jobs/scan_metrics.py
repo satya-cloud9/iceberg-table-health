@@ -64,7 +64,8 @@ TABLE_METRICS_DDL = """
     possible_full_refreshes_30d BIGINT, possible_backfill_batches_30d BIGINT, last_full_refresh_ms BIGINT,
     full_refresh_avg_bytes BIGINT, retained_full_copies BIGINT, pre_refresh_snapshot_ms BIGINT,
     lateness_p99_batches BIGINT, lateness_lookback_days BIGINT, hot_gap_p95_min DOUBLE, hot_gaps_used BIGINT,
-    idle_gaps_ignored BIGINT, gap_lookback_days BIGINT"""
+    idle_gaps_ignored BIGINT, gap_lookback_days BIGINT, metadata_json_bytes BIGINT,
+    retained_metadata_bytes BIGINT"""
 
 
 def coerce(value, data_type):
@@ -250,6 +251,7 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
                     tm["retained_scanned_at"] = scanned_at
                 elif p:
                     tm["retained_bytes"], tm["retained_scanned_at"] = p.get("retained_bytes"), p.get("retained_scanned_at")
+                    tm["retained_metadata_bytes"] = p.get("retained_metadata_bytes")
                 tm["minutes_since_writer_commit"] = wm
                 tm["scan_mode"] = "full"
                 carry_orphans(tm, p)
@@ -282,6 +284,7 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
         tm.update(scan_id=scan_id, scanned_at=scanned_at, table_name=table,
                   table_uuid=info.get("uuid"), target_source=cfg["target_source"],
                   metadata_location=info.get("metadata_location"),
+                  metadata_json_bytes=info.get("metadata_json_bytes"),
                   scan_seconds=round(time.perf_counter() - t0, 2))
         spark.createDataFrame([as_row(tm, tm_schema)], tm_schema).writeTo(tm_table).append()
         summary.append(tm)

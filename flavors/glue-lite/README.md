@@ -1067,3 +1067,47 @@ JOB_TIMEOUT_MIN=20 bash scripts/run-job.sh py build_test_tables.py --only s19
 make gl-scan                       # s19 PASS; shadow: 2026-09-06 SMALL_FILES:auto -> SMALL_FILES:advisory
 make gl-scan FRESH_S3=1            # s3's today partition still filling: no change expected for s3
 ```
+
+### Checking the hot hold while a writer is active: `make gl-step STEP=append-live`
+
+The scan job starts too late to catch a 3-minute hot window after a separate
+build job, so this step does both in one job: 3 small appends into
+`s7_unpartitioned` and into `s0_small_appends`' 2026-09-03 (long ended), then a
+scan and detection of just those two tables. Expected shadow lines:
+`{}` and `2026-09-03` `HOT_PARTITION:defer -> SMALL_FILES:auto`. That scan
+covers two tables only, so run `make gl-scan` (after the hot window) before
+`make gl-plan`.
+
+## GL2.6c — New findings (group 2, shadow)
+
+Three findings from the Traceability review, computed in a new shadow family
+(`incremental.new_findings`): each scan prints
+`=== New findings (shadow): N/M tables would change ===` with what would be
+added, and records it in `glue.ops.incremental_check` (family `new_findings`).
+
+| Finding | Fires when | Action |
+|---|---|---|
+| DELETE_FILE_SPRAWL | a partition has ≥ `delete_sprawl_min_files` (10) position delete files but its delete ratio is under DELETE_BUILDUP's 5% | auto: `rewrite_position_delete_files` scoped to the partition, no data rewrite |
+| RETAINED_STORAGE | bytes only old snapshots reference (M16) ≥ `retained_storage_min_bytes` and ≥ `retained_storage_min_share` (50%) of the live bytes | approval: expire to the policy age now; shorten the policy if it stays high |
+| METADATA_BLOAT | current metadata.json (M35) ≥ `metadata_max_json_bytes`, or manifests only old snapshots reference (M36) ≥ `metadata_max_retained_bytes` | approval: delete-after-commit if off; shorter retention or fewer commits upstream |
+
+Byte limits are test scale, 1/64 of the production placeholders (1 GiB,
+8 MiB, 1 GiB), like the 8 MB target size. Two new table metrics feed them:
+`metadata_json_bytes` (one file-size call per scan) and
+`retained_metadata_bytes` (measured with `retained_bytes`, from
+`all_manifests` minus `manifests`; manifest lists aren't counted). Tables
+reused unchanged since an older scan have no `retained_metadata_bytes` until
+they change; `make gl-scan SCAN_ARGS=--full` measures every table once.
+
+New scenario **s20_delete_sprawl**: a merge-on-read day of 100,000 rows and 12
+single-row DELETEs, so 12 position delete files for 12 rows. Healthy under
+today's rules; the shadow should add `2026-09-01 DELETE_FILE_SPRAWL:auto`.
+s12 (copy-on-write churn, ~12 copies kept by old snapshots) should get
+RETAINED_STORAGE.
+
+```bash
+make gl-image
+JOB_TIMEOUT_MIN=20 bash scripts/run-job.sh py build_test_tables.py --only s20
+make gl-scan SCAN_ARGS=--full     # every table measured, so M36 exists everywhere
+make gl-step STEP=append-live     # revised hot hold while appends continue
+```
