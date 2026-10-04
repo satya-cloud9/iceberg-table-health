@@ -188,7 +188,7 @@ def _sql_str(s):
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def plan_table(table, findings, tm, cfg):
+def plan_table(table, findings, tm, cfg, now=None):
     """-> list of steps: dict(kind, auto, symptoms, statement, note)."""
     th, rw = cfg["thresholds"], cfg.get("rewrite", {})
     ident = table.split(".", 1)[1] if table.startswith("glue.") else table
@@ -246,6 +246,17 @@ def plan_table(table, findings, tm, cfg):
             note.append(f"{len(unsupported)} partitions skipped: transform can't be scoped by a range")
         if widened:
             note.append(f"scope widened over {', '.join(sorted(widened))} (bucket/truncate can't be a range)")
+        appending = [json.loads(f.get("evidence_json") or "{}") for f in active
+                     if f.get("partition_key") in dict(chosen)
+                     and json.loads(f.get("evidence_json") or "{}").get("appends_continue")]
+        if preds == ["(TRUE)"] and cfg.get("time_column") and appending:
+            # GL2.6b: an unpartitioned table still being appended to: appends don't
+            # conflict with the rewrite, but files written in the hot window are
+            # likely to have neighbours soon; rewrite only rows older than it
+            mins = float(appending[0].get("compact_older_than_min") or cfg.get("hot_partition_minutes", 15))
+            older = (now or datetime.now(timezone.utc)) - timedelta(minutes=mins)
+            preds = [f"({cfg['time_column']} < TIMESTAMP '{older.strftime('%Y-%m-%d %H:%M:%S')}')"]
+            note.append(f"appends continue: only rows older than {mins:g} min ({cfg['time_column']})")
         if preds:
             where = "" if "(TRUE)" in preds else \
                 f"where => \"{_sql_str(' OR '.join(preds))}\", "   # TRUE: whole table, no where

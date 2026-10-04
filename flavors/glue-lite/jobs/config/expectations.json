@@ -286,6 +286,20 @@
         "expect": []
       }
     },
+    "glue.demo.s19_partition_churn": {
+      "_comment": "GL2.6b: today all six days are auto SMALL_FILES (table-level churn is below REWRITE_CHURN). The revised holds (incremental.partition_holds, shadow) report 2026-09-06 SMALL_FILES auto -> advisory: writers rewrote it ~6x in 24 h. min_count 5 so the check holds in both modes (advisory findings are not scored).",
+      "expect": [
+        {
+          "symptom": "SMALL_FILES",
+          "min_count": 5,
+          "min_value": "2026-09-01"
+        }
+      ],
+      "after": {
+        "_comment": "after make gl-plan T=s19 APPLY=1 with today's holds: all six days compacted",
+        "expect": []
+      }
+    },
     "glue.demo.s17_growing": {
       "_comment": "MAINTENANCE_LAG needs three scans with excess files rising (scan / make gl-step STEP=grow / scan / grow / scan); it's optional here so every scan in that sequence passes. Check the per-table output of the third scan for it. Two grow steps add 20 commits, so SNAPSHOT_BUILDUP may appear too.",
       "expect": [

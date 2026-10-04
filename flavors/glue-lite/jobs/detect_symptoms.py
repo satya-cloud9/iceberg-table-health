@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pyspark.sql import SparkSession
 
 import gl_common as gl
+import holds as hl
 import probes
 import symptom_rules
 import windows as win
@@ -135,6 +136,44 @@ def load_late_hists(spark, tms, default_days=30):
     return out
 
 
+def load_holds_activity(spark, tms, scan_ms, window_h, hot_cap_min):
+    """Family 2's activity summed per partition for the revised holds (holds.py),
+    by table UUID. Reads back max(churn window, hot cap) from the scan time."""
+    pa = f"{gl.OPS_NAMESPACE}.partition_activity"
+    ids = _uuid_list(tms)
+    if not ids or not spark.catalog.tableExists(pa):
+        return {}
+    churn_since = scan_ms - int(window_h * 3600000)
+    since = min(churn_since, scan_ms - int(hot_cap_min * 60000))
+    out = {}
+    for r in spark.sql(hl.activity_sql(pa, ids, since, churn_since)).collect():
+        out.setdefault(r.table_uuid, {})[r.partition_key] = {
+            "last_conflict_ms": r.last_conflict_ms, "removed_bytes": r.removed_bytes,
+            "rewrite_commits": r.rewrite_commits}
+    return out
+
+
+def record_holds_changes(spark, scan_id, at, mode, changes, report=True):
+    """What the revised holds change, per table (glue.ops.incremental_check,
+    family partition_holds; agree = no change)."""
+    ic = f"{gl.OPS_NAMESPACE}.incremental_check"
+    spark.sql(f"CREATE TABLE IF NOT EXISTS {ic} ({CHECK_DDL}) USING iceberg")
+    schema = spark.table(ic).schema
+    rows = [tuple(coerce(v, c.dataType) for v, c in zip(
+        [scan_id, at, tm["table_name"], tm.get("table_uuid"), "partition_holds", "findings",
+         "today's holds", note, not d, "; ".join(d)[:2000]], schema)) for tm, d, note in changes]
+    if rows:
+        spark.createDataFrame(rows, schema).writeTo(ic).append()
+    changed = [c for c in changes if c[1]]
+    print(f"\n=== Partition holds ({mode}): {len(changed)}/{len(changes)} tables would change"
+          f"{'' if mode == 'shadow' else ' (applied)'} ===", flush=True)
+    if report:
+        for tm, d, note in changed:
+            print(f"  {tm['table_name'].rsplit('.', 1)[-1]:26} {note}", flush=True)
+            for line in d[:8]:
+                print(f"  {'':26}   {line}", flush=True)
+
+
 def record_window_changes(spark, scan_id, at, mode, changes, report=True):
     """What the learned windows change, per table (glue.ops.incremental_check,
     family learned_windows; agree = no change)."""
@@ -188,12 +227,20 @@ def run_detect(spark, scan_id, config, report=True):
     pstate = load_partition_state(spark, tms) if mode3 != "off" else {}
     compactions, late_hists = (load_compactions(spark, tms), load_late_hists(spark, tms)) if mode3 != "off" else ({}, {})
     changes = []
+    mode4 = mode_of(config, "partition_holds")
+    inc = config.get("incremental") or {}
+    if mode4 != "off" and not pstate:
+        pstate = load_partition_state(spark, tms)
+    hold_act = (load_holds_activity(spark, tms, max((t["scanned_ms"] for t in tms), default=0),
+                                    float(inc.get("churn_window_h", 24)), float(inc.get("hot_cap_minutes", 1440)))
+                if mode4 != "off" and tms else {})
+    hold_changes = []
     for tm in sorted(tms, key=lambda t: t["table_name"]):
         table, uuid = tm["table_name"], tm.get("table_uuid")
         cfg = gl.table_config(config, table)
         current = symptom_rules.evaluate(table, tm, parts.get(table, []), cfg,
                                          history=history.get(uuid, []), actions=actions.get(uuid, []))
-        mine = current
+        mine, rows_used = current, parts.get(table, [])
         if mode3 != "off" and uuid in pstate and tm.get("hot_window_min") is not None:
             # GL2.5o: the same rules with learned windows and the ledger's per-partition age
             inc = config.get("incremental") or {}
@@ -207,10 +254,26 @@ def run_detect(spark, scan_id, config, report=True):
             d = win.diff(current, learned)
             changes.append((tm, d))
             if mode3 == "on":
-                mine = learned
+                mine, cfg, rows_used = learned, cfg2, rows2
+        if mode4 != "off" and uuid in pstate:
+            # GL2.6b: the same rules as the findings above, with the revised holds
+            fields = json.loads(tm.get("partition_fields_json") or "[]")
+            rows4 = hl.holds_rows(rows_used, pstate[uuid], hold_act.get(uuid, {}), fields, tm["scanned_ms"])
+            revised = symptom_rules.evaluate(table, tm, rows4, dict(cfg, revised_holds=True),
+                                             history=history.get(uuid, []), actions=actions.get(uuid, []))
+            d4 = hl.diff_actions(mine, revised)
+            churny = [r for r in rows4 if (r.get("rewrite_rate") or 0) >= cfg["thresholds"].get("churn_partition_rate", 1.0)]
+            note = (f"hot {float(cfg.get('hot_partition_minutes', 15)):g} min; "
+                    f"{len(churny)} partition(s) at rewrite rate >= "
+                    f"{cfg['thresholds'].get('churn_partition_rate', 1.0):g} / {inc.get('churn_window_h', 24)} h")
+            hold_changes.append((tm, d4, note))
+            if mode4 == "on":
+                mine = revised
         findings += mine
     if mode3 != "off":
         record_window_changes(spark, scan_id, detected_at, mode3, changes, report)
+    if mode4 != "off":
+        record_holds_changes(spark, scan_id, detected_at, mode4, hold_changes, report)
 
     print(f"=== Symptoms for scan {scan_id}: {len(findings)} findings over {len(tms)} tables ===",
           flush=True)

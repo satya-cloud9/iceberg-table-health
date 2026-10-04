@@ -41,6 +41,7 @@
       "churn_min_commits": 5,
       "churn_rewrite_share": 0.3,
       "churn_turnover_24h": 2.0,
+      "churn_partition_rate": 1.0,
       "min_orphan_files": 1,
       "trend_scans": 3,
       "trend_growth": 0.5,
@@ -68,10 +69,12 @@
     }
   },
   "incremental": {
-    "_comment": "GL2.5m incremental scan. Per family: off | shadow (full path decides, both compared in glue.ops.incremental_check) | on (ledger decides; spot_check_share of tables and any table not compared for reconcile_every_days are still compared). Family 1 (snapshot_ledger) passed shadow 2026-10-03 and is on; family 2 (partition_activity) reports and compares only (shadow); family 3 (learned_windows: hot window = 2 x p95 commit gap between hot_partition_minutes and hot_cap_minutes, settle window = p99 lateness up to settle_cap_hours, the hot window needs min_gaps commit gaps after leaving out idle gaps longer than idle_gap_factor x the median gap, the settle window and LATE_ARRIVALS' lateness trigger need min_batches batches) shows what would change (shadow) or decides (on). Family 4 comes later. Lookback: histogram_days, extended whole days at a time (adaptive_lookback) up to lookback_max_days until a table has min_batches / min_gaps samples. Until a table has min_batches batches, a large append later than cold_start_backfill_hours is labelled possible_backfill.",
+    "_comment": "GL2.5m incremental scan. Per family: off | shadow (full path decides, both compared in glue.ops.incremental_check) | on (ledger decides; spot_check_share of tables and any table not compared for reconcile_every_days are still compared). Family 1 (snapshot_ledger) passed shadow 2026-10-03 and is on; family 2 (partition_activity) reports and compares only (shadow); family 3 (learned_windows: hot window = 2 x p95 commit gap between hot_partition_minutes and hot_cap_minutes, settle window = p99 lateness up to settle_cap_hours, the hot window needs min_gaps commit gaps after leaving out idle gaps longer than idle_gap_factor x the median gap, the settle window and LATE_ARRIVALS' lateness trigger need min_batches batches) shows what would change (shadow) or decides (on). Family partition_holds (GL2.6b, holds.py): the hot hold applies only to commits that removed or rewrote files in the partition, or to a time partition still filling; SMALL_FILES is held per partition while writers rewrote at least thresholds.churn_partition_rate x its bytes in the last churn_window_h (instead of table-wide under REWRITE_CHURN); shadow reports what would change, on decides. A table's optional time_column lets the plan compact an appended-to unpartitioned table's older rows only. Family 4 comes later. Lookback: histogram_days, extended whole days at a time (adaptive_lookback) up to lookback_max_days until a table has min_batches / min_gaps samples. Until a table has min_batches batches, a large append later than cold_start_backfill_hours is labelled possible_backfill.",
     "snapshot_ledger": "on",
     "partition_activity": "shadow",
     "learned_windows": "shadow",
+    "partition_holds": "shadow",
+    "churn_window_h": 24,
     "hot_gap_factor": 2.0,
     "hot_cap_minutes": 1440,
     "idle_gap_factor": 10,

@@ -29,6 +29,10 @@ this schema make 1 MB, so a "healthy day" of 100,000 rows is one ~3.8 MB file.
   s18_sorted_small     sort order on customer_id, one day in 200 small files whose
                        customer ranges all overlap                -> SMALL_FILES, POOR_CLUSTERING;
                        compaction must sort-rewrite (binpack would leave POOR_CLUSTERING)
+  s19_partition_churn  5 fragmented days + one day overwritten 6x (8 small files each
+                       time); table-level churn stays below REWRITE_CHURN
+                                                                  -> SMALL_FILES x6; the revised
+                       holds (GL2.6b, shadow) hold only the overwritten day (rewrite rate ~6/24 h)
 
 Every build gets a fresh location (<warehouse>/demo.db/<table>-<stamp>):
 DROP ... PURGE only deletes files the old table still references, so reusing
@@ -417,6 +421,28 @@ def s18_sorted_small(b, args):
     return t
 
 
+def s19_partition_churn(b, args):
+    """Per-partition churn hold (GL2.6b). Five days fragmented by appends, and a
+    sixth day a job reloads again and again: six dynamic partition overwrites,
+    each writing that day's 100,000 rows as 8 small files. The overwritten day
+    turns over ~6x in 24 h, so a compaction there would be undone at the next
+    reload; the other days are never rewritten and should compact normally.
+    The table as a whole rewrites ~1x a day with a ~0.18 share per commit, under
+    REWRITE_CHURN's thresholds, so today's table-wide hold never applies and
+    all six days are auto SMALL_FILES; the revised holds hold only the sixth.
+    Rewrite rate is measured over 24 h: scan within a day of building."""
+    t = f"{NS}.s19_partition_churn"
+    b.create(t, "days(occurred_at)", {})
+    for i in range(5):
+        b.fragment(t, date(2026, 9, 1) + timedelta(days=i), commits=3, files_per_commit=3, rows_per_commit=30_000)
+    d6, first = date(2026, 9, 6), b.take(100_000)
+    events(b.spark, first, 100_000, epoch(d6), 86400).repartition(8).writeTo(t).append()
+    for _ in range(6):                                     # the same rows reloaded each time
+        events(b.spark, first, 100_000, epoch(d6), 86400).repartition(8).writeTo(t).overwritePartitions()
+    b.finish(t)
+    return t
+
+
 def s17_growing(b, args):
     t = f"{NS}.s17_growing"
     b.create(t, "days(occurred_at)", {})
@@ -460,6 +486,7 @@ BUILDERS = {
     "s16": s16_orphan_files,
     "s17": s17_growing,
     "s18": s18_sorted_small,
+    "s19": s19_partition_churn,
     "s3": s3_hot_partition,      # keep last
 }
 

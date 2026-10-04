@@ -1020,3 +1020,50 @@ make gl-scan                       # s18: SMALL_FILES, POOR_CLUSTERING (expected
 make gl-plan T=s18 APPLY=1         # strategy => 'sort'
 make gl-scan                       # s18 after: PASS
 ```
+
+`s18` uses `WRITE LOCALLY ORDERED BY`: plain `WRITE ORDERED BY` also sets range
+distribution, so each load commit split its files by customer_id and the table
+was never poorly clustered.
+
+## GL2.6b — Revised partition holds (group 2, shadow)
+
+Two holds keep a partition out of compaction; both were coarser than they need
+to be (`holds.py`, new family `incremental.partition_holds`).
+
+- **Hot hold.** Today any write in the last `hot_partition_minutes` holds the
+  partition, and an unpartitioned table appended every few minutes is held for
+  good. A rewrite only conflicts with a concurrent commit that removes or
+  rewrites the same files; appends just add files. Revised: hold only when a
+  commit removed or rewrote files in the partition (overwrite, delete, merge,
+  delete files added) within the hot window, or while a time partition is still
+  filling (its range ended less than a hot window ago and it was written within
+  it). Append-only partitions compact on schedule. With an optional per-table
+  `time_column`, the plan rewrites an appended-to unpartitioned table's rows
+  older than the hot window only.
+- **Churn hold.** Today REWRITE_CHURN anywhere on the table turns every
+  SMALL_FILES advisory, including partitions merges never touch. Revised: per
+  partition, rewrite rate (M32) = data bytes writers removed from it in the last
+  `churn_window_h` (24) / its live bytes. At or above
+  `thresholds.churn_partition_rate` (1.0) its SMALL_FILES turns advisory; the
+  rest compact normally. SCATTERED_SMALL_FILES is held only when every flagged
+  partition is.
+
+The inputs come from family 2 (`partition_activity`, `partition_state`). In
+shadow the findings still come from today's holds; each scan prints
+`=== Partition holds (shadow): N/M tables would change ===` with the changed
+findings per partition (`symptom:action`) and records them in
+`glue.ops.incremental_check` (family `partition_holds`).
+
+New scenario **s19_partition_churn**: five days fragmented by appends, and a
+sixth day reloaded six times (dynamic partition overwrite, 8 small files each
+time). Table-level churn stays under REWRITE_CHURN, so today all six days are
+auto SMALL_FILES; the shadow line should show only the sixth day turning
+advisory (rewrite rate ~6 / 24 h). The rate is measured over 24 h, so scan
+within a day of building.
+
+```bash
+make gl-image
+JOB_TIMEOUT_MIN=20 bash scripts/run-job.sh py build_test_tables.py --only s19
+make gl-scan                       # s19 PASS; shadow: 2026-09-06 SMALL_FILES:auto -> SMALL_FILES:advisory
+make gl-scan FRESH_S3=1            # s3's today partition still filling: no change expected for s3
+```

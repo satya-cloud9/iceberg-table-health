@@ -22,7 +22,9 @@ import json
 import math
 import re
 
-RULE_VERSION = "2.5o-2"
+import holds as hl
+
+RULE_VERSION = "2.6b-1"
 
 # symptom -> (category, level, action, remedy)
 CATALOG = {
@@ -141,8 +143,14 @@ def coarser_spec_hint(spec):
     return "drop or coarsen the partition transform"
 
 
-def partition_findings(table, rows, th, hot_minutes, settle_hours=None, max_settle_compactions=2):
-    """settle_hours (GL2.5o, learned from lateness): a partition whose time range
+def partition_findings(table, rows, th, hot_minutes, settle_hours=None, max_settle_compactions=2,
+                       revised_holds=False):
+    """revised_holds (GL2.6b, see holds.py): the hot hold applies only to
+    conflicting commits or a still-filling time partition, and SMALL_FILES is
+    held per partition while its M32 rewrite rate is at or above
+    churn_partition_rate. Needs the fields holds.holds_rows() adds.
+
+    settle_hours (GL2.5o, learned from lateness): a partition whose time range
     ended less than that long ago still receives late data. Interim policy until
     query evidence can weigh read cost against rewrite cost: the first compaction
     (and up to max_settle_compactions in all) inside the settle window is allowed,
@@ -161,6 +169,9 @@ def partition_findings(table, rows, th, hot_minutes, settle_hours=None, max_sett
         del_ratio = del_records / records if records else 0.0
         minutes = r.get("minutes_since_update")
         hot = minutes is not None and minutes < hot_minutes
+        hot_reason, appends_continue = None, False
+        if revised_holds:
+            hot, hot_reason, appends_continue = hl.decide(r, hot_minutes)
 
         small = excess >= min_excess
         eq_files = _num(r.get("delete_files_eq"))
@@ -174,11 +185,18 @@ def partition_findings(table, rows, th, hot_minutes, settle_hours=None, max_sett
               "small_files": _num(r.get("small_files")), "ideal_files": _num(r.get("ideal_files")),
               "delete_files": del_files, "delete_files_eq": eq_files, "delete_ratio": round(del_ratio, 4),
               "minutes_since_update": None if minutes is None else round(minutes, 1)}
+        if revised_holds:
+            ev.update(hot_reason=hot_reason, rewrite_rate=r.get("rewrite_rate"),
+                      minutes_since_conflict=(None if r.get("minutes_since_conflict") is None
+                                              else round(r["minutes_since_conflict"], 1)))
+            if appends_continue:
+                ev.update(appends_continue=True, compact_older_than_min=hot_minutes)
 
         if (small or deletes) and hot:
-            out.append(_finding(table, "HOT_PARTITION", max(excess / min_excess, 1.0), ev, key,
-                                remedy=f"wait: last write {ev['minutes_since_update']} min ago "
-                                       f"(< {hot_minutes}); compact after it cools"))
+            remedy = (f"wait: {hot_reason}; compact after the hot window ({hot_minutes} min)" if hot_reason else
+                      f"wait: last write {ev['minutes_since_update']} min ago "
+                      f"(< {hot_minutes}); compact after it cools")
+            out.append(_finding(table, "HOT_PARTITION", max(excess / min_excess, 1.0), ev, key, remedy=remedy))
             continue
         since_end = r.get("hours_since_end")
         if small and settle_hours and since_end is not None and since_end < settle_hours:
@@ -198,7 +216,15 @@ def partition_findings(table, rows, th, hot_minutes, settle_hours=None, max_sett
                 remedy = ("written by a possible full refresh: set the refresh job's target file size or "
                           "distribution mode, otherwise every refresh needs this compaction again; "
                           + CATALOG["SMALL_FILES"][3])
-            out.append(_finding(table, "SMALL_FILES", excess / min_excess, ev, key, remedy=remedy))
+            f = _finding(table, "SMALL_FILES", excess / min_excess, ev, key, remedy=remedy)
+            rate = r.get("rewrite_rate")
+            limit = th.get("churn_partition_rate", 1.0)
+            if revised_holds and rate is not None and rate >= limit:
+                f["action"], f["automatic"] = "advisory", False
+                f["remedy"] = (f"held: writers rewrote {rate:g}x this partition's bytes in the churn window "
+                               f"(>= {limit:g}), so a compaction would be undone within hours; fix the "
+                               f"write pattern first ({f['remedy']})")
+            out.append(f)
         if deletes:
             out.append(_finding(table, "DELETE_BUILDUP",
                                 max(del_ratio / th["delete_ratio"],
@@ -459,8 +485,9 @@ def evaluate(table, tm, rows, cfg, history=None, actions=None):
         return []
     th = cfg["thresholds"]
     hot = float(cfg.get("hot_partition_minutes", 15))
+    revised = bool(cfg.get("revised_holds"))
     out = (partition_findings(table, rows, th, hot, cfg.get("settle_hours"),
-                              int(cfg.get("max_settle_compactions", 2)))
+                              int(cfg.get("max_settle_compactions", 2)), revised)
            + table_findings(table, tm, rows, th, cfg))
     if cfg.get("learned_windows"):
         out += late_arrival_findings(table, tm, th, int(cfg.get("min_batches", 20)))
@@ -480,7 +507,17 @@ def evaluate(table, tm, rows, cfg, history=None, actions=None):
             history = [h for h in history if (h.get("scanned_ms") or 0) >= tm["last_full_refresh_ms"]]
     if history or actions:
         out += trend_findings(table, history or [], actions or [], th)
-    if any(f["symptom"] == "REWRITE_CHURN" for f in out):
+    if revised:
+        # GL2.6b: the churn hold is per partition (partition_findings). The
+        # table-level SCATTERED_SMALL_FILES is held only when every partition
+        # it would compact is held.
+        small = [f for f in out if f["symptom"] == "SMALL_FILES"]
+        if small and all(f["action"] == "advisory" for f in small):
+            for f in out:
+                if f["symptom"] == "SCATTERED_SMALL_FILES" and f["action"] == "auto":
+                    f["action"], f["automatic"] = "advisory", False
+                    f["remedy"] = "held: every flagged partition is rewritten by writers too often (" + f["remedy"] + ")"
+    elif any(f["symptom"] == "REWRITE_CHURN" for f in out):
         # Bigger files make every copy-on-write merge rewrite more bytes, so
         # don't compact toward the target while churn is the problem.
         for f in out:
