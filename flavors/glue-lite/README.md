@@ -934,6 +934,17 @@ New `table_metrics` columns: `lateness_p99_batches`, `lateness_lookback_days`,
 The shadow report line shows them:
 `hot 6 min [learned; 140 gaps / 30 d, 12 idle gaps ignored], settle 24 h [learned; 35 batches / 30 d]`.
 
+**Loads into an empty table** (checked against Iceberg's snapshot summary: the
+table's data files just before the commit = total − added + deleted = 0):
+- with an earlier snapshot (a parent, or any older snapshot: `CREATE OR REPLACE
+  TABLE AS` starts a new lineage with no parent and totals from 0) → the insert
+  after a truncate or a table replace → `possible_full_refresh`, so the
+  refresh-aware rules apply.
+- with none → the table's first load → late batches in it are
+  `possible_backfill`.
+A reload spread over several commits is only caught on its first commit; writer
+attribution (2.5d+) closes that.
+
 Batches already labelled by the earlier version keep their labels, so reset the
 family 2 tables once after this change (they rebuild from retained snapshots on
 the next scan):

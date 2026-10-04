@@ -209,18 +209,31 @@ def _backfill_limit(baseline_p99, baseline_n, th):
     return float(th.get("cold_start_backfill_hours", 168))
 
 
-def label_rows(snapshot, rows, live_partitions, baseline_p99, baseline_n, median_partition_bytes, th):
+def files_before(snapshot):
+    """Data files the table had just before this commit (from the snapshot
+    summary), or None when the summary doesn't say."""
+    t = snapshot.get("total_data_files")
+    if t is None:
+        return None
+    return int(t) - int(snapshot.get("added_data_files") or 0) + int(snapshot.get("deleted_data_files") or 0)
+
+
+def label_rows(snapshot, rows, live_partitions, baseline_p99, baseline_n, median_partition_bytes, th,
+               had_snapshots=None):
     """Label each (snapshot, partition) batch in place; -> True when the commit is a
     possible full refresh.
       compaction             a 'replace' commit
-      possible_full_refresh  the commit replaced (nearly) the whole table
+      possible_full_refresh  the commit replaced (nearly) the whole table, or it
+                             loaded an empty table that had earlier snapshots (the
+                             insert after a truncate, CREATE OR REPLACE TABLE AS)
       rewrite                files removed in that partition (copy-on-write, overwrite)
                              or delete files only (merge-on-read row changes)
       possible_backfill      append-only, at least a median partition's bytes, and
                              later than the table's 99th-percentile lateness (as it
                              stood before this scan, with min_batches samples) or,
                              while the table has no such baseline yet (cold start),
-                             later than cold_start_backfill_hours
+                             later than cold_start_backfill_hours; or the table's
+                             first load (an empty table with no earlier snapshot)
       on_time / late         append-only, by whether the partition's range had ended
       append                 append-only into a partition with no time range"""
     if snapshot["operation"] == "replace":
@@ -228,6 +241,13 @@ def label_rows(snapshot, rows, live_partitions, baseline_p99, baseline_n, median
             r["label"] = "compaction"
         return False
     refresh = is_possible_full_refresh(rows, snapshot, live_partitions, th)
+    appends_only = not any(r["data_files_removed"] or r["delete_files_removed"] for r in rows)
+    into_empty = appends_only and files_before(snapshot) == 0
+    # an earlier snapshot existed: a parent, or one the caller knows of (CREATE OR
+    # REPLACE TABLE starts a new lineage with no parent)
+    reload = into_empty and (snapshot.get("parent_id") is not None or bool(had_snapshots))
+    first_load = into_empty and not reload
+    refresh = refresh or reload
     for r in rows:
         if refresh:
             r["label"] = "possible_full_refresh"
@@ -237,6 +257,8 @@ def label_rows(snapshot, rows, live_partitions, baseline_p99, baseline_n, median
             r["label"] = "append"
         elif r["lateness_h"] == 0:
             r["label"] = "on_time"
+        elif first_load:
+            r["label"] = "possible_backfill"
         elif (median_partition_bytes and r["data_bytes_added"] >= median_partition_bytes
               and r["lateness_h"] > _backfill_limit(baseline_p99, baseline_n, th)):
             r["label"] = "possible_backfill"

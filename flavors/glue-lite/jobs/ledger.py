@@ -562,7 +562,9 @@ class Ledger:
                       cold_start_backfill_hours=float(inc.get("cold_start_backfill_hours", 168)))
             for x in new_snaps:
                 commit_rows = act.aggregate(x, files.get(x["snapshot_id"], []))
-                act.label_rows(x, commit_rows, len(live_keys), base_p99, base_n, median_partition_bytes, th)
+                earlier = st is not None or any(s["ts_ms"] < x["ts_ms"] for s in snaps)
+                act.label_rows(x, commit_rows, len(live_keys), base_p99, base_n, median_partition_bytes, th,
+                               had_snapshots=earlier)
                 rows += commit_rows
         state = self._partition_state(uuid)
         changed, reopens = act.update_state(state, rows)
