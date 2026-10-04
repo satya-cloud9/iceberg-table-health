@@ -430,9 +430,9 @@ def refresh_findings(table, tm, th, keep_full_copies=1):
                              "data_bytes": size}))
     copies = _num(tm.get("retained_full_copies"))
     if copies > keep_full_copies:
-        extra = None
-        if tm.get("retained_bytes") is not None and tm.get("data_bytes") is not None:
-            extra = max(int(tm["retained_bytes"]) - int(tm["data_bytes"]), 0)
+        # retained_bytes already counts only what old snapshots keep alive
+        # (all_files minus the current files), so it is the extra itself.
+        extra = None if tm.get("retained_bytes") is None else int(tm["retained_bytes"])
         out.append(_finding(table, "SNAPSHOT_BUILDUP", copies / max(keep_full_copies, 1),
                             {"retained_full_copies": copies, "keep_full_copies": keep_full_copies,
                              "bytes_kept_beyond_current": extra, "snapshots": tm.get("snapshots")},
