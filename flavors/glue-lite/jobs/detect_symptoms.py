@@ -114,18 +114,24 @@ def load_compactions(spark, tms):
     return out
 
 
-def load_late_hists(spark, tms, days=30):
-    """Lateness bucket counts over the last `days` days, by table UUID."""
+def load_late_hists(spark, tms, default_days=30):
+    """Lateness bucket counts by table UUID, over each table's own lookback
+    (lateness_lookback_days from the scan: adaptive, see windows.py)."""
     lh = f"{gl.OPS_NAMESPACE}.lateness_hist"
     ids = _uuid_list(tms)
     if not ids or not spark.catalog.tableExists(lh):
         return {}
+    days = {t.get("table_uuid"): int(t.get("lateness_lookback_days") or default_days) for t in tms}
     out = {}
-    for r in spark.sql(f"SELECT table_uuid, bucket_max_h, sum(batches) AS n FROM {lh} WHERE table_uuid IN ({ids}) "
-                       f"AND day >= date_sub(current_date(), {days}) GROUP BY table_uuid, bucket_max_h").collect():
+    for r in spark.sql(f"SELECT table_uuid, datediff(current_date(), day) AS age, bucket_max_h, sum(batches) AS n "
+                       f"FROM {lh} WHERE table_uuid IN ({ids}) AND day >= date_sub(current_date(), {max(days.values())}) "
+                       f"GROUP BY table_uuid, day, bucket_max_h").collect():
+        if r.age >= days.get(r.table_uuid, default_days):
+            continue
         b = r.bucket_max_h
         b = None if b is None else (int(b) if float(b).is_integer() else float(b))
-        out.setdefault(r.table_uuid, {})[b] = int(r.n)
+        t = out.setdefault(r.table_uuid, {})
+        t[b] = t.get(b, 0) + int(r.n)
     return out
 
 
@@ -152,8 +158,11 @@ def record_window_changes(spark, scan_id, at, mode, changes, report=True):
             if not d and tm.get("hot_window_source", "").startswith("config"):
                 continue
             name = tm["table_name"].rsplit(".", 1)[-1]
-            print(f"  {name:26} hot {tm.get('hot_window_min'):g} min [{tm.get('hot_window_source')}], "
-                  f"settle {tm.get('settle_window_h')} h [{tm.get('settle_window_source')}]", flush=True)
+            idle = f", {tm.get('idle_gaps_ignored')} idle gaps ignored" if tm.get("idle_gaps_ignored") else ""
+            print(f"  {name:26} hot {tm.get('hot_window_min'):g} min [{tm.get('hot_window_source')}; "
+                  f"{tm.get('hot_gaps_used')} gaps / {tm.get('gap_lookback_days')} d{idle}], "
+                  f"settle {tm.get('settle_window_h')} h [{tm.get('settle_window_source')}; "
+                  f"{tm.get('lateness_p99_batches')} batches / {tm.get('lateness_lookback_days')} d]", flush=True)
             for line in d[:8]:
                 print(f"  {'':26}   {line}", flush=True)
 
@@ -187,8 +196,9 @@ def run_detect(spark, scan_id, config, report=True):
         mine = current
         if mode3 != "off" and uuid in pstate and tm.get("hot_window_min") is not None:
             # GL2.5o: the same rules with learned windows and the ledger's per-partition age
+            inc = config.get("incremental") or {}
             cfg2 = dict(cfg, hot_partition_minutes=tm["hot_window_min"], settle_hours=tm.get("settle_window_h"),
-                        learned_windows=True)
+                        learned_windows=True, min_batches=int(inc.get("min_batches", inc.get("min_samples", 20))))
             rows2 = win.learned_rows(parts.get(table, []), pstate[uuid],
                                      json.loads(tm.get("partition_fields_json") or "[]"), tm["scanned_ms"],
                                      compactions.get(uuid, {}), late_hists.get(uuid, {}))

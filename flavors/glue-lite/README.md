@@ -902,6 +902,46 @@ New `table_metrics` columns: `possible_full_refreshes_30d`,
 `full_refresh_avg_bytes`, `retained_full_copies`, `pre_refresh_snapshot_ms`.
 Writer attribution (2.5d+) can later turn "possible" into "confirmed".
 
+### GL2.5o++ — Sample minimums, adaptive lookback, idle gaps, cold start
+
+The first family 3 shadow review found three wrong changes and fixed them here:
+
+- **LATE_ARRIVALS needs enough batches.** The lateness trigger (p99 ≥ 24 h)
+  needs `min_batches` (20) batches in the lookback; a p99 of 4 batches is just
+  the worst of 4. The reopen trigger (≥ 3 reopened partitions) is a count and
+  needs none.
+- **Cold start possible backfill.** Until a table has `min_batches` batches
+  (no p99 baseline yet), an append at least a median partition's size and later
+  than `cold_start_backfill_hours` (168) is labelled `possible_backfill`, so a
+  historical load doesn't become the table's lateness. A baseline p99 beyond
+  the last bucket (> 720 h) means nothing is unusually late.
+- **Idle gaps don't stretch the hot window.** Commit gaps in buckets entirely
+  above `idle_gap_factor` (10) × the median gap (nights, weekends, a paused
+  job) are left out before the p95; `min_gaps` (20) counts what's left.
+- **Adaptive lookback.** Both histograms are read over `histogram_days` (30);
+  a table with fewer than `min_batches` / `min_gaps` samples there reaches
+  further back, whole days at a time, until it has them or hits
+  `lookback_max_days` (365). `adaptive_lookback: false` keeps a fixed window.
+  The p_more_late figure in detect uses each table's own lookback. The family 2
+  shadow comparison (lateness p95) and family 1's commit_gap_p95_min keep the
+  fixed 30 days, so their comparisons are unchanged.
+
+`min_samples` is replaced by `min_batches` and `min_gaps` (the old key is still
+read as the default). Ops histograms are kept for `lookback_max_days`.
+
+New `table_metrics` columns: `lateness_p99_batches`, `lateness_lookback_days`,
+`hot_gap_p95_min`, `hot_gaps_used`, `idle_gaps_ignored`, `gap_lookback_days`.
+The shadow report line shows them:
+`hot 6 min [learned; 140 gaps / 30 d, 12 idle gaps ignored], settle 24 h [learned; 35 batches / 30 d]`.
+
+Batches already labelled by the earlier version keep their labels, so reset the
+family 2 tables once after this change (they rebuild from retained snapshots on
+the next scan):
+
+```bash
+make gl-sql Q="DROP TABLE glue.ops.partition_activity; DROP TABLE glue.ops.partition_state; DROP TABLE glue.ops.lateness_hist; DROP TABLE glue.ops.activity_state"
+```
+
 ### Scorecard: time-limited scenarios
 
 An expectation can set `stale_after_hours`: past that many hours since the

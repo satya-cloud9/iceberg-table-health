@@ -68,17 +68,22 @@
     }
   },
   "incremental": {
-    "_comment": "GL2.5m incremental scan. Per family: off | shadow (full path decides, both compared in glue.ops.incremental_check) | on (ledger decides; spot_check_share of tables and any table not compared for reconcile_every_days are still compared). Family 1 (snapshot_ledger) passed shadow 2026-10-03 and is on; family 2 (partition_activity) reports and compares only (shadow); family 3 (learned_windows: hot window = 2 x p95 commit gap between hot_partition_minutes and hot_cap_minutes, settle window = p99 lateness up to settle_cap_hours, both need min_samples) shows what would change (shadow) or decides (on). Family 4 comes later.",
+    "_comment": "GL2.5m incremental scan. Per family: off | shadow (full path decides, both compared in glue.ops.incremental_check) | on (ledger decides; spot_check_share of tables and any table not compared for reconcile_every_days are still compared). Family 1 (snapshot_ledger) passed shadow 2026-10-03 and is on; family 2 (partition_activity) reports and compares only (shadow); family 3 (learned_windows: hot window = 2 x p95 commit gap between hot_partition_minutes and hot_cap_minutes, settle window = p99 lateness up to settle_cap_hours, the hot window needs min_gaps commit gaps after leaving out idle gaps longer than idle_gap_factor x the median gap, the settle window and LATE_ARRIVALS' lateness trigger need min_batches batches) shows what would change (shadow) or decides (on). Family 4 comes later. Lookback: histogram_days, extended whole days at a time (adaptive_lookback) up to lookback_max_days until a table has min_batches / min_gaps samples. Until a table has min_batches batches, a large append later than cold_start_backfill_hours is labelled possible_backfill.",
     "snapshot_ledger": "on",
     "partition_activity": "shadow",
     "learned_windows": "shadow",
     "hot_gap_factor": 2.0,
     "hot_cap_minutes": 1440,
+    "idle_gap_factor": 10,
     "settle_cap_hours": 168,
-    "min_samples": 20,
+    "cold_start_backfill_hours": 168,
+    "min_batches": 20,
+    "min_gaps": 20,
     "spot_check_share": 0.05,
     "reconcile_every_days": 7,
     "histogram_days": 30,
+    "adaptive_lookback": true,
+    "lookback_max_days": 365,
     "retention_days": 365
   },
   "tables": {

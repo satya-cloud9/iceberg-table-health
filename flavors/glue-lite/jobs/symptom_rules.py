@@ -22,7 +22,7 @@ import json
 import math
 import re
 
-RULE_VERSION = "2.5o-1"
+RULE_VERSION = "2.5o-2"
 
 # symptom -> (category, level, action, remedy)
 CATALOG = {
@@ -392,20 +392,24 @@ def trend_findings(table, history, actions, th):
     return out
 
 
-def late_arrival_findings(table, tm, th):
+def late_arrival_findings(table, tm, th, min_batches=20):
     """GL2.5o: a long settle window or partitions reopened again and again is an
-    upstream problem in its own right (the writer or the partition key)."""
+    upstream problem in its own right (the writer or the partition key). The
+    lateness trigger needs min_batches batches (a p99 of 4 batches is just the
+    worst of 4); the reopen trigger is a count and needs none."""
     p99, reopened = tm.get("lateness_p99_h"), _num(tm.get("reopened_partitions"))
-    long_wait = p99 is not None and float(p99) >= th.get("late_arrivals_hours", 24)
+    n = _num(tm.get("lateness_p99_batches"))
+    long_wait = p99 is not None and n >= min_batches and float(p99) >= th.get("late_arrivals_hours", 24)
     reopens = reopened >= th.get("late_reopened_partitions", 3)
     if not (long_wait or reopens):
         return []
     ev = {"lateness_p95_h": tm.get("lateness_p95_h"), "lateness_p99_h": p99,
-          "batches_in_window": tm.get("lateness_batches_window"), "reopened_partitions": reopened,
+          "batches_in_window": tm.get("lateness_p99_batches"), "lookback_days": tm.get("lateness_lookback_days"),
+          "reopened_partitions": reopened,
           "possible_backfill_batches_30d": tm.get("possible_backfill_batches_30d"),
           "possible_full_refreshes_30d": tm.get("possible_full_refreshes_30d"),
           "settle_window_h": tm.get("settle_window_h")}
-    score = max((float(p99) / th.get("late_arrivals_hours", 24)) if p99 is not None else 0,
+    score = max((float(p99) / th.get("late_arrivals_hours", 24)) if long_wait else 0,
                 reopened / th.get("late_reopened_partitions", 3))
     return [_finding(table, "LATE_ARRIVALS", score, ev)]
 
@@ -459,7 +463,7 @@ def evaluate(table, tm, rows, cfg, history=None, actions=None):
                               int(cfg.get("max_settle_compactions", 2)))
            + table_findings(table, tm, rows, th, cfg))
     if cfg.get("learned_windows"):
-        out += late_arrival_findings(table, tm, th)
+        out += late_arrival_findings(table, tm, th, int(cfg.get("min_batches", 20)))
         extra = refresh_findings(table, tm, th, int(cfg.get("keep_full_copies", 1)))
         if any(f["symptom"] == "SNAPSHOT_BUILDUP" for f in out):      # one SNAPSHOT_BUILDUP, with both reasons
             for f in out:

@@ -201,6 +201,14 @@ def is_possible_full_refresh(rows, totals, live_partitions, th):
             and byte_repl >= th.get("refresh_byte_replacement", 0.8))
 
 
+def _backfill_limit(baseline_p99, baseline_n, th):
+    """Lateness above which a large append counts as a possible backfill."""
+    if (baseline_n or 0) >= th.get("min_batches", th.get("min_samples", 20)):
+        # p99 beyond the last bucket: nothing is unusually late
+        return float("inf") if baseline_p99 is None else float(baseline_p99)
+    return float(th.get("cold_start_backfill_hours", 168))
+
+
 def label_rows(snapshot, rows, live_partitions, baseline_p99, baseline_n, median_partition_bytes, th):
     """Label each (snapshot, partition) batch in place; -> True when the commit is a
     possible full refresh.
@@ -208,9 +216,11 @@ def label_rows(snapshot, rows, live_partitions, baseline_p99, baseline_n, median
       possible_full_refresh  the commit replaced (nearly) the whole table
       rewrite                files removed in that partition (copy-on-write, overwrite)
                              or delete files only (merge-on-read row changes)
-      possible_backfill      append-only, later than the table's 99th-percentile
-                             lateness (as it stood before this scan, with enough
-                             samples) and at least a median partition's bytes
+      possible_backfill      append-only, at least a median partition's bytes, and
+                             later than the table's 99th-percentile lateness (as it
+                             stood before this scan, with min_batches samples) or,
+                             while the table has no such baseline yet (cold start),
+                             later than cold_start_backfill_hours
       on_time / late         append-only, by whether the partition's range had ended
       append                 append-only into a partition with no time range"""
     if snapshot["operation"] == "replace":
@@ -227,9 +237,8 @@ def label_rows(snapshot, rows, live_partitions, baseline_p99, baseline_n, median
             r["label"] = "append"
         elif r["lateness_h"] == 0:
             r["label"] = "on_time"
-        elif (baseline_p99 is not None and baseline_n >= th.get("min_samples", 20)
-              and r["lateness_h"] > baseline_p99
-              and median_partition_bytes and r["data_bytes_added"] >= median_partition_bytes):
+        elif (median_partition_bytes and r["data_bytes_added"] >= median_partition_bytes
+              and r["lateness_h"] > _backfill_limit(baseline_p99, baseline_n, th)):
             r["label"] = "possible_backfill"
         else:
             r["label"] = "late"

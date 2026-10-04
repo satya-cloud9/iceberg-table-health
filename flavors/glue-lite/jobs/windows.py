@@ -5,14 +5,23 @@ Two waits, learned per table instead of one fixed number:
   hot window    how long a writer may pause between commits and still be
                 "writing": 2 x the 95th-percentile commit gap (family 1's gap
                 histogram), at least the configured hot_partition_minutes (the
-                floor), at most hot_cap_minutes; needs min_samples gaps
+                floor), at most hot_cap_minutes; needs min_gaps gaps. Idle
+                gaps (longer than idle_gap_factor x the median gap: nights,
+                weekends, a paused job) are left out first, so a writer that
+                commits every 2 minutes doesn't get a 4-hour hot window
   settle window how long after a partition's time range ends late data keeps
                 landing: the 99th-percentile lateness (family 2's lateness
                 histogram; only append-only batches labelled on_time or late
                 count, so rewrites, possible backfills and possible full
                 refreshes don't stretch it),
                 at most settle_cap_hours; time-based partitions only; needs
-                min_samples batches
+                min_batches batches
+
+Lookback (adaptive): both histograms are read over histogram_days; a table
+with fewer than min_batches / min_gaps samples there reaches further back,
+whole days at a time, until it has them or hits lookback_max_days. A table
+that writes once a day gets a learned window after 20 days instead of never;
+a busy table keeps its 30 days.
 
 Inside the settle window (interim policy, until query evidence can weigh read
 cost against rewrite cost): the first compaction is allowed and up to
@@ -36,9 +45,52 @@ from datetime import date
 import activity as act
 
 
-def learned_hot(p95_edge, n_gaps, floor_min, cap_min=1440.0, min_samples=20, factor=2.0):
+def adaptive_window(day_counts, today, base_days, max_days, min_n):
+    """day_counts: {date: {bucket_edge: n}} (as far back as max_days).
+    -> (counts {edge: n}, n, days_used). Every day younger than base_days is in;
+    older days are added newest first only while n < min_n, up to max_days."""
+    counts, n, oldest = {}, 0, None
+    for d in sorted(day_counts, reverse=True):
+        age = (today - d).days
+        if age >= max(max_days, base_days) or (age >= base_days and n >= min_n):
+            break
+        for b, k in day_counts[d].items():
+            counts[b] = counts.get(b, 0) + k
+            n += k
+        oldest = d
+    used = base_days if oldest is None else max(base_days, (today - oldest).days + 1)
+    return counts, n, used
+
+
+def drop_idle(counts, buckets, factor):
+    """Leave out gaps in buckets entirely above factor x the median gap.
+    counts: {edge: n}, buckets: the edges in order (None last). -> (kept, dropped)."""
+    total = sum(counts.values())
+    if not total or not factor:
+        return dict(counts), 0
+    k, run, median = max(1, -(-total // 2)), 0, None
+    for e in buckets:
+        run += counts.get(e, 0)
+        if run >= k:
+            median = e
+            break
+    if median is None:                      # most gaps are longer than the last edge
+        return dict(counts), 0
+    limit = factor * median
+    kept, dropped, lower = {}, 0, 0
+    for e in buckets:
+        n = counts.get(e, 0)
+        if lower >= limit:
+            dropped += n
+        elif n:
+            kept[e] = n
+        lower = e if e is not None else lower
+    return kept, dropped
+
+
+def learned_hot(p95_edge, n_gaps, floor_min, cap_min=1440.0, min_gaps=20, factor=2.0):
     """-> (minutes, source)."""
-    if not n_gaps or n_gaps < min_samples:
+    if not n_gaps or n_gaps < min_gaps:
         return float(floor_min), f"config (only {n_gaps or 0} gaps)"
     if p95_edge is None:                      # p95 beyond the last bucket
         return float(cap_min), "learned (capped)"
@@ -50,9 +102,9 @@ def learned_hot(p95_edge, n_gaps, floor_min, cap_min=1440.0, min_samples=20, fac
     return m, "learned"
 
 
-def learned_settle(p99_edge, n_batches, cap_h=168.0, min_samples=20):
+def learned_settle(p99_edge, n_batches, cap_h=168.0, min_batches=20):
     """-> (hours or None, source)."""
-    if not n_batches or n_batches < min_samples:
+    if not n_batches or n_batches < min_batches:
         return None, f"none (only {n_batches or 0} batches)"
     if p99_edge is None or float(p99_edge) >= cap_h:
         return float(cap_h), "learned (capped)"

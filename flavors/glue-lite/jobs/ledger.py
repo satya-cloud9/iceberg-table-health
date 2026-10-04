@@ -367,6 +367,11 @@ class Ledger:
         self.spot_share = float(inc.get("spot_check_share", 0.05))
         self.reconcile_days = float(inc.get("reconcile_every_days", 7))
         self.hist_days = int(inc.get("histogram_days", 30))
+        # adaptive lookback (family 3 and the possible-backfill baseline)
+        self.min_batches = int(inc.get("min_batches", inc.get("min_samples", 20)))
+        self.min_gaps = int(inc.get("min_gaps", inc.get("min_samples", 20)))
+        self.max_days = (max(int(inc.get("lookback_max_days", 365)), self.hist_days)
+                         if inc.get("adaptive_lookback", True) else self.hist_days)
         self.retention_days = int(inc.get("retention_days", 365))
         self.results = []          # per table: (table, agree, n_checks, disagreements, ingested, event)
         # rows written once at the end of the scan (one Iceberg commit per ops table, not per table)
@@ -407,14 +412,53 @@ class Ledger:
     def _windows(self, uuid, tm, cfg):
         """Family 3 inputs, recorded per table for detect_symptoms."""
         inc = self.config.get("incremental") or {}
-        p99, n_late = self._late_pct(uuid, 0.99)
+        p99, n_late, late_days = self._late_adaptive(uuid, 0.99)
         tm["lateness_p99_h"] = p99
+        tm["lateness_p99_batches"] = n_late
+        tm["lateness_lookback_days"] = late_days
+        gaps, n_gaps, gap_days = self._gaps_adaptive(uuid)
+        kept, idle = win.drop_idle(gaps, GAP_BUCKETS, float(inc.get("idle_gap_factor", 10)))
+        hot_edge, n_hot = hist_percentile(kept, 0.95)
+        tm["hot_gap_p95_min"] = hot_edge
+        tm["hot_gaps_used"] = n_hot
+        tm["idle_gaps_ignored"] = idle
+        tm["gap_lookback_days"] = gap_days
         tm["hot_window_min"], tm["hot_window_source"] = win.learned_hot(
-            tm.get("commit_gap_p95_min"), tm.get("commit_gaps_window"),
-            float(cfg.get("hot_partition_minutes", 15)), float(inc.get("hot_cap_minutes", 1440)),
-            int(inc.get("min_samples", 20)), float(inc.get("hot_gap_factor", 2.0)))
+            hot_edge, n_hot, float(cfg.get("hot_partition_minutes", 15)), float(inc.get("hot_cap_minutes", 1440)),
+            self.min_gaps, float(inc.get("hot_gap_factor", 2.0)))
         tm["settle_window_h"], tm["settle_window_source"] = win.learned_settle(
-            p99, n_late, float(inc.get("settle_cap_hours", 168)), int(inc.get("min_samples", 20)))
+            p99, n_late, float(inc.get("settle_cap_hours", 168)), self.min_batches)
+
+    def _day_hist(self, uuid, table, bucket_col, n_col, pending_key):
+        """{day: {bucket_edge: n}} for one table, back to max_days."""
+        today = datetime.now(timezone.utc).date()
+        since = today - timedelta(days=self.max_days)
+        out = {}
+        for r in self.spark.sql(f"""
+                SELECT day, {bucket_col} AS b, sum({n_col}) AS n FROM {self.ops}.{table}
+                WHERE table_uuid = '{uuid}' AND day > DATE '{since}'
+                GROUP BY day, {bucket_col}""").collect():
+            b = r.b
+            b = None if b is None else (int(b) if float(b).is_integer() else float(b))
+            day = out.setdefault(r.day, {})
+            day[b] = day.get(b, 0) + int(r.n)
+        for r in self.pending[pending_key]:
+            if r["table_uuid"] == uuid and r["day"] > since:
+                day = out.setdefault(r["day"], {})
+                day[r[bucket_col]] = day.get(r[bucket_col], 0) + r[n_col]
+        return out, today
+
+    def _late_adaptive(self, uuid, q):
+        """-> (percentile edge, batches, days looked back)."""
+        days, today = self._day_hist(uuid, "lateness_hist", "bucket_max_h", "batches", "lateness_hist")
+        counts, n, used = win.adaptive_window(days, today, self.hist_days, self.max_days, self.min_batches)
+        edge, _ = act.hist_percentile(counts, q)
+        return edge, n, used
+
+    def _gaps_adaptive(self, uuid):
+        """-> (gap counts, gaps, days looked back)."""
+        days, today = self._day_hist(uuid, "commit_gap_hist", "bucket_max_min", "gaps", "commit_gap_hist")
+        return win.adaptive_window(days, today, self.hist_days, self.max_days, self.min_gaps)
 
     def _family1(self, table, uuid, tm, cfg, full_fn, snaps, current, versions):
         """Ingest new snapshots, compute ledger metrics, compare (shadow / spot
@@ -512,9 +556,10 @@ class Ledger:
         if new_snaps:
             files = act.read_activity(spark, table, [x["snapshot_id"] for x in new_snaps])
             # the table's lateness as it stood before this scan: the baseline for possible backfills
-            base_p99, base_n = self._late_pct(uuid, 0.99)
-            th = dict(cfg.get("thresholds", {}),
-                      min_samples=int((self.config.get("incremental") or {}).get("min_samples", 20)))
+            base_p99, base_n, _ = self._late_adaptive(uuid, 0.99)
+            inc = self.config.get("incremental") or {}
+            th = dict(cfg.get("thresholds", {}), min_batches=self.min_batches,
+                      cold_start_backfill_hours=float(inc.get("cold_start_backfill_hours", 168)))
             for x in new_snaps:
                 commit_rows = act.aggregate(x, files.get(x["snapshot_id"], []))
                 act.label_rows(x, commit_rows, len(live_keys), base_p99, base_n, median_partition_bytes, th)
@@ -764,8 +809,12 @@ class Ledger:
         try:   # keep the ops tables bounded
             self.spark.sql(f"DELETE FROM {self.ops}.incremental_check "
                            f"WHERE checked_at < current_timestamp() - INTERVAL 30 DAYS")
+            keep = max(self.hist_days * 3, 90, self.max_days + 1)
             self.spark.sql(f"DELETE FROM {self.ops}.commit_gap_hist "
-                           f"WHERE day < date_sub(current_date(), {max(self.hist_days * 3, 90)})")
+                           f"WHERE day < date_sub(current_date(), {keep})")
+            if self.mode2 != "off":
+                self.spark.sql(f"DELETE FROM {self.ops}.lateness_hist "
+                               f"WHERE day < date_sub(current_date(), {keep})")
             self.spark.sql(f"DELETE FROM {self.ops}.snapshot_log "
                            f"WHERE committed_at < current_timestamp() - INTERVAL {self.retention_days} DAYS")
         except Exception as e:

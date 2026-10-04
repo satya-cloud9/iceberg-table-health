@@ -62,7 +62,9 @@ TABLE_METRICS_DDL = """
     lateness_p99_h DOUBLE, hot_window_min DOUBLE, hot_window_source STRING,
     settle_window_h DOUBLE, settle_window_source STRING,
     possible_full_refreshes_30d BIGINT, possible_backfill_batches_30d BIGINT, last_full_refresh_ms BIGINT,
-    full_refresh_avg_bytes BIGINT, retained_full_copies BIGINT, pre_refresh_snapshot_ms BIGINT"""
+    full_refresh_avg_bytes BIGINT, retained_full_copies BIGINT, pre_refresh_snapshot_ms BIGINT,
+    lateness_p99_batches BIGINT, lateness_lookback_days BIGINT, hot_gap_p95_min DOUBLE, hot_gaps_used BIGINT,
+    idle_gaps_ignored BIGINT, gap_lookback_days BIGINT"""
 
 
 def coerce(value, data_type):
