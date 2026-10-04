@@ -1,18 +1,11 @@
 SHELL := /bin/bash
 
-# Which tenant every target below acts on. Override on the command
-# line, e.g.:
-#   make tenant-apply TENANT=tenant-b
-# This fork is EKS-only: Floci-emulated EKS first, then real EKS. The
-# other providers from upstream lakehouse-anywhere were removed, so
-# PROVIDER is pinned rather than overridable.
+# This repo is the Glue-Lite flavor only: Floci (S3, Glue) + Floci-emulated
+# EKS + Spark Operator. The provider is pinned to the emulated AWS module.
 override PROVIDER := aws
-TENANT ?= tenant-a
 export PROVIDER
-export TENANT
 
-.PHONY: preflight install emulator-up provider-apply platform-apply tenant-apply \
-        flows status teardown destroy up
+.PHONY: preflight install emulator-up provider-apply teardown destroy
 
 preflight:
 	bash scripts/00-preflight.sh
@@ -26,40 +19,19 @@ emulator-up:
 provider-apply:
 	bash scripts/03-apply-provider.sh
 
-platform-apply:
-	bash scripts/04-apply-platform.sh
-
-tenant-apply:
-	bash scripts/05-apply-tenant.sh
-
-flows:
-	bash scripts/06-register-flows.sh
-
-status:
-	bash scripts/status.sh
-
-# Stops the emulator/local state only -- leaves all Terraform state alone.
+# Stops Floci and the emulated cluster; leaves Terraform state alone.
 teardown:
 	bash scripts/99-teardown.sh
 
-# Actually runs `tofu destroy` at every applied stage (tenant, platform,
-# provider), then stops the emulator. See scripts/99-teardown.sh.
+# Runs `tofu destroy` on the provider module, then stops Floci.
 destroy:
 	DESTROY=1 bash scripts/99-teardown.sh
-
-# Full run, phase by phase, against PROVIDER (default aws). Intended to be
-# run interactively the first time so you can catch and report back any
-# failure before the next phase starts -- e.g.:
-#   make up PROVIDER=baremetal
-up: preflight install emulator-up provider-apply platform-apply tenant-apply flows
-	@echo ""
-	@echo "=== Stack is up (PROVIDER=$(PROVIDER), TENANT=$(TENANT)). Run 'make status' for endpoints. ==="
 
 # --- Glue-Lite flavor (flavors/glue-lite) --------------------------------
 # Kestra, Spark Operator, Glue, S3, Iceberg on the emulated EKS cluster --
 # no platform/tenant layers. Tear down with `make destroy` as usual.
 .PHONY: gl-spike gl-cluster gl-spark-operator gl-image gl-smoke gl-up gl-generate \
-        gl-health gl-bench gl-compact gl-report gl-demo gl-test-tables gl-metrics gl-symptoms gl-scorecard gl-scan gl-plan gl-step gl-sql
+        gl-health gl-bench gl-compact gl-report gl-demo gl-test-tables gl-metrics gl-symptoms gl-scorecard gl-scan gl-plan gl-step gl-sql gl-clean gl-status
 
 gl-spike:
 	bash flavors/glue-lite/spike/run-glue-spike.sh
@@ -158,6 +130,18 @@ endif
 
 gl-sql:
 	bash flavors/glue-lite/scripts/run-job.sh py run_sql.py -e "$(Q)"
+
+# Delete finished SparkApplications (and their driver pods) now, rather than
+# waiting for their timeToLiveSeconds.
+gl-clean:
+	bash -c 'source flavors/glue-lite/scripts/env.sh && kubectl -n spark-jobs get sparkapplication -o json \
+	  | jq -r ".items[] | select(.status.applicationState.state | IN(\"COMPLETED\", \"FAILED\", \"SUBMISSION_FAILED\")) | .metadata.name" \
+	  | xargs -r kubectl -n spark-jobs delete sparkapplication'
+
+# What the Glue-Lite stack is running and using.
+gl-status:
+	bash -c 'source flavors/glue-lite/scripts/env.sh && kubectl get nodes && kubectl get pods -A --field-selector=status.phase=Running \
+	  && (kubectl top nodes 2>/dev/null || true) && docker stats --no-stream --format "table {{.Name}}\t{{.MemUsage}}\t{{.CPUPerc}}"'
 
 gl-step:
 	JOB_TIMEOUT_MIN=20 bash flavors/glue-lite/scripts/run-job.sh py scenario_step.py $(STEP)

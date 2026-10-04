@@ -26,8 +26,8 @@ services:
       - "/var/run/docker.sock:/var/run/docker.sock"
     healthcheck:
       # Floci serves LocalStack's /_localstack/health path for drop-in
-      # compatibility, so this check (and the ones in scripts/03 and
-      # scripts/status.sh) didn't need to change when we swapped tools.
+      # compatibility, so this check (and the one in scripts/02)
+      # didn't need to change when we swapped tools.
       test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
       interval: 5s
       timeout: 5s

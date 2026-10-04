@@ -72,6 +72,26 @@ your Docker network differs.
 
 Every change to `jobs/` needs `make gl-image` again before the next run.
 
+### What the stack runs (checked 2026-10-04)
+
+| Runs | Where | Memory |
+|---|---|---|
+| Floci (S3, Glue; DynamoDB next, for advisor state) | `lakehouse-floci` container | ~190 MiB |
+| Emulated EKS: one k3s node | `floci-eks-lakehouse-aws` container | ~1 GiB idle |
+| Image registry for the Spark image | `floci-ecr-registry` container | ~20 MiB |
+| Spark Operator (controller + webhook) | `spark-operator` namespace | ~130 MiB |
+| Spark jobs, one driver + one executor at a time | `spark-jobs` namespace, 8 GiB quota | while running |
+
+Nothing else is needed: Nessie, Kestra, Trino, MinIO, Postgres and the
+observability stack belong to the base repo's platform and tenant stages,
+which this flavor never applies. Trino comes back only for the Trino facts
+source, as one pod pointed at Floci's Glue. Query evidence from Trino or dbt
+is read from exported files, not from running services.
+
+Finished jobs delete themselves a day after they end (`JOB_TTL_SECONDS`,
+default 86400). `make gl-clean` deletes them now; `make gl-status` shows what
+is running and how much memory it uses.
+
 ## GL1 — Small-file generator
 
 Builds `glue.demo.events`: 7 days of 200,000 events each. Healthy days are

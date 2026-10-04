@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Phase 3b: sanity-check what 03-apply-provider.sh produced, BEFORE
-# terraform/platform or terraform/tenants ever touch it. Runs
+# the Glue-Lite scripts touch it. Runs
 # automatically at the end of 03-apply-provider.sh; also safe to re-run
-# on its own (e.g. right before 04-apply-platform.sh, if you want to
+# on its own (e.g. right before make gl-spark-operator, if you want to
 # double-check nothing's gone stale since 03 last ran).
 #
 # Why this exists: every real incident chasing AWS's 401s down to floci's
@@ -22,7 +22,7 @@
 #     both defaulted to the shared test/test credentials, which
 #     floci-io/floci#2912 deliberately rejects for EKS token-webhook
 #     auth -- surfacing as kubectl 401 Unauthorized deep inside
-#     terraform/platform's Kubernetes/Helm provider calls, several
+#     later kubectl and helm calls, several
 #     `tofu apply` invocations away from the actual cause.
 # None of these were floci bugs or Terraform bugs -- they were captured
 # command output silently standing in for a real value, several steps
@@ -30,7 +30,7 @@
 # job is closing that gap: catch a bad value where it was produced, not
 # where it finally explodes.
 #
-# Usage: PROVIDER=baremetal|aws|gcp|azure bash scripts/03b-verify-provider.sh
+# Usage: bash scripts/03b-verify-provider.sh
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -124,13 +124,12 @@ fi
 # 5. The decisive check: does the whole chain actually authenticate?
 # Everything above is static inspection; this is the one live probe that
 # would have caught the 401-Unauthorized incident directly, at the
-# source, instead of inside terraform/platform's Kubernetes/Helm provider
-# calls several steps later.
+# source, instead of inside a later kubectl or helm call several steps on.
 echo "--- kubectl get --raw /healthz against $KUBECONFIG_PATH ---"
 if ! kubectl --kubeconfig "$KUBECONFIG_PATH" get --raw /healthz; then
   echo "" >&2
   echo "ERROR: kubectl can't authenticate against the cluster $PROVIDER just" >&2
-  echo "created. Don't proceed to 04-apply-platform.sh -- it'll fail the same" >&2
+  echo "created. Don't proceed to make gl-spark-operator -- it'll fail the same" >&2
   echo "way, just with a less direct error message three resources in." >&2
   echo "Common causes:" >&2
   echo "  - AWS: see the exec-plugin identity check above if it passed but" >&2

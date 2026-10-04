@@ -11,7 +11,8 @@
 # JOB_TIMEOUT_MIN (default 30) caps how long this waits; the job itself keeps
 # running if the wait gives up.
 # Sizing (override per run): DRIVER_MEMORY (1g), EXECUTOR_MEMORY (2g),
-# EXECUTOR_OVERHEAD (1g), EXECUTOR_INSTANCES (1). Executor pod = memory +
+# EXECUTOR_OVERHEAD (1g), EXECUTOR_INSTANCES (1), JOB_TTL_SECONDS (86400:
+# how long a finished application and its driver pod are kept). Executor pod = memory +
 # overhead; the spark-jobs quota is 8Gi of requests in total.
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
@@ -56,9 +57,10 @@ export DRIVER_MEMORY="${DRIVER_MEMORY:-1g}"
 export EXECUTOR_MEMORY="${EXECUTOR_MEMORY:-2g}"
 export EXECUTOR_OVERHEAD="${EXECUTOR_OVERHEAD:-1g}"
 export EXECUTOR_INSTANCES="${EXECUTOR_INSTANCES:-1}"
+export JOB_TTL_SECONDS="${JOB_TTL_SECONDS:-86400}"   # finished jobs are cleaned up after a day
 
 echo "=== Submitting $JOB_NAME ($MAIN_FILE ${ARGS[*]:-}) [executor ${EXECUTOR_INSTANCES} x ${EXECUTOR_MEMORY}+${EXECUTOR_OVERHEAD}] ==="
-envsubst '${JOB_NAME} ${MAIN_FILE} ${JOB_ARGS} ${IMAGE} ${AWS_ENDPOINT} ${WAREHOUSE} ${AWS_REGION} ${DRIVER_MEMORY} ${EXECUTOR_MEMORY} ${EXECUTOR_OVERHEAD} ${EXECUTOR_INSTANCES}' \
+envsubst '${JOB_NAME} ${MAIN_FILE} ${JOB_ARGS} ${IMAGE} ${AWS_ENDPOINT} ${WAREHOUSE} ${AWS_REGION} ${DRIVER_MEMORY} ${EXECUTOR_MEMORY} ${EXECUTOR_OVERHEAD} ${EXECUTOR_INSTANCES} ${JOB_TTL_SECONDS}' \
   < "$GL_ROOT/k8s/sparkapp.tmpl.yaml" | kubectl apply -f -
 
 TIMEOUT_MIN="${JOB_TIMEOUT_MIN:-30}"

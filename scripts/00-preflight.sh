@@ -53,11 +53,11 @@ echo ""
 CPUS=$(nproc)
 echo "vCPUs: $CPUS"
 if [ "$CPUS" -ge 8 ]; then
-  pass "8+ vCPUs — comfortable for the full stack."
+  pass "8+ vCPUs — comfortable."
 elif [ "$CPUS" -ge 4 ]; then
-  warn "4-7 vCPUs — workable, but the full stack (kind + floci + Trino + Kestra + observability) may feel sluggish under load. CPU overcommit is generally fine for this workload since services are mostly idle/bursty."
+  warn "4-7 vCPUs — workable, but Spark jobs will be slower. CPU overcommit is generally fine for this workload since services are mostly idle/bursty."
 else
-  fail "$CPUS vCPUs — likely too little to run kind plus the rest of the stack concurrently."
+  fail "$CPUS vCPUs — likely too little for the emulated cluster plus Spark jobs."
 fi
 echo ""
 

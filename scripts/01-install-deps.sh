@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Phase 1: install Docker, kind, kubectl, helm, OpenTofu, and awscli-local.
+# Phase 1: install Docker, kubectl, helm, OpenTofu, and awscli-local.
 #
 # Distro/arch-agnostic: detects the package manager (apt/dnf/yum) and CPU
 # architecture (amd64/arm64) instead of assuming Ubuntu on x86_64, so the
 # same script runs unmodified on any Linux box — an AWS EC2 instance, a
 # DigitalOcean droplet, an Oracle Cloud Ampere (ARM) instance, bare metal,
 # whatever. Nothing in this stack talks to a real cloud's API (that's the
-# whole point of floci + kind), so the only things that actually vary
+# whole point of floci), so the only things that actually vary
 # across "which cloud is this VM on" are the OS package manager and the
 # CPU architecture — this script handles both explicitly instead of
 # silently assuming Ubuntu/apt/amd64.
@@ -83,22 +83,6 @@ if ! docker compose version >/dev/null 2>&1; then
   esac
 fi
 
-# --- kind ---
-if ! command -v kind >/dev/null 2>&1; then
-  echo "=== Installing kind ($GOARCH) ==="
-  KIND_VERSION=$(curl -fsSL https://api.github.com/repos/kubernetes-sigs/kind/releases/latest | jq -r .tag_name 2>/dev/null || echo "")
-  if [ -z "$KIND_VERSION" ] || [ "$KIND_VERSION" = "null" ]; then
-    KIND_VERSION="v0.27.0"  # fallback pin — update if this is stale
-    echo "Could not resolve latest kind release, falling back to $KIND_VERSION"
-  fi
-  curl -Lo /tmp/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-${GOARCH}"
-  chmod +x /tmp/kind
-  sudo mv /tmp/kind /usr/local/bin/kind
-  echo "Installed kind $KIND_VERSION"
-else
-  echo "kind already installed: $(kind version)"
-fi
-
 # --- kubectl ---
 if ! command -v kubectl >/dev/null 2>&1; then
   echo "=== Installing kubectl ($GOARCH) ==="
@@ -146,7 +130,6 @@ echo ""
 echo "=== Versions ==="
 docker --version || true
 docker compose version || true
-kind version || true
 kubectl version --client 2>/dev/null || true
 helm version --short || true
 tofu version || true

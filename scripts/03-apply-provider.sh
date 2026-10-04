@@ -1,13 +1,9 @@
 #!/usr/bin/env bash
-# Phase 3: apply exactly one terraform/providers/<name> module, then
-# capture its four contract outputs (see terraform/providers/CONTRACT.md)
-# into terraform/generated/<name>.tfvars.json for the platform/tenant
-# stages to consume. This is what actually keeps terraform/platform and
-# terraform/tenants provider-agnostic in practice -- they only ever see
-# these four values (plus whatever provider-specific extras the identity
-# wiring needs), never the provider module itself.
+# Phase 3: apply terraform/providers/aws (Floci-emulated EKS and its IAM),
+# then capture its outputs into terraform/generated/aws.tfvars.json;
+# scripts/env.sh reads the kubeconfig path from there.
 #
-# Usage: PROVIDER=baremetal|aws|gcp|azure bash scripts/03-apply-provider.sh
+# Usage: bash scripts/03-apply-provider.sh   (PROVIDER is pinned to aws)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -17,52 +13,12 @@ PROVIDER_DIR="terraform/providers/${PROVIDER}"
 
 if [ ! -d "$PROVIDER_DIR" ]; then
   echo "No such provider module: $PROVIDER_DIR" >&2
-  echo "Expected one of: baremetal, aws, gcp, azure" >&2
   exit 1
 fi
 
-if [ "$PROVIDER" = "baremetal" ] && [ ! -f "$PROVIDER_DIR/terraform.tfvars" ]; then
-  echo "terraform/providers/baremetal/terraform.tfvars doesn't exist yet (it's"
-  echo "gitignored -- machine-specific, not source)."
-  echo "Copy the committed template and fill in your own values:"
-  echo "  cp $PROVIDER_DIR/terraform.tfvars.example $PROVIDER_DIR/terraform.tfvars"
-  echo "See terraform/providers/baremetal/variables.tf for every option."
-  exit 1
-fi
-
-# Option A (see terraform/providers/CONTRACT.md's "Known gap" section and
-# each provider's own workload-identity.tf) needs to know every tenant
-# that exists BEFORE this provider module applies -- that's the one real
-# cost of native federation over the shared static credential: onboarding a
-# tenant now touches the provider layer too, not just that tenant's own
-# apply (see workload-identity.tf's own header comments on why -- the
-# trust binding has to be built unilaterally, inside the provider's own
-# phase, using nothing it'd otherwise have to read from platform/tenant).
-#
-# Discovered here, not hand-maintained: every terraform/tenants/<name>
-# directory except _template (which is a module source, never applied on
-# its own -- see that directory's own README/header comments) is a real
-# tenant. Written as PROVIDER_DIR/tenant_ids.auto.tfvars.json, a plain
-# Terraform auto-loaded var-file (the .auto.tfvars.json suffix is what
-# makes tofu pick it up with no -var-file flag needed) -- gitignored,
-# regenerated fresh on every run of this script, the same "generated, not
-# committed" treatment terraform/generated/*.tfvars.json already gets.
-# for_each in workload-identity.tf keys off this list directly; an empty
-# list (no terraform/tenants/* directories yet) makes every resource
-# there for_each = {}, a clean no-op, not an error.
-echo "=== Discovering tenants for Option A (workload-identity.tf) ==="
-TENANT_IDS_JSON="[]"
-if [ -d "terraform/tenants" ]; then
-  TENANT_IDS_JSON=$(
-    find terraform/tenants -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
-      | grep -v '^_template$' \
-      | sort \
-      | jq -R . \
-      | jq -s -c .
-  )
-fi
-echo "Tenants found: $TENANT_IDS_JSON"
-echo "{\"tenant_ids\": $TENANT_IDS_JSON}" > "$PROVIDER_DIR/tenant_ids.auto.tfvars.json"
+# workload-identity.tf iterates over tenant_ids; this repo has no tenants,
+# so it gets an empty list (every resource there becomes a no-op).
+echo '{"tenant_ids": []}' > "$PROVIDER_DIR/tenant_ids.auto.tfvars.json"
 
 echo "=== tofu init ($PROVIDER_DIR) ==="
 (cd "$PROVIDER_DIR" && tofu init -upgrade)
@@ -145,14 +101,7 @@ echo "=== Capturing the provider contract outputs ==="
 mkdir -p terraform/generated
 (cd "$PROVIDER_DIR" && tofu output -json) > "terraform/generated/${PROVIDER}-outputs.json"
 
-# The four required contract outputs, plus every provider-specific extra
-# (trino_gsa_email, etc.) -- terraform/platform and
-# terraform/tenants only declare the variables they actually use, so
-# passing extras through as a var-file is harmless. This is a plain
-# var-file, not *.auto.tfvars.json -- it lives outside terraform/platform
-# and terraform/tenants/<name>, so it has to be passed explicitly with
-# -var-file (04/05 do this) rather than relying on Terraform's
-# same-directory auto-loading.
+# Plain values (no type wrappers), read by scripts/env.sh.
 jq 'map_values(.value)' "terraform/generated/${PROVIDER}-outputs.json" > "terraform/generated/${PROVIDER}.tfvars.json"
 
 echo "Wrote terraform/generated/${PROVIDER}.tfvars.json:"
@@ -162,4 +111,4 @@ echo ""
 PROVIDER="$PROVIDER" bash scripts/03b-verify-provider.sh
 
 echo ""
-echo "Next: bash scripts/04-apply-platform.sh -- PROVIDER=${PROVIDER}"
+echo "Next: make gl-spark-operator gl-image gl-smoke"

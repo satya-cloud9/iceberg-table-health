@@ -36,6 +36,9 @@ ${JOB_ARGS}
   sparkVersion: "3.5.6"
   restartPolicy:
     type: Never
+  # The operator deletes the finished application (and its driver pod) this
+  # long after it ends; run-job.sh has printed the driver log by then.
+  timeToLiveSeconds: ${JOB_TTL_SECONDS}
   sparkConf:
     spark.ui.enabled: "false"
     spark.sql.session.timeZone: UTC

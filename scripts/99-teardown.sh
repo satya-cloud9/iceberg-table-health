@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
-# Tears down whichever stages have actually been applied, in reverse order
-# (tenant -> platform -> provider), then stops the emulator container if
-# one is running. Leaves Terraform state and everything in git untouched
+# Tears down the emulated AWS provider (Floci + emulated EKS), then stops
+# the emulator container if one is running. Leaves Terraform state and everything in git untouched
 # by default -- pass DESTROY=1 to actually run `tofu destroy` at each
 # stage instead of just stopping the emulator/local cluster.
 #
-# Usage: PROVIDER=baremetal|aws|gcp|azure TENANT=tenant-a DESTROY=1 WIPE_STATE=1 bash scripts/99-teardown.sh
+# Usage: DESTROY=1 WIPE_STATE=1 bash scripts/99-teardown.sh
 #
-# WIPE_STATE=1 (new, AWS/GCP/azure only): on top of stopping the emulator,
-# also deletes the local Terraform state for the provider and platform
-# layers (.terraform/, terraform.tfstate*, generated/, *.auto.tfvars.json)
-# so the next 02/03/04 script run starts genuinely from scratch. This is a
+# WIPE_STATE=1: on top of stopping the emulator, also deletes the local
+# Terraform state for the provider layer (.terraform/, terraform.tfstate*, generated/, *.auto.tfvars.json)
+# so the next 02/03 script run starts genuinely from scratch. This is a
 # DIFFERENT thing from DESTROY=1 and the two answer different situations,
 # don't reach for both together without thinking about why:
 #   - DESTROY=1 assumes the emulator/cluster is still alive and healthy
@@ -31,7 +29,6 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 PROVIDER="${PROVIDER:-aws}"
-TENANT="${TENANT:-tenant-a}"
 DESTROY="${DESTROY:-0}"
 WIPE_STATE="${WIPE_STATE:-0}"
 
@@ -128,14 +125,12 @@ cleanup_floci_volumes() {
   done
 }
 
-# Deletes local Terraform state for the given provider + platform (never
-# git-tracked -- .gitignore'd, same convention as tenant_ids.auto.tfvars.json
-# elsewhere in this repo) so the next apply chain starts from nothing rather
+# Deletes local Terraform state for the provider (never git-tracked) so the next apply chain starts from nothing rather
 # than reusing state that may reference resources on a now-gone emulator.
 wipe_local_state() {
   local provider="$1"
 
-  echo "=== Wiping local Terraform state (provider=${provider}, platform) ==="
+  echo "=== Wiping local Terraform state (provider=${provider}) ==="
 
   echo "  terraform/providers/${provider}/{.terraform,terraform.tfstate*,generated/,*.auto.tfvars.json}"
   rm -rf \
@@ -144,96 +139,48 @@ wipe_local_state() {
     "terraform/providers/${provider}/generated" \
     "terraform/providers/${provider}"/*.auto.tfvars.json
 
-  echo "  terraform/platform/{.terraform,terraform.tfstate*}"
-  rm -rf terraform/platform/.terraform terraform/platform/terraform.tfstate*
-
-  echo "  terraform/generated/ (captured provider outputs consumed by platform/tenant applies)"
+  echo "  terraform/generated/ (captured provider outputs; scripts/env.sh reads the kubeconfig path)"
   rm -rf terraform/generated/
 
-  echo "  Done. Re-run scripts/02-start-emulator.sh, then 03-apply-provider.sh," \
-       "then 04-apply-platform.sh to rebuild from scratch."
+  echo "  Done. Run 'make gl-up' to rebuild from scratch."
 }
 
 if [ "$DESTROY" = "1" ]; then
-  echo "DESTROY=1 -- running 'tofu destroy' at each applied stage, in reverse order."
+  echo "DESTROY=1 -- running 'tofu destroy' on terraform/providers/${PROVIDER}."
   echo "(Ctrl-C now if that's not what you meant.)"
   echo ""
-
-  if [ -d "terraform/tenants/${TENANT}" ]; then
-    echo "=== tofu destroy (terraform/tenants/${TENANT}) ==="
-    (cd "terraform/tenants/${TENANT}" && tofu destroy -auto-approve \
-      -var-file="../../generated/${PROVIDER}.tfvars.json" \
-      -var-file="../../generated/platform.tfvars.json") \
-      || echo "(destroy failed or nothing to destroy -- continuing)"
-  fi
-
-  echo "=== tofu destroy (terraform/platform) ==="
-  (cd terraform/platform && tofu destroy -auto-approve -var-file="../generated/${PROVIDER}.tfvars.json") \
-    || echo "(destroy failed or nothing to destroy -- continuing)"
-
-  echo "=== tofu destroy (terraform/providers/${PROVIDER}) ==="
   (cd "terraform/providers/${PROVIDER}" && tofu destroy -auto-approve) \
     || echo "(destroy failed or nothing to destroy -- continuing)"
 else
-  echo "DESTROY not set -- leaving all Terraform state alone (this only stops the"
-  echo "local emulator/cluster below). Re-run with DESTROY=1 to actually tear down"
-  echo "the ${PROVIDER} provider, platform, and ${TENANT} resources."
+  echo "DESTROY not set -- leaving Terraform state alone (this only stops the"
+  echo "local emulator and cluster below). Re-run with DESTROY=1 to tear down"
+  echo "the provider resources too."
 fi
 
 echo ""
-case "$PROVIDER" in
-  baremetal)
-    echo "PROVIDER=baremetal -- no emulator container to stop. If DESTROY=1 ran above,"
-    echo "the k3s install on the remote host was also removed by the provider module's"
-    echo "destroy provisioner (see terraform/providers/baremetal/main.tf)."
-    ;;
-  aws)
-    echo "=== Stopping floci ==="
-    # -v --remove-orphans, not a bare `down`: leaving floci's own persisted
-    # volume in place across a restart is exactly what let its embedded k3s
-    # node's stale/duplicate registration survive a "just restart it" cycle
-    # instead of actually resetting -- confirmed the hard way more than once
-    # working through the IRSA/workload-identity path on this provider.
-    # There's no real data worth preserving in a disposable dev emulator, so
-    # -v is the default here now, not opt-in.
-    #
-    # No `2>/dev/null` here on purpose (removed 2026-09-24) -- it was
-    # blanket-swallowing this command's own stderr, which would hide a real
-    # partial failure (e.g. the volume removal itself failing because
-    # something still had it mounted) behind the exact same "(not running)"
-    # fallback text a genuinely-nothing-to-tear-down case prints. Better to
-    # let the real output through and see it.
-    docker compose -f docker-compose.floci.yml down -v --remove-orphans || echo "(not running, or partial failure above -- read the output)"
-    cleanup_compose_network docker-compose.floci.yml
-    cleanup_floci_volumes
-    ;;
-  gcp)
-    echo "=== Stopping floci-gcp ==="
-    docker compose -f docker-compose.floci-gcp.yml down -v --remove-orphans || echo "(not running, or partial failure above -- read the output)"
-    cleanup_compose_network docker-compose.floci-gcp.yml
-    cleanup_floci_volumes
-    ;;
-  azure)
-    echo "=== Stopping floci-az ==="
-    docker compose -f docker-compose.floci-az.yml down -v --remove-orphans || echo "(not running, or partial failure above -- read the output)"
-    cleanup_compose_network docker-compose.floci-az.yml
-    cleanup_floci_volumes
-    ;;
-  *)
-    echo "Unknown PROVIDER='$PROVIDER' -- skipping emulator teardown." >&2
-    ;;
-esac
+echo "=== Stopping floci ==="
+  # -v --remove-orphans, not a bare `down`: leaving floci's own persisted
+  # volume in place across a restart is exactly what let its embedded k3s
+  # node's stale/duplicate registration survive a "just restart it" cycle
+  # instead of actually resetting -- confirmed the hard way more than once
+  # working through the IRSA/workload-identity path on this provider.
+  # There's no real data worth preserving in a disposable dev emulator, so
+  # -v is the default here now, not opt-in.
+  #
+  # No `2>/dev/null` here on purpose (removed 2026-09-24) -- it was
+  # blanket-swallowing this command's own stderr, which would hide a real
+  # partial failure (e.g. the volume removal itself failing because
+  # something still had it mounted) behind the exact same "(not running)"
+  # fallback text a genuinely-nothing-to-tear-down case prints. Better to
+  # let the real output through and see it.
+  docker compose -f docker-compose.floci.yml down -v --remove-orphans || echo "(not running, or partial failure above -- read the output)"
+  cleanup_compose_network docker-compose.floci.yml
+  cleanup_floci_volumes
+
 
 if [ "$WIPE_STATE" = "1" ]; then
   echo ""
-  if [ "$PROVIDER" = "baremetal" ]; then
-    echo "WIPE_STATE=1 requested but PROVIDER=baremetal -- skipping. Bare metal's" >&2
-    echo "state isn't emulator-disposable the same way (see the destroy-provisioner" >&2
-    echo "note above); wipe terraform/providers/baremetal's local state by hand if" >&2
-    echo "you're sure that's what you want." >&2
-  else
-    wipe_local_state "$PROVIDER"
-  fi
+  wipe_local_state "$PROVIDER"
 fi
 
 echo ""
