@@ -1176,3 +1176,35 @@ make gl-scan TRACE=s20_delete_sprawl SCAN_ARGS=--full 2>&1 | tee /tmp/trace.log
 grep -o '@ [^ ]*:[0-9]* [a-z_]*' /tmp/trace.log | uniq        # the code path, one stop per line
 grep 'TRACE' /tmp/trace.log                                   # in a VS Code terminal: Ctrl+click each path
 ```
+
+## GL2.6d — Partition holds and new findings switched on
+
+Shadow evidence on the cluster (2026-10-04):
+
+- **Partition holds**: s19's reloaded day held (rewrite rate ~6/24 h) and its
+  five appended days not; s3's today partition still held (a filling time
+  partition); `STEP=append-live` released both scratch tables
+  (`HOT_PARTITION:defer -> SMALL_FILES:auto`: appends only, no conflicting
+  commit). No other table changed.
+- **New findings**: s20 `DELETE_FILE_SPRAWL` (12 position delete files vs 10,
+  0.012% of rows deleted); RETAINED_STORAGE on s12 (12x), s19 (1.1x).
+
+`incremental.partition_holds` and `incremental.new_findings` are now `on`:
+findings come from the revised holds, plus the three new findings. The
+shadow lines still print, now as "(applied)". Learned windows stays in
+shadow.
+
+RETAINED_STORAGE now needs strictly more than `retained_storage_min_share`
+(1.0) of the live bytes: a table whose data was rewritten once in full (s14,
+exactly 1.0x) is the normal one copy kept for the retention window.
+
+Expectation changes: s20 requires DELETE_FILE_SPRAWL; RETAINED_STORAGE is
+allowed (optional) on s14 and s19 before and after, and on s12 after.
+
+```bash
+make gl-image
+make gl-scan                       # the scorecard is scored on the switched-on findings now
+make gl-plan T=s19                 # dry run: 5 days in the rewrite, 2026-09-06 under "hold"
+make gl-plan T=s20 APPLY=1         # rewrite_position_delete_files only, no rewrite_data_files
+make gl-scan                       # s20 after: PASS (one delete file left)
+```

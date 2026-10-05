@@ -209,6 +209,10 @@
           {
             "symptom": "SCATTERED_SMALL_FILES",
             "optional": true
+          },
+          {
+            "symptom": "RETAINED_STORAGE",
+            "optional": true
           }
         ]
       },
@@ -233,12 +237,22 @@
       "expect": [
         {
           "symptom": "MIXED_SPEC"
+        },
+        {
+          "symptom": "RETAINED_STORAGE",
+          "optional": true
         }
       ],
       "after": {
         "_comment": "after make gl-plan T=s14 APPROVE=MIXED_SPEC: everything rewritten into the monthly spec",
-        "expect": []
-      }
+        "expect": [
+          {
+            "symptom": "RETAINED_STORAGE",
+            "optional": true
+          }
+        ]
+      },
+      "_comment": "GL2.6c: RETAINED_STORAGE allowed (the rewrite into the new spec leaves a full copy for the retention window, ~1.0x)."
     },
     "glue.demo.s15_metadata_retention": {
       "_comment": "the log holds 5 versions; older metadata.json files fall off it and stay in storage, so they also count as orphans",
@@ -291,32 +305,40 @@
       }
     },
     "glue.demo.s19_partition_churn": {
-      "_comment": "GL2.6b: today all six days are auto SMALL_FILES (table-level churn is below REWRITE_CHURN). The revised holds (incremental.partition_holds, shadow) report 2026-09-06 SMALL_FILES auto -> advisory: writers rewrote it ~6x in 24 h. min_count 5 so the check holds in both modes (advisory findings are not scored).",
+      "_comment": "GL2.6b: all six days are SMALL_FILES; with partition_holds on, 2026-09-06 (rewritten ~6x in 24 h) is advisory and not scored, so 5 are auto. RETAINED_STORAGE is allowed: the six reloads keep more than one extra copy alive.",
       "expect": [
         {
           "symptom": "SMALL_FILES",
           "min_count": 5,
           "min_value": "2026-09-01"
+        },
+        {
+          "symptom": "RETAINED_STORAGE",
+          "optional": true
         }
       ],
       "after": {
-        "_comment": "after make gl-plan T=s19 APPLY=1 with today's holds: all six days compacted",
-        "expect": []
+        "_comment": "after make gl-plan T=s19 APPLY=1: the five appended days compacted; the reloaded day is left alone (advisory, not scored)",
+        "expect": [
+          {
+            "symptom": "RETAINED_STORAGE",
+            "optional": true
+          }
+        ]
       }
     },
     "glue.demo.s20_delete_sprawl": {
-      "_comment": "GL2.6c: 12 single-row DELETEs on a merge-on-read day: 12 position delete files, 0.012% of rows deleted. Healthy under today's rules; DELETE_FILE_SPRAWL in the new-findings shadow (optional here so the check holds in both modes).",
+      "_comment": "GL2.6c: 12 single-row DELETEs with partition-scoped delete files: 12 position delete files, 0.012% of rows deleted. DELETE_FILE_SPRAWL (new_findings on): the plan merges the delete files without rewriting data.",
       "expect": [
         {
           "symptom": "DELETE_FILE_SPRAWL",
-          "optional": true,
           "partitions": [
             "2026-09-01"
           ]
         }
       ],
       "after": {
-        "_comment": "after the delete files are merged (new_findings on, make gl-plan T=s20 APPLY=1)",
+        "_comment": "after make gl-plan T=s20 APPLY=1: rewrite_position_delete_files merged the 12 into one",
         "expect": []
       }
     },
