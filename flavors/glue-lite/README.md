@@ -1137,3 +1137,28 @@ JOB_TIMEOUT_MIN=20 bash scripts/run-job.sh py build_test_tables.py --only s20
 make gl-scan                       # new findings: s20 2026-09-01 DELETE_FILE_SPRAWL:auto; RETAINED_STORAGE on s12, s14, s19 only
 make gl-step STEP=append-live      # partition holds: both scratch tables HOT_PARTITION:defer -> SMALL_FILES:auto
 ```
+
+## Tracing one table: `make gl-scan TRACE=<table>`
+
+`--trace` prints every step for the named tables, in the order of
+`scan-execution-paths.md`; each line starts with `TRACE <table> |`, so
+`grep TRACE` pulls them out of the job log. Without `--tables`, only the
+traced tables are scanned (a partial scan: the scorecard skips the tables it
+didn't cover, and it becomes the latest scan, so run a full `make gl-scan`
+before `make gl-plan`).
+
+```bash
+make gl-scan TRACE=s20_delete_sprawl                         # unchanged table: the reused path
+make gl-scan TRACE=s20_delete_sprawl SCAN_ARGS=--full        # force the full-measure path (SQL included)
+make gl-scan TRACE=s19_partition_churn,s3_hot_partition
+```
+
+| Step | What it shows |
+|---|---|
+| `table_info`, `previous_scan`, `path` | what was loaded, the last scan of the table, and which path ran (2A full / 2B reused) and why |
+| `partition_metrics`, `sql`, `partition` | the age mode, every probe's SQL with the row it returned, one line per partition |
+| `retained`, `orphans`, `reuse` | the interval-gated probes: run now or carried, and why |
+| `family1*`, `family2*`, `family3` | ledger ingest and check, each new (snapshot, partition) with its label and the partition state change, the learned windows |
+| `table_row` | the row written to ops.table_metrics |
+| `detect`, `rule.*[variant]`, `detect.diff` | per evaluation (today, learned_windows, partition_holds, new_findings): every partition's values and decisions, every table rule's value against its threshold, the findings, and each family's change |
+| `score` | the scorecard verdict |

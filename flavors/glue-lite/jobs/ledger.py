@@ -37,6 +37,7 @@ import random
 from datetime import datetime, timedelta, timezone
 
 import activity as act
+import gltrace as tr
 import windows as win
 
 SNAPSHOT_LOG_DDL = """
@@ -428,6 +429,11 @@ class Ledger:
             self.min_gaps, float(inc.get("hot_gap_factor", 2.0)))
         tm["settle_window_h"], tm["settle_window_source"] = win.learned_settle(
             p99, n_late, float(inc.get("settle_cap_hours", 168)), self.min_batches)
+        tr.log("family3", "learned windows (inputs for detect)", gap_counts=gaps, idle_gaps_dropped=idle,
+               gap_p95_bucket_min=hot_edge, gaps_used=n_hot, gap_lookback_days=gap_days,
+               hot_window_min=tm["hot_window_min"], hot_source=tm["hot_window_source"],
+               lateness_p99_bucket_h=p99, late_batches=n_late, late_lookback_days=late_days,
+               settle_window_h=tm["settle_window_h"], settle_source=tm["settle_window_source"])
 
     def _day_hist(self, uuid, table, bucket_col, n_col, pending_key):
         """{day: {bucket_edge: n}} for one table, back to max_days."""
@@ -473,6 +479,12 @@ class Ledger:
                                   f"AND snapshot_id = {int(sid)} LIMIT 1").collect())
 
         rows, event, new_state = plan_ingest(snaps, state, current, in_ledger)
+        tr.log("family1", "snapshot ledger: " + ("first sight, every retained snapshot ingested" if state is None
+                                                 else f"{len(rows)} snapshot(s) newer than the watermark"),
+               mode=self.mode, event=event, retained_snapshots=len(snaps),
+               watermark_ts_ms=None if not state else state.get("last_ts_ms"))
+        tr.rows("family1.ingest", rows, ["snapshot_id", "operation", "is_writer", "gap_min", "gap_note",
+                                         "added_data_files", "deleted_data_files", "added_files_size"])
         now = datetime.now(timezone.utc)
         for r in rows:
             self.pending["snapshot_log"].append(dict(
@@ -536,6 +548,13 @@ class Ledger:
                 tm["ledger_event"] = event + ",fallback-full"
             else:
                 tm.update({k: v for k, v in led.items() if k in COMPARED})
+        tr.log("family1.check", ("compared with the full path: " + ("agree" if not disagreements else
+                                  f"{len(disagreements)} disagree") if check else "not compared this scan"),
+               why=("shadow" if self.mode == "shadow" else "spot check / reconcile") if check else None,
+               used=("full path (fallback)" if disagreements else "ledger") if self.mode == "on" else "full path",
+               disagreements=[d[:3] for d in disagreements][:5] or None,
+               **{k: led.get(k) for k in ("snapshots", "commits_24h", "overwrite_commits_recent",
+                                          "table_turnover_24h", "minutes_since_writer_commit")})
         self.results.append((table, not disagreements, n_checks, disagreements, len(rows), event))
 
     # -- family 2 ----------------------------------------------------------
@@ -566,8 +585,16 @@ class Ledger:
                 act.label_rows(x, commit_rows, len(live_keys), base_p99, base_n, median_partition_bytes, th,
                                had_snapshots=earlier)
                 rows += commit_rows
+        tr.log("family2", "partition activity: " + (f"{len(new_snaps)} new snapshot(s), manifests they wrote read"
+                                                    if new_snaps else "no new snapshots"),
+               mode=self.mode2, event=event)
+        tr.rows("family2.activity", rows, ["snapshot_id", "operation", "partition_key", "label", "data_files_added",
+                                          "data_files_removed", "delete_files_added", "data_bytes_removed",
+                                          "lateness_h"])
         state = self._partition_state(uuid)
         changed, reopens = act.update_state(state, rows)
+        for pk, v in changed.items():
+            tr.log("family2.state", pk, **v)
         state.update(changed)
         for r in rows:
             self.pending["partition_activity"].append(dict(

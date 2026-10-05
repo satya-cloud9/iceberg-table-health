@@ -22,6 +22,7 @@ import json
 import math
 import re
 
+import gltrace as tr
 import holds as hl
 
 RULE_VERSION = "2.6c-1"
@@ -207,6 +208,15 @@ def partition_findings(table, rows, th, hot_minutes, settle_hours=None, max_sett
             if appends_continue:
                 ev.update(appends_continue=True, compact_older_than_min=hot_minutes)
 
+        tr.log("rule.partition", key, excess=f"{excess} vs min {min_excess} -> small={small}",
+               deletes=f"pos+eq files {del_files}, ratio {del_ratio:.4f} vs {th['delete_ratio']}, eq {eq_files} vs "
+                       f"{th.get('eq_delete_min_files', 5)} -> {deletes}",
+               sprawl=(f"pos files {pos_files} vs {th.get('delete_sprawl_min_files', 10)} -> {sprawl}"
+                       if new_findings else "off"),
+               hot=(f"{hot_reason or 'no hold'}" if revised_holds else
+                    f"minutes {None if minutes is None else round(minutes, 1)} vs {hot_minutes} -> {hot}"),
+               rewrite_rate=r.get("rewrite_rate") if revised_holds else None,
+               hours_since_end=None if r.get("hours_since_end") is None else round(r["hours_since_end"], 1))
         if (small or deletes or sprawl) and hot:
             remedy = (f"wait: {hot_reason}; compact after the hot window ({hot_minutes} min)" if hot_reason else
                       f"wait: last write {ev['minutes_since_update']} min ago "
@@ -266,6 +276,9 @@ def table_findings(table, tm, rows, th, cfg):
     with_excess = sum(1 for r in rows if _num(r.get("excess_files")) >= th["min_excess_files"])
     share = with_excess / parts if parts else 0.0
     avg_parts = _num(tm.get("avg_changed_partitions_per_commit"))
+    tr.log("rule.SCATTERED_SMALL_FILES", partitions_to_compact=f"{with_excess} vs {th['scattered_min_partitions']}",
+           share=f"{share:.3f} vs {th['scattered_partition_share']}",
+           avg_changed_partitions=f"{avg_parts} vs {th['scattered_avg_changed_partitions']}")
     if (with_excess >= th["scattered_min_partitions"] and share >= th["scattered_partition_share"]
             and avg_parts >= th["scattered_avg_changed_partitions"]):
         out.append(_finding(table, "SCATTERED_SMALL_FILES", share / th["scattered_partition_share"],
@@ -275,6 +288,8 @@ def table_findings(table, tm, rows, th, cfg):
     # SNAPSHOT_BUILDUP: too many, or too old, snapshots kept.
     snaps = _num(tm.get("snapshots"))
     age_h = _num(tm.get("oldest_snapshot_age_h"), 0.0)
+    tr.log("rule.SNAPSHOT_BUILDUP", snapshots=f"{snaps} vs {th['max_snapshots']}",
+           oldest_h=f"{age_h} vs {th['max_snapshot_age_h']}")
     if snaps > th["max_snapshots"] or age_h > th["max_snapshot_age_h"]:
         score = max(snaps / th["max_snapshots"], age_h / th["max_snapshot_age_h"])
         out.append(_finding(table, "SNAPSHOT_BUILDUP", score,
@@ -289,6 +304,8 @@ def table_findings(table, tm, rows, th, cfg):
     limit = (int(props.get("commit.manifest.min-count-to-merge", th["manifest_merge_min_count"]))
              if merge_on else th["max_manifests_no_merge"])
     avg_mb = _num(tm.get("avg_manifest_bytes"), 0)
+    tr.log("rule.MANIFEST_BLOAT", data_manifests=f"{manifests} vs {limit}", merge_on=merge_on,
+           avg_manifest_bytes=f"{avg_mb} vs < {th['small_manifest_bytes']}")
     if manifests >= limit and avg_mb < th["small_manifest_bytes"]:
         out.append(_finding(table, "MANIFEST_BLOAT", manifests / limit,
                             {"data_manifests": manifests, "limit": limit,
@@ -300,6 +317,9 @@ def table_findings(table, tm, rows, th, cfg):
     n_ow = _num(tm.get("overwrite_commits_recent"))
     share_ow = _num(tm.get("avg_overwrite_rewrite_share"), 0.0)
     turnover = _num(tm.get("table_turnover_24h"), 0.0)
+    tr.log("rule.REWRITE_CHURN", overwrite_commits=f"{n_ow} vs {th.get('churn_min_commits', 5)}",
+           rewrite_share=f"{share_ow} vs {th.get('churn_rewrite_share', 0.3)}",
+           turnover_24h=f"{turnover} vs {th.get('churn_turnover_24h', 2.0)}")
     if (n_ow >= th.get("churn_min_commits", 5) and share_ow >= th.get("churn_rewrite_share", 0.3)
             and turnover >= th.get("churn_turnover_24h", 2.0)):
         mode = (tm.get("write_merge_mode") or "copy-on-write (default)")
@@ -315,6 +335,7 @@ def table_findings(table, tm, rows, th, cfg):
     versions = _num(tm.get("metadata_versions"))
     max_versions = int(props.get("write.metadata.previous-versions-max", th["max_metadata_versions"]))
     auto_delete = str(props.get("write.metadata.delete-after-commit.enabled", "false")).lower() == "true"
+    tr.log("rule.UNBOUNDED_RETENTION", metadata_versions=f"{versions} vs {max_versions}", delete_after_commit=auto_delete)
     if versions >= max_versions and not auto_delete:
         out.append(_finding(table, "UNBOUNDED_RETENTION", 1 + versions / max(1, max_versions),
                             {"metadata_versions": versions, "previous_versions_max": max_versions,
@@ -322,6 +343,7 @@ def table_findings(table, tm, rows, th, cfg):
 
     # ORPHAN_FILES: objects under the table location nothing references.
     orphans = _num(tm.get("orphan_files"))
+    tr.log("rule.ORPHAN_FILES", orphan_files=f"{orphans} vs {th.get('min_orphan_files', 1)}")
     if orphans >= th.get("min_orphan_files", 1):
         out.append(_finding(table, "ORPHAN_FILES", 1 + orphans / 10,
                             {"orphan_files": orphans, "orphan_bytes": tm.get("orphan_bytes"),
@@ -332,6 +354,8 @@ def table_findings(table, tm, rows, th, cfg):
     # terms (a skewed table of tiny partitions is not worth acting on).
     skew = _num(tm.get("skew_ratio"), 0.0)
     largest = max((_num(r.get("data_bytes")) for r in rows), default=0)
+    tr.log("rule.PARTITION_SKEW", partitions=f"{parts} vs {th['skew_min_partitions']}",
+           skew=f"{skew} vs {th['skew_ratio']}", largest=f"{largest} vs {th['skew_min_largest_targets'] * target}")
     if (parts >= th["skew_min_partitions"] and skew >= th["skew_ratio"]
             and largest >= th["skew_min_largest_targets"] * target):
         out.append(_finding(table, "PARTITION_SKEW", skew / th["skew_ratio"],
@@ -341,6 +365,8 @@ def table_findings(table, tm, rows, th, cfg):
     # OVER_PARTITIONED: most partitions are tiny and there are many of them.
     # Per-partition rules can't see this (each partition holds one file).
     under = _num(tm.get("undersized_partition_share"), 0.0)
+    tr.log("rule.OVER_PARTITIONED", partitions=f"{parts} vs {th['over_partitioned_min_partitions']}",
+           undersized_share=f"{under} vs {th['over_partitioned_share']}")
     if parts >= th["over_partitioned_min_partitions"] and under >= th["over_partitioned_share"]:
         ideal_unpartitioned = max(1, math.ceil(_num(tm.get("data_bytes")) / target))
         out.append(_finding(table, "OVER_PARTITIONED", parts / th["over_partitioned_min_partitions"],
@@ -352,6 +378,7 @@ def table_findings(table, tm, rows, th, cfg):
                                    f"then rewrite to the new spec"))
 
     old_spec = sum(_num(r.get("files_old_spec")) for r in rows)
+    tr.log("rule.MIXED_SPEC", files_old_spec=old_spec)
     if old_spec > 0:
         out.append(_finding(table, "MIXED_SPEC", 1 + old_spec / max(1, _num(tm.get("data_files"), 1)),
                             {"files_old_spec": old_spec, "current_spec_id": tm.get("current_spec_id")}))
@@ -373,6 +400,8 @@ def table_findings(table, tm, rows, th, cfg):
     need = cfg.get("workload_min_evidence", "observed")
     for col, v in sorted(pruning.items()):
         eff = v.get("efficiency")
+        tr.log("rule.POOR_CLUSTERING", col, efficiency=f"{eff} vs {th['min_pruning_efficiency']}",
+               status=v.get("status"), evidence=f"{level} vs needed {need}")
         if v.get("status") != "ok" or eff is None or eff >= th["min_pruning_efficiency"]:
             continue
         f = _finding(table, "POOR_CLUSTERING",
@@ -445,6 +474,9 @@ def late_arrival_findings(table, tm, th, min_batches=20):
     n = _num(tm.get("lateness_p99_batches"))
     long_wait = p99 is not None and n >= min_batches and float(p99) >= th.get("late_arrivals_hours", 24)
     reopens = reopened >= th.get("late_reopened_partitions", 3)
+    tr.log("rule.LATE_ARRIVALS", lateness_p99_h=f"{p99} vs {th.get('late_arrivals_hours', 24)} "
+                                                f"({n} batches vs {min_batches})",
+           reopened=f"{reopened} vs {th.get('late_reopened_partitions', 3)}")
     if not (long_wait or reopens):
         return []
     ev = {"lateness_p95_h": tm.get("lateness_p95_h"), "lateness_p99_h": p99,
@@ -497,6 +529,9 @@ def storage_findings(table, tm, th):
     out = []
     live = _num(tm.get("data_bytes"))
     kept = tm.get("retained_bytes")
+    tr.log("rule.RETAINED_STORAGE", retained=f"{kept} vs {th.get('retained_storage_min_bytes', 1073741824)}",
+           share=(None if not (kept is not None and live) else
+                  f"{kept / live:.2f} vs {th.get('retained_storage_min_share', 1.0)}"))
     if kept is not None and live:
         share = kept / live
         if (kept >= th.get("retained_storage_min_bytes", 1073741824)
@@ -508,6 +543,7 @@ def storage_findings(table, tm, th):
     js, meta = tm.get("metadata_json_bytes"), tm.get("retained_metadata_bytes")
     max_js = th.get("metadata_max_json_bytes", 8388608)
     max_meta = th.get("metadata_max_retained_bytes", 1073741824)
+    tr.log("rule.METADATA_BLOAT", metadata_json=f"{js} vs {max_js}", old_manifests=f"{meta} vs {max_meta}")
     if (js is not None and js >= max_js) or (meta is not None and meta >= max_meta):
         score = max((js or 0) / max_js, (meta or 0) / max_meta)
         out.append(_finding(table, "METADATA_BLOAT", score,
@@ -579,4 +615,9 @@ def evaluate(table, tm, rows, cfg, history=None, actions=None):
                 f["remedy"] = "held: REWRITE_CHURN on this table; fix the write mode first (" + f["remedy"] + ")"
     if cfg.get("learned_windows"):
         apply_acks(out, tm)
+    for f in out:
+        tr.log("rule.result", f"{f['symptom']} {f.get('partition_key') or '(table)'}", action=f["action"],
+               score=f["score"], remedy=f["remedy"][:120])
+    if not out:
+        tr.log("rule.result", "no findings: healthy")
     return out

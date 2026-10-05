@@ -226,8 +226,9 @@ def render(scan_id, results):
     return out
 
 
-def run_scorecard(spark, scan_id, config, expectations):
+def run_scorecard(spark, scan_id, config, expectations, partial=False):
     import gl_common as gl
+    import gltrace as tr
     import probes
 
     sy = f"{gl.OPS_NAMESPACE}.symptoms"
@@ -265,13 +266,17 @@ def run_scorecard(spark, scan_id, config, expectations):
                           float(cfg.get("hot_partition_minutes", 15)), phase,
                           writer_age_min=tmrows[t].get("minutes_since_writer_commit"))
         res["table_name"] = t
+        tr.begin(t)
+        tr.log("score", f"{res['status']} ({phase})", found=res.get("found"), missing=res.get("missing"),
+               unexpected=res.get("unexpected"), notes=res.get("notes"))
+        tr.begin(None)
         res["last_fix"] = last_fix.get(tmrows[t].get("table_uuid")) if phase == "after" else None
         props = json.loads(tmrows[t].get("properties_json") or "{}")
         mode = props.get("advisor.mode") or cfg.get("advisor_mode", "auto")
         res["next"] = next_step(t, [f for f in findings.get(t, [])
                                     if f["action"] not in ("needs-evidence", "advisory")], mode)
         results.append(res)
-    for t in sorted(set(exp_tables) - set(tables)):
+    for t in ([] if partial else sorted(set(exp_tables) - set(tables))):    # a --tables scan covers only some
         results.append({"table_name": t, "status": "MISSING TABLE", "found": [], "missing": [],
                         "unexpected": [], "notes": "not in this scan: run make gl-test-tables",
                         "phase": "before", "last_fix": None, "next": ""})

@@ -21,6 +21,7 @@ from pyspark.sql import functions as F
 
 import gl_common as gl
 import ledger as ledger_mod
+import gltrace as tr
 import probes
 
 PARTITION_METRICS_DDL = """
@@ -186,6 +187,8 @@ def reuse(spark, table, cfg, p, prev_rows, scanned_at, snapshot_source="full"):
         wm = p.get("minutes_since_writer_commit")     # the ledger replaces it (mode "on")
         tm["minutes_since_writer_commit"] = None if wm is None else float(wm) + elapsed
     tm["scan_mode"] = "reused"
+    tr.log("reuse", "previous partition rows copied; ages moved on by elapsed_min", elapsed_min=elapsed,
+           partitions=len(rows))
     return tm, rows
 
 
@@ -226,26 +229,45 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
         cfg = gl.table_config(config, table)
         scanned_at = probes.now_utc()
         t0 = time.perf_counter()
+        tr.begin(table)
         info = probes.table_info(spark, table)
         cfg["target_file_bytes"], cfg["target_source"] = gl.resolve_target(
             config, table, info.get("properties"))
         p = prev.get(table)
+        tr.log("table_info", spec=info.get("spec"), partitioned=info.get("partitioned"),
+               sort_order=info.get("sort_order"), format_version=info.get("format_version"),
+               uuid=info.get("uuid"), metadata_json_bytes=info.get("metadata_json_bytes"),
+               target_file_bytes=cfg["target_file_bytes"], target_source=cfg["target_source"],
+               error=info.get("error"))
+        tr.log("previous_scan", "none (first sight)" if not p else "",
+               **({} if not p else {"scan_id": p.get("scan_id"), "elapsed_min": p.get("elapsed_min"),
+                                    "same_metadata_json": p.get("metadata_location") == info.get("metadata_location"),
+                                    "retained_age_h": p.get("retained_age_h"), "orphan_age_h": p.get("orphan_age_h")}))
         try:
             if (not full and p and info.get("metadata_location")
                     and p["metadata_location"] == info["metadata_location"]):
+                tr.log("path", "2B reused: metadata.json unchanged since the last scan",
+                       snapshot_metrics_from=snap_source)
                 tm, pm_rows = reuse(spark, table, cfg, p, prev_parts.get(table, []), scanned_at, snap_source)
                 rows = [dict(r, scan_id=scan_id, scanned_at=scanned_at, table_name=table) for r in pm_rows]
                 if rows:
                     spark.createDataFrame([as_row(r, pm_schema) for r in rows], pm_schema).writeTo(pm_table).append()
             else:
+                tr.log("path", "2A full measure: " + ("--full" if full else "first scan of this table" if not p
+                                                      else "metadata.json changed"))
                 wm = probes.writer_minutes(spark, table)
                 pm = probes.partition_metrics(spark, table, info, cfg, wm)
                 pm_rows = pm.collect()
+                tr.rows("partition", pm_rows, ["partition_key", "data_files", "data_bytes", "small_files",
+                                               "ideal_files", "excess_files", "oversized_files", "delete_files_pos",
+                                               "delete_files_eq", "delete_records", "records", "minutes_since_update"])
                 out = (pm.withColumn("scan_id", F.lit(scan_id))
                          .withColumn("scanned_at", F.lit(scanned_at).cast("timestamp"))
                          .withColumn("table_name", F.lit(table)))
                 out.select(*[F.col(f.name).cast(f.dataType) for f in pm_schema]).writeTo(pm_table).append()
                 retained_due = due(p, "retained_age_h", cfg.get("retained_bytes_every_hours", 24))
+                tr.log("retained", "measure now (all_files, all_manifests)" if retained_due else "carried from the last scan",
+                       every_hours=cfg.get("retained_bytes_every_hours", 24))
                 tm = probes.table_metrics(spark, table, info, cfg, pm_rows, retained=retained_due)
                 if retained_due:
                     tm["retained_scanned_at"] = scanned_at
@@ -255,10 +277,16 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
                 tm["minutes_since_writer_commit"] = wm
                 tm["scan_mode"] = "full"
                 carry_orphans(tm, p)
+            if tm.get("scan_mode") == "reused":
+                tr.rows("partition", pm_rows, ["partition_key", "data_files", "excess_files", "delete_files_pos",
+                                               "minutes_since_update"])
             acted = acted_since_orphan_scan(p, info.get("uuid"), ages)
-            if cfg.get("orphan_scan", False) and (acted or due(
-                    p, "orphan_age_h", cfg.get("orphan_scan_every_hours", 24),
-                    changed=tm["scan_mode"] == "full")):
+            orphan_due = cfg.get("orphan_scan", False) and (acted or due(
+                p, "orphan_age_h", cfg.get("orphan_scan_every_hours", 24), changed=tm["scan_mode"] == "full"))
+            tr.log("orphans", "list the location now" if orphan_due else "carried from the last listing",
+                   orphan_scan=cfg.get("orphan_scan", False), action_since_listing=acted,
+                   every_hours=cfg.get("orphan_scan_every_hours", 24))
+            if orphan_due:
                 if acted and tm["scan_mode"] == "reused":
                     tm["scan_mode"] = "reused+orphans"
                 try:
@@ -286,6 +314,13 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
                   metadata_location=info.get("metadata_location"),
                   metadata_json_bytes=info.get("metadata_json_bytes"),
                   scan_seconds=round(time.perf_counter() - t0, 2))
+        tr.log("table_row", "written to ops.table_metrics", **{k: tm.get(k) for k in (
+            "scan_mode", "partitions", "data_files", "data_bytes", "excess_files_total", "delete_files",
+            "snapshots", "oldest_snapshot_age_h", "commits_24h", "data_manifests", "metadata_versions",
+            "retained_bytes", "retained_metadata_bytes", "metadata_json_bytes", "overwrite_commits_recent",
+            "avg_overwrite_rewrite_share", "table_turnover_24h", "minutes_since_writer_commit", "orphan_files",
+            "ledger_event", "activity_event", "hot_window_min", "settle_window_h", "load_error")})
+        tr.begin(None)
         spark.createDataFrame([as_row(tm, tm_schema)], tm_schema).writeTo(tm_table).append()
         summary.append(tm)
         modes[tm.get("scan_mode", "full")] = modes.get(tm.get("scan_mode", "full"), 0) + 1

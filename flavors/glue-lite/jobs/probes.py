@@ -13,6 +13,8 @@ import json
 import math
 from datetime import datetime, timezone
 
+import gltrace as tr
+
 # Table properties that drive write-configuration findings (W1).
 WATCHED_PROPS = [
     "format-version",
@@ -122,7 +124,10 @@ def partition_metrics(spark, table, info, cfg, table_writer_minutes="compute"):
         w_join = ""
         age_sql = ("CAST(NULL AS DOUBLE)" if table_writer_minutes is None
                    else f"CAST({table_writer_minutes} AS DOUBLE)")
-    return spark.sql(f"""
+    tr.log("partition_metrics", "age per partition from all_entries" if per_partition_age else
+           "every partition gets the table's writer age (last writer commit outside the hot window)",
+           writer_minutes=table_writer_minutes, hot_window_min=hot, small_below=small, oversized_above=oversized)
+    q = f"""
         WITH f AS (
             SELECT {pk} AS partition_key, content, file_size_in_bytes, record_count,
                    spec_id, sort_order_id
@@ -170,11 +175,15 @@ def partition_metrics(spark, table, info, cfg, table_writer_minutes="compute"):
                CAST({target} AS BIGINT) AS target_file_bytes
         FROM a {p_join} {w_join}
         ORDER BY a.partition_key
-    """)
+    """
+    tr.sql(q)
+    return spark.sql(q)
 
 
 def _one(spark, sql):
-    return spark.sql(sql).collect()[0]
+    r = spark.sql(sql).collect()[0]
+    tr.sql(sql, r.asDict())
+    return r
 
 
 def column_types(spark, table):

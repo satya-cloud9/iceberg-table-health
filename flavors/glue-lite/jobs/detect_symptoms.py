@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pyspark.sql import SparkSession
 
 import gl_common as gl
+import gltrace as tr
 import holds as hl
 import probes
 import symptom_rules
@@ -245,6 +246,11 @@ def run_detect(spark, scan_id, config, report=True):
     for tm in sorted(tms, key=lambda t: t["table_name"]):
         table, uuid = tm["table_name"], tm.get("table_uuid")
         cfg = gl.table_config(config, table)
+        tr.begin(table)
+        tr.log("detect", "inputs", partitions=len(parts.get(table, [])), history_scans=len(history.get(uuid, [])),
+               actions=len(actions.get(uuid, [])), hot_partition_minutes=cfg.get("hot_partition_minutes"),
+               families=f"learned_windows={mode3} partition_holds={mode4} new_findings={mode5}")
+        tr.variant("today")
         current = symptom_rules.evaluate(table, tm, parts.get(table, []), cfg,
                                          history=history.get(uuid, []), actions=actions.get(uuid, []))
         mine, rows_used = current, parts.get(table, [])
@@ -256,9 +262,15 @@ def run_detect(spark, scan_id, config, report=True):
             rows2 = win.learned_rows(parts.get(table, []), pstate[uuid],
                                      json.loads(tm.get("partition_fields_json") or "[]"), tm["scanned_ms"],
                                      compactions.get(uuid, {}), late_hists.get(uuid, {}))
+            tr.variant("learned_windows")
+            tr.log("detect", "learned windows", hot_window_min=tm["hot_window_min"],
+                   settle_window_h=tm.get("settle_window_h"))
+            tr.rows("detect.learned_rows", rows2, ["partition_key", "minutes_since_update", "hours_since_end",
+                                                   "compactions_since_end", "p_more_late", "last_write_label"])
             learned = symptom_rules.evaluate(table, tm, rows2, cfg2,
                                              history=history.get(uuid, []), actions=actions.get(uuid, []))
             d = win.diff(current, learned)
+            tr.log("detect.diff", "learned_windows: " + ("; ".join(d) if d else "no change"))
             changes.append((tm, d))
             if mode3 == "on":
                 mine, cfg, rows_used = learned, cfg2, rows2
@@ -266,9 +278,14 @@ def run_detect(spark, scan_id, config, report=True):
             # GL2.6b: the same rules as the findings above, with the revised holds
             fields = json.loads(tm.get("partition_fields_json") or "[]")
             rows4 = hl.holds_rows(rows_used, pstate[uuid], hold_act.get(uuid, {}), fields, tm["scanned_ms"])
+            tr.variant("partition_holds")
+            tr.rows("detect.holds_rows", rows4, ["partition_key", "minutes_since_update", "hours_since_end",
+                                                 "minutes_since_conflict", "removed_bytes_window",
+                                                 "rewrite_commits_window", "rewrite_rate"])
             revised = symptom_rules.evaluate(table, tm, rows4, dict(cfg, revised_holds=True),
                                              history=history.get(uuid, []), actions=actions.get(uuid, []))
             d4 = hl.diff_actions(mine, revised)
+            tr.log("detect.diff", "partition_holds: " + ("; ".join(d4) if d4 else "no change"))
             churny = [r for r in rows4 if (r.get("rewrite_rate") or 0) >= cfg["thresholds"].get("churn_partition_rate", 1.0)]
             note = (f"hot {float(cfg.get('hot_partition_minutes', 15)):g} min; "
                     f"{len(churny)} partition(s) at rewrite rate >= "
@@ -278,15 +295,22 @@ def run_detect(spark, scan_id, config, report=True):
                 mine, cfg, rows_used = revised, dict(cfg, revised_holds=True), rows4
         if mode5 != "off":
             # GL2.6c: the same rules plus DELETE_FILE_SPRAWL, RETAINED_STORAGE, METADATA_BLOAT
+            tr.variant("new_findings")
             added = symptom_rules.evaluate(table, tm, rows_used, dict(cfg, new_findings=True),
                                            history=history.get(uuid, []), actions=actions.get(uuid, []))
             d5 = hl.diff_actions(mine, added)
+            tr.log("detect.diff", "new_findings: " + ("; ".join(d5) if d5 else "no change"))
             note = (f"old snapshots keep {_mb(tm.get('retained_bytes'))} (live {_mb(tm.get('data_bytes'))}); "
                     f"metadata.json {_mb(tm.get('metadata_json_bytes'))}; "
                     f"old manifests {_mb(tm.get('retained_metadata_bytes'))}")
             new_changes.append((tm, d5, note))
             if mode5 == "on":
                 mine = added
+        tr.variant("")
+        tr.log("detect", f"recorded: {len(mine)} finding(s) from "
+               + ("today's rules" if mine is current else "the families switched on"),
+               symptoms=sorted({f['symptom'] for f in mine}))
+        tr.begin(None)
         findings += mine
     if mode3 != "off":
         record_window_changes(spark, scan_id, detected_at, mode3, changes, report)

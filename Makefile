@@ -93,6 +93,9 @@ gl-demo:
 #   make gl-scan                     metrics + symptoms + scorecard in one job (s3 measured first)
 #   make gl-scan FRESH_S3=1          rebuild s3 first so its hot partition is checkable (~4 min more)
 #   make gl-scan SCAN_ARGS=--full    measure every table, even unchanged ones
+#   make gl-scan TRACE=s20_delete_sprawl   scan only that table, printing every step (TRACE lines);
+#                                    TRACE=a,b for several; add SCAN_ARGS=--full to force the full-measure path
+#   make gl-scan SCAN_ARGS="--tables s19_partition_churn"   scan only some tables (no trace)
 #   make gl-plan T=s0                print the fix plan for s0 from the latest scan (dry run)
 #   make gl-plan T=s0 APPLY=1        run the plan's auto steps -> glue.ops.actions
 #   make gl-step STEP=s12-mor        scripted approval step for a scenario (see scenario_step.py)
@@ -101,6 +104,7 @@ gl-demo:
 #   make gl-bench BENCH_LABEL=before BENCH_ARGS="--table glue.demo.s0_small_appends"
 #   make gl-test-tables TT_ARGS="--only s0,s4"
 TT_ARGS ?=
+TRACE ?=
 METRIC_ARGS ?=
 SYM_ARGS ?=
 SCAN_ARGS ?=
@@ -126,7 +130,7 @@ gl-scan:
 ifeq ($(FRESH_S3),1)
 	JOB_TIMEOUT_MIN=15 bash flavors/glue-lite/scripts/run-job.sh py build_test_tables.py --only s3
 endif
-	bash flavors/glue-lite/scripts/run-job.sh py gl_scan.py $(SCAN_ARGS)
+	bash flavors/glue-lite/scripts/run-job.sh py gl_scan.py $(SCAN_ARGS) $(if $(TRACE),--trace $(TRACE))
 
 gl-sql:
 	bash flavors/glue-lite/scripts/run-job.sh py run_sql.py -e "$(Q)"

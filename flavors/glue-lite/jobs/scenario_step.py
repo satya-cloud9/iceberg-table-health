@@ -173,7 +173,7 @@ def append_live(spark, args):
         print(f"  {t}: rebuilt; 1 healthy file + 6 small appends into {d}", flush=True)
     config = gl.load_config(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "health.json"))
     scan_id = run_scan(spark, NS, config, tables=names, report=False)
-    run_detect(spark, scan_id, config, report=False)
+    run_detect(spark, scan_id, config, report=True)
     print("  look for '=== Partition holds (shadow)' above: live_append_unpart {} and live_append_days "
           "2026-09-03 HOT_PARTITION:defer -> SMALL_FILES:auto", flush=True)
 
