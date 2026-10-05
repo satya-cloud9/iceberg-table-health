@@ -454,8 +454,13 @@ def s20_delete_sprawl(b, args):
     so nothing fires today, yet every read of the day opens 12 delete files.
     DELETE_FILE_SPRAWL (new-findings shadow) merges them without rewriting data."""
     t = f"{NS}.s20_delete_sprawl"
+    # partition-scoped delete files: since Iceberg 1.8 Spark folds a data file's
+    # earlier file-scoped deletes into each new one (at most one delete file per
+    # data file), so sprawl only builds up with partition granularity, other
+    # engines (Trino, Flink) or older Spark; this reproduces that layout
     b.create(t, "days(occurred_at)", {"format-version": "2", "write.delete.mode": "merge-on-read",
-                                      "write.update.mode": "merge-on-read", "write.merge.mode": "merge-on-read"})
+                                      "write.update.mode": "merge-on-read", "write.merge.mode": "merge-on-read",
+                                      "write.delete.granularity": "partition"})
     first = b.next_id
     b.day(t, date(2026, 9, 1), 100_000)
     for i in range(12):

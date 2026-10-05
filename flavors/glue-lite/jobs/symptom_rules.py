@@ -500,8 +500,8 @@ def storage_findings(table, tm, th):
     if kept is not None and live:
         share = kept / live
         if (kept >= th.get("retained_storage_min_bytes", 1073741824)
-                and share >= th.get("retained_storage_min_share", 0.5)):
-            out.append(_finding(table, "RETAINED_STORAGE", share / th.get("retained_storage_min_share", 0.5),
+                and share >= th.get("retained_storage_min_share", 1.0)):
+            out.append(_finding(table, "RETAINED_STORAGE", share / th.get("retained_storage_min_share", 1.0),
                                 {"retained_bytes": int(kept), "live_bytes": int(live), "share": round(share, 2),
                                  "snapshots": tm.get("snapshots"),
                                  "oldest_snapshot_age_h": tm.get("oldest_snapshot_age_h")}))

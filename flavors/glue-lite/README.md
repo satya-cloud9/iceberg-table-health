@@ -1088,7 +1088,7 @@ added, and records it in `glue.ops.incremental_check` (family `new_findings`).
 | Finding | Fires when | Action |
 |---|---|---|
 | DELETE_FILE_SPRAWL | a partition has ≥ `delete_sprawl_min_files` (10) position delete files but its delete ratio is under DELETE_BUILDUP's 5% | auto: `rewrite_position_delete_files` scoped to the partition, no data rewrite |
-| RETAINED_STORAGE | bytes only old snapshots reference (M16) ≥ `retained_storage_min_bytes` and ≥ `retained_storage_min_share` (50%) of the live bytes | approval: expire to the policy age now; shorten the policy if it stays high |
+| RETAINED_STORAGE | bytes only old snapshots reference (M16) ≥ `retained_storage_min_bytes` and ≥ `retained_storage_min_share` (1.0 = more than one extra copy) of the live bytes | approval: expire to the policy age now; shorten the policy if it stays high |
 | METADATA_BLOAT | current metadata.json (M35) ≥ `metadata_max_json_bytes`, or manifests only old snapshots reference (M36) ≥ `metadata_max_retained_bytes` | approval: delete-after-commit if off; shorter retention or fewer commits upstream |
 
 Byte limits are test scale, 1/64 of the production placeholders (1 GiB,
@@ -1110,4 +1110,30 @@ make gl-image
 JOB_TIMEOUT_MIN=20 bash scripts/run-job.sh py build_test_tables.py --only s20
 make gl-scan SCAN_ARGS=--full     # every table measured, so M36 exists everywhere
 make gl-step STEP=append-live     # revised hot hold while appends continue
+```
+
+### First shadow run, and two corrections (GL2.6c+)
+
+- **s20 found nothing: Iceberg 1.10 folds position deletes.** Since 1.8, when
+  Spark writes a position delete for a data file it rewrites that file's
+  earlier file-scoped deletes into the new one, so a data file never has more
+  than one (s2 shows it too: 10 DELETEs, one delete file per day). Delete-file
+  sprawl now comes from partition-scoped deletes, other engines (Trino, Flink)
+  or older Spark. s20 now sets `write.delete.granularity = partition`, which
+  reproduces that layout: 12 DELETEs, 12 delete files.
+- **RETAINED_STORAGE flagged a table right after one compaction** (s18: the
+  pre-compaction files, 0.5x the live bytes, kept for the retention window).
+  One extra copy is the normal cost of time travel, not a reason to shorten the
+  policy, so `retained_storage_min_share` is now 1.0: more than one extra copy
+  (s12 12x, s19 1.1x, s14 1.0x still fire; s18 doesn't).
+- **append-live uses its own scratch tables** (`live_append_unpart`,
+  `live_append_days`, rebuilt each run, not scored), with 6 small appends so
+  the appended day is over min_excess_files: on the compacted s0 and s7, 3
+  appends left only 3 excess files, so neither rule had anything to hold.
+
+```bash
+make gl-image
+JOB_TIMEOUT_MIN=20 bash scripts/run-job.sh py build_test_tables.py --only s20
+make gl-scan                       # new findings: s20 2026-09-01 DELETE_FILE_SPRAWL:auto; RETAINED_STORAGE on s12, s14, s19 only
+make gl-step STEP=append-live      # partition holds: both scratch tables HOT_PARTITION:defer -> SMALL_FILES:auto
 ```

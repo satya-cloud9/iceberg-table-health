@@ -25,14 +25,15 @@ Steps:
   expire-gap (GL2.5m) 10 commits into s17, then expire all but the current
             snapshot before any scan: the next scan must report a ledger gap.
 
-  append-live (GL2.6b) a writer still appending: 3 small appends into s7_unpartitioned
-            and into s0_small_appends' 2026-09-03 (a day long ended), then scan
-            and detect those two tables in the same job, inside the hot window.
-            Today's hot hold defers both; the revised holds (shadow) should not:
-            s7 "{}" and s0 2026-09-03 HOT_PARTITION:defer -> SMALL_FILES:auto.
-            Not recorded as an action. The scan covers only these two tables, so
-            run make gl-scan afterwards (once the hot window has passed) before
-            make gl-plan, which reads the latest scan.
+  append-live (GL2.6b) a writer still appending: rebuilds two scratch tables,
+            glue.demo.live_append_unpart (unpartitioned) and live_append_days
+            (by day), each 1 healthy file + 6 small appends into 2026-09-03 (a
+            day long ended), then scans and detects them in the same job, inside
+            the hot window. Today's hot hold defers both; the revised holds
+            (shadow) should not: HOT_PARTITION:defer -> SMALL_FILES:auto. The
+            scratch tables aren't in expectations.json, so the scorecard ignores
+            them. The scan covers only these two tables, so run make gl-scan
+            afterwards before make gl-plan, which reads the latest scan.
 
 Usage (via scripts/run-job.sh py scenario_step.py ...):
   scenario_step.py s12-mor [--hot-minutes 3]
@@ -151,19 +152,30 @@ def expire_gap(spark, args):
 
 
 def append_live(spark, args):
+    """Two scratch tables (not in expectations.json, so the scorecard ignores
+    them and the fixed scenario tables keep their 'after' state): one
+    unpartitioned, one by day. Each gets one healthy file, then 6 small appends
+    (5 excess files, over min_excess_files) into a long-ended day; then the two
+    are scanned and detected in this job, inside the hot window."""
     from datetime import date
     from detect_symptoms import run_detect
     from scan_metrics import run_scan
     b = Builder(spark)
     b.next_id = 70_000_000 + int(time.time()) % 1_000_000 * 100
-    for t, d in ((f"{NS}.s7_unpartitioned", date(2026, 9, 2)), (f"{NS}.s0_small_appends", date(2026, 9, 3))):
-        b.fragment(t, d, commits=3, files_per_commit=1, rows_per_commit=500)
-        print(f"  {t}: 3 small appends into {d}", flush=True)
+    d = date(2026, 9, 3)
+    names = []
+    for name, spec in (("live_append_unpart", ""), ("live_append_days", "days(occurred_at)")):
+        t = f"{NS}.{name}"
+        b.create(t, spec, {})
+        b.day(t, d, 100_000)
+        b.fragment(t, d, commits=6, files_per_commit=1, rows_per_commit=500)
+        names.append(name)
+        print(f"  {t}: rebuilt; 1 healthy file + 6 small appends into {d}", flush=True)
     config = gl.load_config(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "health.json"))
-    scan_id = run_scan(spark, NS, config, tables=["s7_unpartitioned", "s0_small_appends"], report=False)
+    scan_id = run_scan(spark, NS, config, tables=names, report=False)
     run_detect(spark, scan_id, config, report=False)
-    print("  look for '=== Partition holds (shadow)' above: s7 {} and s0 2026-09-03 "
-          "HOT_PARTITION:defer -> SMALL_FILES:auto", flush=True)
+    print("  look for '=== Partition holds (shadow)' above: live_append_unpart {} and live_append_days "
+          "2026-09-03 HOT_PARTITION:defer -> SMALL_FILES:auto", flush=True)
 
 
 STEPS = {"append-live": append_live, "s12-mor": s12_mor, "grow": grow, "rollback": rollback, "expire-gap": expire_gap}
