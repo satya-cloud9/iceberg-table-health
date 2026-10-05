@@ -243,13 +243,16 @@ def run_detect(spark, scan_id, config, report=True):
     hold_changes = []
     mode5 = mode_of(config, "new_findings")
     new_changes = []
+    mode6 = mode_of(config, "expiry_policy")
+    exp_changes = []
     for tm in sorted(tms, key=lambda t: t["table_name"]):
         table, uuid = tm["table_name"], tm.get("table_uuid")
         cfg = gl.table_config(config, table)
         tr.begin(table)
         tr.log("detect", "inputs", partitions=len(parts.get(table, [])), history_scans=len(history.get(uuid, [])),
                actions=len(actions.get(uuid, [])), hot_partition_minutes=cfg.get("hot_partition_minutes"),
-               families=f"learned_windows={mode3} partition_holds={mode4} new_findings={mode5}")
+               families=f"learned_windows={mode3} partition_holds={mode4} new_findings={mode5} "
+                        f"expiry_policy={mode6}")
         tr.variant("today")
         current = symptom_rules.evaluate(table, tm, parts.get(table, []), cfg,
                                          history=history.get(uuid, []), actions=actions.get(uuid, []))
@@ -305,7 +308,20 @@ def run_detect(spark, scan_id, config, report=True):
                     f"old manifests {_mb(tm.get('retained_metadata_bytes'))}")
             new_changes.append((tm, d5, note))
             if mode5 == "on":
-                mine = added
+                mine, cfg = added, dict(cfg, new_findings=True)
+        if mode6 != "off" and tm.get("policy_age_h") is not None:
+            # GL2.6e: SNAPSHOT_BUILDUP by retention policy (expiry.py), STALE_REF
+            tr.variant("expiry_policy")
+            pol = symptom_rules.evaluate(table, tm, rows_used, dict(cfg, expiry_policy=True),
+                                         history=history.get(uuid, []), actions=actions.get(uuid, []))
+            d6 = hl.diff_actions(mine, pol)
+            tr.log("detect.diff", "expiry_policy: " + ("; ".join(d6) if d6 else "no change"))
+            note = (f"{tm.get('write_category')}: {tm.get('policy_age_h'):g} h / keep {tm.get('policy_min_keep')} "
+                    f"[{tm.get('policy_source')}]; {tm.get('snapshots')} snapshots, "
+                    f"{tm.get('expirable_snapshots')} expirable; refs {tm.get('refs_json')}")
+            exp_changes.append((tm, d6, note))
+            if mode6 == "on":
+                mine = pol
         tr.variant("")
         tr.log("detect", f"recorded: {len(mine)} finding(s) from "
                + ("today's rules" if mine is current else "the families switched on"),
@@ -319,6 +335,9 @@ def run_detect(spark, scan_id, config, report=True):
     if mode5 != "off":
         record_holds_changes(spark, scan_id, detected_at, mode5, new_changes, report,
                              family="new_findings", title="New findings", baseline="today's findings")
+    if mode6 != "off":
+        record_holds_changes(spark, scan_id, detected_at, mode6, exp_changes, report,
+                             family="expiry_policy", title="Expiry by policy", baseline="count/age rule")
 
     print(f"=== Symptoms for scan {scan_id}: {len(findings)} findings over {len(tms)} tables ===",
           flush=True)

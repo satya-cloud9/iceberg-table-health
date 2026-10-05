@@ -36,6 +36,11 @@ this schema make 1 MB, so a "healthy day" of 100,000 rows is one ~3.8 MB file.
   s20_delete_sprawl    merge-on-read, one healthy day, 12 single-row DELETEs
                                                                   -> nothing today (0.01% deleted);
                        DELETE_FILE_SPRAWL in the new-findings shadow (12 position delete files)
+  s21_expiry_policy    history.expire.max-snapshot-age-ms = 10 min, min-snapshots-to-keep 3,
+                       15 small appends, a tag on the 3rd snapshot
+                                                                  -> SMALL_FILES today; in the expiry
+                       shadow, once 10 min old: SNAPSHOT_BUILDUP by policy (the tagged snapshot and
+                       the newest 3 kept), and STALE_REF once the tag is over 1 h old (test scale)
 
 Every build gets a fresh location (<warehouse>/demo.db/<table>-<stamp>):
 DROP ... PURGE only deletes files the old table still references, so reusing
@@ -469,6 +474,29 @@ def s20_delete_sprawl(b, args):
     return t
 
 
+def s21_expiry_policy(b, args):
+    """Expiry by policy (GL2.6e). The writer declares its own retention in the
+    table properties (10 minutes, keep 3), which wins over the advisor's batch
+    default (120 h / 10). 15 appends, so 16 snapshots: well under today's count
+    threshold (30), so today's rule never expires them; under the policy, every
+    snapshot older than 10 minutes beyond the newest 3 is expirable, except the
+    one the tag points at (expire_snapshots never removes a ref's snapshot). The
+    tag has no retention of its own, so once it is older than stale_ref_hours it
+    is STALE_REF. The summary formula for retained bytes reports unknown here
+    (a ref other than main)."""
+    t = f"{NS}.s21_expiry_policy"
+    b.create(t, "days(occurred_at)", {"history.expire.max-snapshot-age-ms": str(10 * 60 * 1000),
+                                      "history.expire.min-snapshots-to-keep": "3"})
+    for i in range(15):
+        b.day(t, date(2026, 9, 1), 2_000)
+        if i == 2:
+            sid = b.spark.sql(f"SELECT snapshot_id FROM {t}.snapshots ORDER BY committed_at DESC LIMIT 1") \
+                .collect()[0].snapshot_id
+            b.spark.sql(f"ALTER TABLE {t} CREATE TAG release_1 AS OF VERSION {sid}")
+    b.finish(t)
+    return t
+
+
 def s17_growing(b, args):
     t = f"{NS}.s17_growing"
     b.create(t, "days(occurred_at)", {})
@@ -514,6 +542,7 @@ BUILDERS = {
     "s18": s18_sorted_small,
     "s19": s19_partition_churn,
     "s20": s20_delete_sprawl,
+    "s21": s21_expiry_policy,
     "s3": s3_hot_partition,      # keep last
 }
 

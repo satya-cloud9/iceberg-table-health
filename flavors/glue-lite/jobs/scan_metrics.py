@@ -66,7 +66,10 @@ TABLE_METRICS_DDL = """
     full_refresh_avg_bytes BIGINT, retained_full_copies BIGINT, pre_refresh_snapshot_ms BIGINT,
     lateness_p99_batches BIGINT, lateness_lookback_days BIGINT, hot_gap_p95_min DOUBLE, hot_gaps_used BIGINT,
     idle_gaps_ignored BIGINT, gap_lookback_days BIGINT, metadata_json_bytes BIGINT,
-    retained_metadata_bytes BIGINT"""
+    retained_metadata_bytes BIGINT, policy_age_h DOUBLE, policy_min_keep BIGINT, policy_source STRING,
+    write_category STRING, writer_commits_24h BIGINT, expirable_snapshots BIGINT,
+    oldest_expirable_age_h DOUBLE, refs_json STRING, stale_refs_json STRING, stale_refs BIGINT,
+    retained_bytes_ledger BIGINT, retained_ledger_note STRING, metadata_json_files BIGINT"""
 
 
 def coerce(value, data_type):
@@ -102,9 +105,9 @@ def load_previous(spark, tm_table, pm_table, namespace):
         SELECT * FROM (
             SELECT t.*,
                    row_number() OVER (PARTITION BY table_name ORDER BY scanned_at DESC) AS rn,
-                   (unix_timestamp(current_timestamp()) - unix_timestamp(scanned_at)) / 60.0 AS elapsed_min,
-                   (unix_timestamp(current_timestamp()) - unix_timestamp(orphan_scanned_at)) / 3600.0 AS orphan_age_h,
-                   (unix_timestamp(current_timestamp()) - unix_timestamp(retained_scanned_at)) / 3600.0
+                   (unix_millis(current_timestamp()) - unix_millis(scanned_at)) / 60000.0 AS elapsed_min,
+                   (unix_millis(current_timestamp()) - unix_millis(orphan_scanned_at)) / 3600000.0 AS orphan_age_h,
+                   (unix_millis(current_timestamp()) - unix_millis(retained_scanned_at)) / 3600000.0
                        AS retained_age_h
             FROM {tm_table} t
             WHERE load_error IS NULL AND metadata_location IS NOT NULL
@@ -128,7 +131,7 @@ def action_ages(spark):
     try:
         return {r.table_uuid: float(r.age_min) for r in spark.sql(f"""
             SELECT table_uuid,
-                   (unix_timestamp(current_timestamp()) - unix_timestamp(max(started_at))) / 60.0 AS age_min
+                   (unix_millis(current_timestamp()) - unix_millis(max(started_at))) / 60000.0 AS age_min
             FROM {ops}.actions WHERE table_uuid IS NOT NULL GROUP BY table_uuid""").collect()}
     except Exception:          # no actions table yet
         return {}
@@ -154,7 +157,7 @@ def due(p, age_key, every_hours, changed=True):
 
 def carry_orphans(tm, p):
     if p:
-        for k in ("orphan_files", "orphan_bytes", "listed_objects", "orphan_sample", "orphan_error",
+        for k in ("orphan_files", "orphan_bytes", "listed_objects", "orphan_sample", "orphan_error", "metadata_json_files",
                   "orphan_scanned_at"):
             tm.setdefault(k, p.get(k))
 
@@ -265,12 +268,18 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
                          .withColumn("scanned_at", F.lit(scanned_at).cast("timestamp"))
                          .withColumn("table_name", F.lit(table)))
                 out.select(*[F.col(f.name).cast(f.dataType) for f in pm_schema]).writeTo(pm_table).append()
-                retained_due = due(p, "retained_age_h", cfg.get("retained_bytes_every_hours", 24))
-                tr.log("retained", "measure now (all_files, all_manifests)" if retained_due else "carried from the last scan",
-                       every_hours=cfg.get("retained_bytes_every_hours", 24))
+                rmode = str(cfg.get("retained_bytes", "full"))
+                retained_due = rmode == "full" and due(p, "retained_age_h", cfg.get("retained_bytes_every_hours", 24))
+                tr.log("retained", "measure now (all_files, all_manifests)" if retained_due else
+                       ("carried from the last scan" if rmode == "full" else
+                        f"not measured (retained_bytes={rmode}: the ledger's summary formula fills it in)"),
+                       every_hours=cfg.get("retained_bytes_every_hours", 24), mode=rmode)
                 tm = probes.table_metrics(spark, table, info, cfg, pm_rows, retained=retained_due)
                 if retained_due:
                     tm["retained_scanned_at"] = scanned_at
+                    tm["_retained_fresh"] = True          # the ledger compares its formula with it
+                elif rmode != "full":
+                    tm["retained_bytes"] = tm["retained_metadata_bytes"] = None
                 elif p:
                     tm["retained_bytes"], tm["retained_scanned_at"] = p.get("retained_bytes"), p.get("retained_scanned_at")
                     tm["retained_metadata_bytes"] = p.get("retained_metadata_bytes")

@@ -342,6 +342,34 @@
         "expect": []
       }
     },
+    "glue.demo.s21_expiry_policy": {
+      "_comment": "GL2.6e: the writer's own retention (10 min, keep 3) wins. Today: SMALL_FILES only (16 snapshots < 30). In the expiry-policy shadow, once 10 minutes old: SNAPSHOT_BUILDUP (12 expirable: 16 minus the newest 3 minus the tagged one), and STALE_REF once the tag is over 1 h old; optional here so the check holds in both modes.",
+      "expect": [
+        {
+          "symptom": "SMALL_FILES",
+          "partitions": [
+            "2026-09-01"
+          ]
+        },
+        {
+          "symptom": "SNAPSHOT_BUILDUP",
+          "optional": true
+        },
+        {
+          "symptom": "STALE_REF",
+          "optional": true
+        }
+      ],
+      "after": {
+        "_comment": "after make gl-plan T=s21 APPLY=1 (with expiry_policy on): compacted, expired to the policy; the tag still holds its snapshot",
+        "expect": [
+          {
+            "symptom": "STALE_REF",
+            "optional": true
+          }
+        ]
+      }
+    },
     "glue.demo.s17_growing": {
       "_comment": "MAINTENANCE_LAG needs three scans with excess files rising (scan / make gl-step STEP=grow / scan / grow / scan); it's optional here so every scan in that sequence passes. Check the per-table output of the third scan for it. Two grow steps add 20 commits, so SNAPSHOT_BUILDUP may appear too.",
       "expect": [

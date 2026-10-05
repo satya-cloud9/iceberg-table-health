@@ -1159,6 +1159,7 @@ make gl-scan TRACE=s19_partition_churn,s3_hot_partition
 | `partition_metrics`, `sql`, `partition` | the age mode, every probe's SQL with the row it returned, one line per partition |
 | `retained`, `orphans`, `reuse` | the interval-gated probes: run now or carried, and why |
 | `family1*`, `family2*`, `family3` | ledger ingest and check, each new (snapshot, partition) with its label and the partition state change, the learned windows |
+| `expiry`, `retained_ledger` | the retention policy and its source, the category, expirable snapshots, refs; retained bytes from summaries vs the full query (GL2.6e) |
 | `table_row` | the row written to ops.table_metrics |
 | `detect`, `rule.*[variant]`, `detect.diff` | per evaluation (today, learned_windows, partition_holds, new_findings): every partition's values and decisions, every table rule's value against its threshold, the findings, and each family's change |
 | `score` | the scorecard verdict |
@@ -1207,4 +1208,57 @@ make gl-scan                       # the scorecard is scored on the switched-on 
 make gl-plan T=s19                 # dry run: 5 days in the rewrite, 2026-09-06 under "hold"
 make gl-plan T=s20 APPLY=1         # rewrite_position_delete_files only, no rewrite_data_files
 make gl-scan                       # s20 after: PASS (one delete file left)
+```
+
+## GL2.6e — Expiry by policy (shadow), refs, retained bytes from snapshot summaries
+
+**Policy, not counts** (`expiry.py`). What may be expired comes from a retention
+policy; snapshot count stays as evidence. First match wins:
+
+1. the table's own `history.expire.max-snapshot-age-ms` / `history.expire.min-snapshots-to-keep`
+2. `advisor.expire.max-age-hours` / `advisor.expire.min-snapshots` (table properties for the advisor only)
+3. `defaults.expiry.<category>`: **batch** 120 h / keep 10, **streaming** 72 h / keep 10;
+   streaming = at least `streaming_min_commits_24h` (48) writer commits in the last 24 h
+
+and never below `inflight_floor_hours` (production 24 h; **test scale 0.05 h**): a
+long query or write still needs its starting snapshot.
+
+In the new shadow family `incremental.expiry_policy`, SNAPSHOT_BUILDUP fires when
+the policy would expire at least `expire_min_snapshots` snapshots: older than the
+policy age, beyond the newest `min_keep` ancestors, and not pointed at by a tag
+or branch (expire_snapshots never removes those). The plan then expires to the
+policy (`older_than = now − age`, `retain_last = min_keep`).
+
+**STALE_REF** (approval): a tag or branch other than main whose head is older
+than `stale_ref_hours` (production ~720; **test scale 1 h**) and that has no
+retention of its own; it keeps its files alive. Suggested fix: drop it, or give
+it a retention.
+
+**Retained bytes from summaries.** In a straight-line history, the bytes only
+old snapshots keep alive = Σ `removed-files-size` over the current snapshot's
+retained ancestors, except the oldest. That is metadata the scan already holds,
+so it costs nothing. It is "unknown" when refs other than main exist, when
+snapshots sit off the current lineage, or when a snapshot has no size summary.
+`retained_bytes`: `full` (today's query, now also compared with the formula:
+`=== Retained bytes, summary formula vs full query ===` and
+`incremental_check` family `retained_ledger`), `ledger` (formula only) or `off`.
+Kept at `full` until the comparison agrees on the cluster.
+
+Also: the orphan listing counts `*.metadata.json` files in storage
+(`metadata_json_files`, the A9 check after delete-after-commit), and probe ages
+use millisecond timestamps (an action and an orphan listing in the same second
+could re-list once more).
+
+New scenario **s21_expiry_policy**: the writer's own retention (10 min, keep 3),
+16 snapshots, a tag on the 3rd. Today: SMALL_FILES only (16 < 30 snapshots).
+Shadow, once 10 minutes old: `(table): - -> SNAPSHOT_BUILDUP:auto` (12
+expirable: 16 − newest 3 − the tagged one); STALE_REF once the tag is over 1 h
+old. Expected shadow lines elsewhere: the count rule's SNAPSHOT_BUILDUP on s3,
+s4 (and s0 if rebuilt) goes away (nothing older than the policy).
+
+```bash
+make gl-image
+JOB_TIMEOUT_MIN=20 bash scripts/run-job.sh py build_test_tables.py --only s21
+sleep 600; make gl-scan SCAN_ARGS=--full    # Expiry by policy (shadow) + Retained bytes comparison
+make gl-scan TRACE=s21_expiry_policy         # expiry / retained_ledger / rule.SNAPSHOT_BUILDUP(policy) lines
 ```

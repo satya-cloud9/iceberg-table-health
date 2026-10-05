@@ -25,7 +25,7 @@ import re
 import gltrace as tr
 import holds as hl
 
-RULE_VERSION = "2.6c-1"
+RULE_VERSION = "2.6e-1"
 
 # symptom -> (category, level, action, remedy)
 CATALOG = {
@@ -64,6 +64,10 @@ CATALOG = {
     "METADATA_BLOAT":        ("metadata", "table", "approval",
                               "metadata is large: shorten the snapshot retention policy or commit less "
                               "often upstream (every commit rewrites metadata.json and adds a manifest list)"),
+    "STALE_REF":             ("metadata", "table", "approval",
+                              "a tag or branch other than main points at an old snapshot and keeps its files "
+                              "alive (expire_snapshots never removes what a ref points at): drop it, or give it "
+                              "a retention (ALTER TABLE ... CREATE OR REPLACE TAG ... RETAIN n DAYS)"),
     "MANIFEST_BLOAT":        ("metadata", "table", "auto",
                               "rewrite_manifests; re-enable commit.manifest-merge.enabled"),
     "REWRITE_CHURN":         ("write_config", "table", "approval",
@@ -339,7 +343,8 @@ def table_findings(table, tm, rows, th, cfg):
     if versions >= max_versions and not auto_delete:
         out.append(_finding(table, "UNBOUNDED_RETENTION", 1 + versions / max(1, max_versions),
                             {"metadata_versions": versions, "previous_versions_max": max_versions,
-                             "delete_after_commit": auto_delete}))
+                             "delete_after_commit": auto_delete,
+                             "metadata_json_files": tm.get("metadata_json_files")}))
 
     # ORPHAN_FILES: objects under the table location nothing references.
     orphans = _num(tm.get("orphan_files"))
@@ -553,6 +558,41 @@ def storage_findings(table, tm, th):
     return out
 
 
+def expiry_findings(table, tm, th):
+    """GL2.6e, expiry by policy (expiry.py fills the facts). SNAPSHOT_BUILDUP when
+    the policy would expire at least expire_min_snapshots snapshots: snapshots
+    older than the policy age, beyond the newest min_keep, not held by a ref.
+    Snapshot count alone no longer triggers it (it stays evidence). STALE_REF
+    when a ref other than main is older than expiry.stale_ref_hours and has no
+    retention of its own."""
+    out = []
+    n = tm.get("expirable_snapshots")
+    need = int(th.get("expire_min_snapshots", 1))
+    tr.log("rule.SNAPSHOT_BUILDUP(policy)", expirable=f"{n} vs {need}",
+           policy=f"{tm.get('policy_age_h')} h / keep {tm.get('policy_min_keep')} ({tm.get('policy_source')})",
+           category=tm.get("write_category"), snapshots=tm.get("snapshots"))
+    if n is not None and n >= need:
+        out.append(_finding(table, "SNAPSHOT_BUILDUP", max(1.0, n / max(need, 1) / 10 + 1),
+                            {"expirable_snapshots": n, "oldest_expirable_age_h": tm.get("oldest_expirable_age_h"),
+                             "policy_age_h": tm.get("policy_age_h"), "policy_min_keep": tm.get("policy_min_keep"),
+                             "policy_source": tm.get("policy_source"), "write_category": tm.get("write_category"),
+                             "snapshots": tm.get("snapshots"), "retained_bytes": tm.get("retained_bytes")},
+                            remedy=f"expire_snapshots to the policy: older than {tm.get('policy_age_h'):g} h, "
+                                   f"keeping the last {tm.get('policy_min_keep')} ({tm.get('policy_source')})"))
+    try:
+        stale = json.loads(tm.get("stale_refs_json") or "[]")
+    except ValueError:
+        stale = []
+    tr.log("rule.STALE_REF", stale_refs=stale or None)
+    if stale:
+        out.append(_finding(table, "STALE_REF", 1 + len(stale),
+                            {"refs": stale, "retained_bytes": tm.get("retained_bytes")},
+                            remedy="refs keep old snapshots alive: " + ", ".join(
+                                f"{r['type']} {r['name']} ({r['head_age_h']} h old)" for r in stale)
+                                   + "; drop them or set a retention"))
+    return out
+
+
 def apply_acks(findings, tm):
     """Table property advisor.ack = SYMPTOM[,SYMPTOM...]: the owner knows and it's
     deliberate. Those findings stay recorded (action 'acknowledged') but drop
@@ -578,6 +618,9 @@ def evaluate(table, tm, rows, cfg, history=None, actions=None):
            + table_findings(table, tm, rows, th, cfg))
     if new:
         out += storage_findings(table, tm, th)
+    if cfg.get("expiry_policy") and tm.get("policy_age_h") is not None:
+        # GL2.6e: the policy decides; the count/age SNAPSHOT_BUILDUP gives way
+        out = [f for f in out if f["symptom"] != "SNAPSHOT_BUILDUP"] + expiry_findings(table, tm, th)
     if cfg.get("learned_windows"):
         out += late_arrival_findings(table, tm, th, int(cfg.get("min_batches", 20)))
         extra = refresh_findings(table, tm, th, int(cfg.get("keep_full_copies", 1)))

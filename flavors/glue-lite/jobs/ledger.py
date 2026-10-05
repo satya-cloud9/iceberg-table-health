@@ -37,6 +37,7 @@ import random
 from datetime import datetime, timedelta, timezone
 
 import activity as act
+import expiry as xp
 import gltrace as tr
 import windows as win
 
@@ -311,6 +312,28 @@ def read_snapshots(spark, table):
     return snaps, (None if cur is None else int(cur.snapshotId())), versions
 
 
+def read_refs(spark, table):
+    """Branches and tags from the loaded table's metadata (no I/O beyond the load):
+    [{name, type, snapshot_id, max_ref_age_ms, min_snapshots_to_keep, max_snapshot_age_ms}],
+    or None when they can't be read."""
+    try:
+        jt = spark._jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark._jsparkSession, table)
+        refs = jt.refs()
+        out = []
+        for name in refs.keySet().toArray():
+            r = refs.get(name)
+
+            def opt(v):
+                return None if v is None else int(v)
+            out.append({"name": str(name), "type": str(r.type().toString()).lower(),
+                        "snapshot_id": int(r.snapshotId()), "max_ref_age_ms": opt(r.maxRefAgeMs()),
+                        "min_snapshots_to_keep": opt(r.minSnapshotsToKeep()),
+                        "max_snapshot_age_ms": opt(r.maxSnapshotAgeMs())})
+        return out
+    except Exception:
+        return None
+
+
 def ensure_tables(spark, ops):
     import gl_common as gl
     specs = {"snapshot_log": (SNAPSHOT_LOG_DDL, "PARTITIONED BY (days(committed_at))"),
@@ -384,6 +407,7 @@ class Ledger:
         if self.mode2 == "on":     # family 2 only reports in this patch; "on" behaves like shadow
             self.mode2 = "shadow"
         self.results2 = []
+        self.results_retained = []
         self.pstate_cache = {}
         if self.mode2 != "off":
             ensure_activity_tables(spark, self.ops)
@@ -403,12 +427,47 @@ class Ledger:
         if not uuid or (self.mode == "off" and self.mode2 == "off"):
             return
         snaps, current, versions = read_snapshots(self.spark, table)
+        self._expiry(table, uuid, tm, cfg, snaps, current)
         if self.mode != "off":
             self._family1(table, uuid, tm, cfg, full_fn, snaps, current, versions)
         if self.mode2 != "off":
             self._family2(table, uuid, tm, cfg, snaps, live_keys or [], partitioned, median_partition_bytes)
         if self.mode3 != "off" and self.mode != "off" and self.mode2 != "off":
             self._windows(uuid, tm, cfg)
+
+    def _expiry(self, table, uuid, tm, cfg, snaps, current):
+        """GL2.6e: the retention policy and what it would expire, refs, and retained
+        bytes from snapshot summaries (compared with the full query when that ran)."""
+        refs = read_refs(self.spark, table)
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        try:
+            props = json.loads(tm.get("properties_json") or "{}")
+        except ValueError:
+            props = {}
+        policy = xp.resolve_policy(props, cfg, snaps, now_ms)
+        tm.update(xp.expiry_facts(snaps, refs, current, now_ms, policy, cfg))
+        led_bytes, note = xp.retained_from_summaries(snaps, refs, current)
+        tm["retained_bytes_ledger"], tm["retained_ledger_note"] = led_bytes, note
+        mode = str(cfg.get("retained_bytes", "full"))
+        tr.log("expiry", f"policy {policy['age_h']:g} h / keep {policy['min_keep']} ({policy['source']})",
+               category=policy["category"], writer_commits_24h=policy["writer_commits_24h"],
+               expirable=tm["expirable_snapshots"], oldest_expirable_h=tm["oldest_expirable_age_h"],
+               refs=tm["refs_json"], stale_refs=tm["stale_refs"])
+        tr.log("retained_ledger", note, ledger_bytes=led_bytes, full_bytes=tm.get("retained_bytes"),
+               full_measured_now=bool(tm.get("_retained_fresh")), mode=mode)
+        if tm.get("_retained_fresh") and tm.get("retained_bytes") is not None:
+            full = int(tm["retained_bytes"])
+            ok = led_bytes is None or abs(led_bytes - full) <= max(1024, full * 0.001)
+            self.pending["incremental_check"].append({
+                "scan_id": self.scan_id, "checked_at": datetime.now(timezone.utc), "table_name": table,
+                "table_uuid": uuid, "family": "retained_ledger", "metric": "retained_bytes",
+                "full_value": str(full), "ledger_value": None if led_bytes is None else str(led_bytes),
+                "agree": ok, "note": note})
+            self.results_retained.append((table, ok, full, led_bytes, note))
+        if mode == "ledger" and led_bytes is not None:
+            tm["retained_bytes"] = led_bytes
+        elif mode == "off":
+            tm["retained_bytes"] = None
 
     def _windows(self, uuid, tm, cfg):
         """Family 3 inputs, recorded per table for detect_symptoms."""
@@ -819,6 +878,13 @@ class Ledger:
             for table, agree, n, dis, _, event, _r in self.results2:
                 for m, f, l, note in dis:
                     print(f"  {table.rsplit('.', 1)[-1]:26} {m}: full={f} ledger={l}  {note} [{event}]", flush=True)
+        if self.results_retained:
+            ok_r = sum(1 for r in self.results_retained if r[1])
+            print(f"\n=== Retained bytes, summary formula vs full query: {ok_r}/{len(self.results_retained)} "
+                  f"tables agree ===", flush=True)
+            for table, ok, full, led, note in self.results_retained:
+                if not ok or led is None:
+                    print(f"  {table.rsplit('.', 1)[-1]:26} full={full} ledger={led}  {note}", flush=True)
         if self.mode == "off":
             return
         checked = [r for r in self.results if r[2]]

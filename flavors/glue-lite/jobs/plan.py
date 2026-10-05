@@ -332,11 +332,22 @@ def plan_table(table, findings, tm, cfg, now=None):
                           "note": "needs approval: otherwise the manifests pile up again"})
 
     # 3. snapshots last, so the snapshots the rewrites replaced can expire too
-    if any(f["symptom"] == "SNAPSHOT_BUILDUP" and f["action"] == "auto" for f in active):
+    sb = next((f for f in active if f["symptom"] == "SNAPSHOT_BUILDUP" and f["action"] == "auto"), None)
+    if sb:
         keep = int(rw.get("expire_retain_last", 5))
         older, note = "{now}", f"keeps the last {keep} snapshots"
+        pol = json.loads(sb.get("evidence_json") or "{}")
+        cut_ms = None
+        if pol.get("policy_age_h") is not None:
+            # GL2.6e: expire to the retention policy, never inside it
+            keep = int(pol.get("policy_min_keep") or keep)
+            cut_ms = (now or datetime.now(timezone.utc)).timestamp() * 1000 - float(pol["policy_age_h"]) * 3600000
+            older = "TIMESTAMP '" + datetime.fromtimestamp(cut_ms / 1000.0, timezone.utc) \
+                .strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + "+00:00'"
+            note = (f"policy: older than {float(pol['policy_age_h']):g} h, keeping the last {keep} "
+                    f"({pol.get('policy_source')})")
         pre = tm.get("pre_refresh_snapshot_ms")
-        if pre and int(cfg.get("keep_full_copies", 1)) >= 1:
+        if pre and int(cfg.get("keep_full_copies", 1)) >= 1 and (cut_ms is None or int(pre) < cut_ms):
             # GL2.5o+: keep the copy before the latest possible full refresh, so a bad
             # refresh can still be rolled back (expire only what is older than it)
             older = "TIMESTAMP '" + datetime.fromtimestamp(int(pre) / 1000.0, timezone.utc) \
@@ -381,6 +392,9 @@ def plan_table(table, findings, tm, cfg, now=None):
             if str(props.get("write.metadata.delete-after-commit.enabled", "false")).lower() != "true":
                 stmt = (f"ALTER TABLE {table} SET TBLPROPERTIES "
                         f"('write.metadata.delete-after-commit.enabled' = 'true')")
+        elif f["symptom"] == "STALE_REF":
+            stmt = "; ".join(f"ALTER TABLE {table} DROP {r.get('type', 'tag').upper()} {r['name']}"
+                             for r in ev.get("refs", []))
         elif f["symptom"] == "UNBOUNDED_RETENTION":
             stmt = (f"ALTER TABLE {table} SET TBLPROPERTIES "
                     f"('write.metadata.delete-after-commit.enabled' = 'true')")

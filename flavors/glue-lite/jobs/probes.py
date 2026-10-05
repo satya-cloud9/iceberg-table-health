@@ -452,13 +452,15 @@ def orphan_metrics(spark, table, cfg):
         except Exception:
             pass
     cutoff_ms = (now_utc().timestamp() - float(cfg.get("orphan_min_age_minutes", 4320)) * 60) * 1000
-    listed = orphans = orphan_bytes = 0
+    listed = orphans = orphan_bytes = meta_json = 0
     sample = []
     it = jt.io().listPrefix(prefix).iterator()
     while it.hasNext():
         f = it.next()
         listed += 1
         loc = _norm_uri(f.location())
+        if loc.endswith(".metadata.json") and "/metadata/" in loc:
+            meta_json += 1                   # every metadata.json version still in storage (A9 check)
         if loc in refs or f.createdAtMillis() > cutoff_ms:
             continue
         orphans += 1
@@ -466,7 +468,7 @@ def orphan_metrics(spark, table, cfg):
         if len(sample) < 5:
             sample.append(loc[len(prefix):] if loc.startswith(prefix) else loc)
     return {"orphan_files": orphans, "orphan_bytes": orphan_bytes, "listed_objects": listed,
-            "orphan_sample": json.dumps(sample)}
+            "orphan_sample": json.dumps(sample), "metadata_json_files": meta_json}
 
 
 def now_utc():
