@@ -1162,3 +1162,17 @@ make gl-scan TRACE=s19_partition_churn,s3_hot_partition
 | `table_row` | the row written to ops.table_metrics |
 | `detect`, `rule.*[variant]`, `detect.diff` | per evaluation (today, learned_windows, partition_holds, new_findings): every partition's values and decisions, every table rule's value against its threshold, the findings, and each family's change |
 | `score` | the scorecard verdict |
+
+Every line names the code that produced it: `TRACE s20_delete_sprawl | path @
+flavors/glue-lite/jobs/scan_metrics.py:252 run_scan: ...`. In a VS Code
+terminal (Remote-SSH on the lab machine), Ctrl+click the path to open the file
+at that line; from a shell, `code -g flavors/glue-lite/jobs/scan_metrics.py:252`.
+SQL lines point at the probe function that built the SQL. The numbers match
+the code in the image, so run `make gl-image` after pulling. To walk the code
+in order:
+
+```bash
+make gl-scan TRACE=s20_delete_sprawl SCAN_ARGS=--full 2>&1 | tee /tmp/trace.log
+grep -o '@ [^ ]*:[0-9]* [a-z_]*' /tmp/trace.log | uniq        # the code path, one stop per line
+grep 'TRACE' /tmp/trace.log                                   # in a VS Code terminal: Ctrl+click each path
+```
