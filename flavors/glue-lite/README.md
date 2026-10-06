@@ -1356,7 +1356,7 @@ how state is read and written.
   - `ledger_state` and `activity_state` are compacted to one row per table in
     the retention pass.
 - **A new timing line closes the scan:**
-  `=== Timing: load (previous scan + state preload) …, tables …, writes + report …; state store: N queries, M table loads … ===`
+  `=== Timing: previous scan …, state preload …, tables …, writes + report …; state store: N queries, M table loads … ===`
 - **Not moved yet:** plan, scenario-step and scorecard writes (already one
   append per run), and the log reads (previous scan, history, scorecard). They
   move with the JSON-lines log sink and the new state layout (step 3).
@@ -1383,3 +1383,13 @@ Gate result (homelab, 27 tables, `--full`): findings identical to the last
 scan before the change (empty diff); per-table time 75.2 s → 51.5 s; steady
 state 0 table loads. Follow-up: the size guard's count queries were replaced by
 a `LIMIT` read (half the store queries) and table-existence checks are cached.
+
+**Previous-scan read bounded.** The scan reads each table's last row from the
+`table_metrics` log (carried values, probe clocks, reuse), that scan's
+partition rows and recent actions; detect reads recent scans for trends. Those
+logs grow every run, so all four reads now look back only
+`incremental.previous_scan_window_hours` (168). Iceberg skips older files by
+their `scanned_at` bounds. A table not scanned within the window is measured in
+full, which is always correct. The Timing line now shows the previous-scan read
+and the state preload separately. (In the design these carried values move into
+the state store's `table_state`, and the scan path stops reading logs.)

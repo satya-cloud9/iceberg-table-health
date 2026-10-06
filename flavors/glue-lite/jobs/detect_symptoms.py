@@ -56,8 +56,10 @@ def latest_scan_id(spark):
     return r[0].s if r else None
 
 
-def load_history(spark, tms, scan_id):
-    """Per table UUID: earlier scans (oldest first, up to the current one) and actions.
+def load_history(spark, tms, scan_id, window_hours=168):
+    """Per table UUID: earlier scans (oldest first, up to the current one) and actions,
+    from the last window_hours only (trend rules use the last few scans; the logs
+    grow every run, so the read is bounded).
     Bounded by the scan's own timestamp in SQL: a Python datetime written back as a
     literal would shift by the driver's local zone."""
     uuids = sorted({t["table_uuid"] for t in tms if t.get("table_uuid")})
@@ -72,12 +74,14 @@ def load_history(spark, tms, scan_id):
             FROM {gl.OPS_NAMESPACE}.table_metrics
             WHERE table_uuid IN ({ids}) AND scanned_at <= (
                 SELECT max(scanned_at) FROM {gl.OPS_NAMESPACE}.table_metrics WHERE scan_id = '{scan_id}')
+              AND scanned_at > current_timestamp() - INTERVAL {int(window_hours)} HOURS
             ORDER BY scanned_at""").collect():
         history.setdefault(r.table_uuid, []).append(r.asDict())
     if spark.catalog.tableExists(f"{gl.OPS_NAMESPACE}.actions"):
         for r in spark.sql(f"""
                 SELECT table_uuid, started_at, kind, status, result_json
                 FROM {gl.OPS_NAMESPACE}.actions WHERE table_uuid IN ({ids})
+                  AND started_at > current_timestamp() - INTERVAL {int(window_hours)} HOURS
                 ORDER BY started_at""").collect():
             actions.setdefault(r.table_uuid, []).append(r.asDict())
     return history, actions
@@ -205,7 +209,8 @@ def run_detect(spark, scan_id, config, report=True):
     for r in spark.sql(f"SELECT * FROM {pm_table} WHERE scan_id = '{scan_id}'").collect():
         parts.setdefault(r.table_name, []).append(r.asDict())
 
-    history, actions = load_history(spark, tms, scan_id)
+    history, actions = load_history(spark, tms, scan_id, float(
+        (config.get("incremental") or {}).get("previous_scan_window_hours", 168)))
     detected_at = probes.now_utc()
     findings = []
     store = ss.IcebergStateStore(spark, gl.OPS_NAMESPACE)

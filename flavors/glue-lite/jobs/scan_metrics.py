@@ -95,9 +95,16 @@ def as_row(values, schema):
 REUSE_DROP = {"rn", "elapsed_min", "orphan_age_h", "retained_age_h"}
 
 
-def load_previous(spark, tm_table, pm_table, namespace):
+def load_previous(spark, tm_table, pm_table, namespace, window_hours=168):
     """Each table's latest successful scan row (with ages computed in SQL, so
-    no Python datetime round trip) and that scan's partition rows."""
+    no Python datetime round trip) and that scan's partition rows.
+
+    Both are log tables that grow every scan, so the read is bounded to the last
+    window_hours (Iceberg skips older files by their scanned_at bounds). A table
+    not scanned within the window has no previous row and is measured in full,
+    which is always correct. (The design moves these carried values into the
+    state store's table_state; then the log is not read on the scan path.)"""
+    since = f"scanned_at > current_timestamp() - INTERVAL {int(window_hours)} HOURS"
     cols = {f.name for f in spark.table(tm_table).schema}
     if "metadata_location" not in cols:
         return {}, {}
@@ -111,18 +118,18 @@ def load_previous(spark, tm_table, pm_table, namespace):
                        AS retained_age_h
             FROM {tm_table} t
             WHERE load_error IS NULL AND metadata_location IS NOT NULL
-              AND table_name LIKE '{namespace}.%')
+              AND table_name LIKE '{namespace}.%' AND {since})
         WHERE rn = 1""").collect()}
     parts = {}
     if prev:
         ids = ", ".join(f"'{p['scan_id']}'" for p in prev.values())
-        for r in spark.sql(f"SELECT * FROM {pm_table} WHERE scan_id IN ({ids})").collect():
+        for r in spark.sql(f"SELECT * FROM {pm_table} WHERE scan_id IN ({ids}) AND {since}").collect():
             if prev.get(r.table_name, {}).get("scan_id") == r.scan_id:
                 parts.setdefault(r.table_name, []).append(r.asDict())
     return prev, parts
 
 
-def action_ages(spark):
+def action_ages(spark, window_hours=168):
     """Minutes since the latest advisor action per table UUID (any status).
     Some actions change files without a new metadata.json - remove_orphan_files
     deletes objects but commits nothing - so an unchanged metadata location
@@ -132,7 +139,9 @@ def action_ages(spark):
         return {r.table_uuid: float(r.age_min) for r in spark.sql(f"""
             SELECT table_uuid,
                    (unix_millis(current_timestamp()) - unix_millis(max(started_at))) / 60000.0 AS age_min
-            FROM {ops}.actions WHERE table_uuid IS NOT NULL GROUP BY table_uuid""").collect()}
+            FROM {ops}.actions WHERE table_uuid IS NOT NULL
+              AND started_at > current_timestamp() - INTERVAL {int(window_hours)} HOURS
+            GROUP BY table_uuid""").collect()}
     except Exception:          # no actions table yet
         return {}
 
@@ -221,7 +230,10 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
     print(f"=== Scan {scan_id}: {len(names)} tables in {namespace} ===", flush=True)
 
     t_prev = time.perf_counter()
-    prev, prev_parts = load_previous(spark, tm_table, pm_table, namespace)
+    window_h = float((config.get("incremental") or {}).get("previous_scan_window_hours", 168))
+    prev, prev_parts = load_previous(spark, tm_table, pm_table, namespace, window_h)
+    t_prev = time.perf_counter() - t_prev
+    t_pre = time.perf_counter()
     # logs (table_metrics, partition_metrics, incremental_check) are buffered and
     # written once at the end: one Iceberg commit per table instead of two per scanned table
     log = ss.IcebergLogSink(spark, gl.OPS_NAMESPACE)
@@ -229,9 +241,9 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
     known = sorted({p.get("table_uuid") for n, p in prev.items()
                     if p.get("table_uuid") and n.rsplit(".", 1)[-1] in set(names)})
     led = ledger_mod.Ledger(spark, config, scan_id, log=log, uuids=known if wanted else None)
-    t_prev = time.perf_counter() - t_prev
+    t_pre = time.perf_counter() - t_pre
     snap_source = "ledger" if led.mode == "on" else "full"
-    ages = action_ages(spark)
+    ages = action_ages(spark, window_h)
     summary, modes, t_start = [], {"full": 0, "reused": 0}, time.perf_counter()
     for name in names:
         table = f"{namespace}.{name}"
@@ -354,7 +366,7 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
     log.flush()
     t_w = time.perf_counter() - t_w
     st = led.store.stats
-    print(f"=== Timing: load (previous scan + state preload) {t_prev:.1f}s, tables {t_tables:.1f}s, writes + report {t_w:.1f}s; "
+    print(f"=== Timing: previous scan {t_prev:.1f}s, state preload {t_pre:.1f}s, tables {t_tables:.1f}s, writes + report {t_w:.1f}s; "
           f"state store: {st['queries']} queries, {st['table_loads']} table loads, {st['ranges']} range / "
           f"{st['gets']} get calls served"
           + (f"; not preloaded (too big): {st['preload_skipped']}" if st["preload_skipped"] else "") + " ===",
