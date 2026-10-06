@@ -50,7 +50,8 @@ LATENESS_HIST_DDL = """
 
 ACTIVITY_STATE_DDL = """
     table_uuid STRING, table_name STRING, updated_at TIMESTAMP, last_ts_ms BIGINT,
-    last_snapshot_id BIGINT, event STRING, scan_id STRING"""
+    last_snapshot_id BIGINT, event STRING, scan_id STRING,
+    last_full_refresh_ms BIGINT, refresh_seeded BOOLEAN"""
 
 # Upper edges in hours after the partition's time range ended; None = longer.
 LATE_BUCKETS = [1, 6, 24, 48, 72, 168, 720, None]

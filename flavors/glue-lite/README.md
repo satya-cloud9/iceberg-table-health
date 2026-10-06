@@ -1300,3 +1300,79 @@ make gl-plan T=s21                       # expire_snapshots(older_than => now �
 make gl-plan T=s21 APPLY=1               # then: snapshots left = newest 3 + the tagged one (+ the compaction's)
 make gl-scan                             # s21 'after': healthy, STALE_REF allowed
 ```
+
+## Step 1 — StateStore and LogSink (storage interfaces)
+
+Migration step 1 from the design doc. Behaviour stays the same; what changes is
+how state is read and written.
+
+- **`jobs/state_store.py`**:
+  - `StateStore` provides `get`, `range`, `put`, `increment`, `transaction`, `expire` and
+    `claim` (claim is for step 2). `LogSink` provides `append`, `flush` and `expire`.
+  - Every write is visible to reads in the same run, so callers keep no pending lists.
+  - Kinds and keys:
+
+    | kind | mode | key | sort |
+    |---|---|---|---|
+    | `ledger_state`, `activity_state` | latest | table_uuid | |
+    | `partition_state` | merge | table_uuid, partition_key | |
+    | `commit` (snapshot_log) | append | table_uuid | ts_ms, snapshot_id |
+    | `commit_partition` (partition_activity) | append | table_uuid | ts_ms, snapshot_id, partition_key |
+    | `gap_hist`, `late_hist` | counter | table_uuid | day, bucket |
+- **`IcebergStateStore` keeps today's `glue.ops` tables.** It reads each kind
+  in one query and serves `get` and `range` from memory, buffers writes, and
+  flushes once per scan (one append per table, one MERGE for partition_state).
+- **The ledger runs no per-table SQL any more.** Before, it ran about 12 queries
+  per table; now each of its 7 kinds costs one count (for the size guard) and one
+  read per scan, about 14 queries whatever the table count, plus a table load
+  for any table whose retained snapshots reach past the window. Detect reads
+  partition state, activity and lateness through the store. The holds
+  aggregation moved from SQL into `holds.activity_from_rows`, which matches the
+  SQL on random data.
+- **The scan buffers its logs** (`table_metrics`, `partition_metrics`,
+  `incremental_check`) and writes them once at the end, instead of two Iceberg
+  commits per table. One consequence: a scan that dies halfway writes nothing,
+  and the next scan redoes it.
+- **What is read is bounded, so it doesn't grow with history:**
+  - **Windows.** Commits and partition activity are preloaded only from
+    `store_preload_days` back (31). A table whose retained snapshots reach
+    further back is read again on its own, so results are unchanged. Detect
+    reads activity only as far back as a rule looks: the settle cap (168 h),
+    the churn window or the hot cap. Histograms go back to the lookback.
+  - **Only this run's tables** when `--tables` is given; new tables load on
+    their own.
+  - **A size guard.** A kind with more than `store_preload_max_rows` rows in
+    its window (2M) isn't read in bulk; tables then load one by one, and the
+    Timing line counts those loads.
+  - **The latest full refresh** is kept in `activity_state`
+    (`last_full_refresh_ms`, seeded once from history), so no read goes back
+    to the start of history.
+- **What is kept is bounded:**
+  - `partition_activity` now has retention too (`retention_days`, as snapshot_log).
+  - `partition_state` drops partitions that are no longer in the table and had
+    no write or compaction for `partition_state_keep_days` (7).
+  - `ledger_state` and `activity_state` are compacted to one row per table in
+    the retention pass.
+- **A new timing line closes the scan:**
+  `=== Timing: load (previous scan + state preload) …, tables …, writes + report …; state store: N queries, M table loads … ===`
+- **Not moved yet:** plan, scenario-step and scorecard writes (already one
+  append per run), and the log reads (previous scan, history, scorecard). They
+  move with the JSON-lines log sink and the new state layout (step 3).
+
+Gate on the cluster (findings identical, scan faster). Take the baseline before applying:
+
+```bash
+# 1. baseline with the current image (GL2.6f)
+make gl-scan SCAN_ARGS=--full 2>&1 | tee ~/scan-before.log
+grep -E "^=== Scan|tables in" ~/scan-before.log         # note scan_id A and the time
+# 2. apply, rebuild, same scan
+bash ~/apply-s1-state-store.sh && make gl-image
+make gl-scan SCAN_ARGS=--full 2>&1 | tee ~/scan-after.log
+grep -E "^=== Scan|tables in|=== Timing" ~/scan-after.log  # scan_id B, time, store queries
+# 3. findings that differ between A and B (expect none, apart from time-driven ones:
+#    a partition that cooled down, a tag that aged past stale_ref_hours)
+make gl-sql Q="(SELECT 'before' AS side, table_name, partition_key, symptom, action FROM glue.ops.symptoms WHERE scan_id = 'A' EXCEPT SELECT 'before', table_name, partition_key, symptom, action FROM glue.ops.symptoms WHERE scan_id = 'B') UNION ALL (SELECT 'after', table_name, partition_key, symptom, action FROM glue.ops.symptoms WHERE scan_id = 'B' EXCEPT SELECT 'after', table_name, partition_key, symptom, action FROM glue.ops.symptoms WHERE scan_id = 'A')"
+```
+
+The scorecard and the incremental-check sections (ledger, activity, retained
+bytes, holds, new findings, expiry) should read the same as in the baseline.

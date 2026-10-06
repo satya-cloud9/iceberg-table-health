@@ -53,6 +53,30 @@ def activity_sql(pa, ids, since_ms, churn_since_ms):
         GROUP BY table_uuid, partition_key"""
 
 
+def activity_from_rows(rows, since_ms, churn_since_ms):
+    """activity_sql over commit_partition items (state store): {partition_key:
+    {last_conflict_ms, removed_bytes, rewrite_commits}} for one table."""
+    out, commits = {}, {}
+    for r in rows:
+        ts = r.get("ts_ms")
+        if ts is None or ts < since_ms:
+            continue
+        pk = r.get("partition_key")
+        a = out.setdefault(pk, {"last_conflict_ms": None, "removed_bytes": 0, "rewrite_commits": 0})
+        if not r.get("is_writer"):
+            continue
+        if (r.get("data_files_removed") or 0) > 0 or (r.get("delete_files_added") or 0) > 0 \
+                or (r.get("delete_files_removed") or 0) > 0:
+            a["last_conflict_ms"] = ts if a["last_conflict_ms"] is None else max(a["last_conflict_ms"], ts)
+        if ts >= churn_since_ms:
+            a["removed_bytes"] += int(r.get("data_bytes_removed") or 0)
+            if (r.get("data_files_removed") or 0) > 0:
+                commits.setdefault(pk, set()).add(r.get("snapshot_id"))
+    for pk, ids in commits.items():
+        out[pk]["rewrite_commits"] = len(ids)
+    return out
+
+
 def holds_rows(rows, pstate, activity, fields, scan_ms):
     """Copies of the partition rows with what the revised holds need:
     minutes_since_update from the ledger's last writer write (when known),

@@ -17,10 +17,10 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from pyspark.sql import SparkSession
-from pyspark.sql import functions as F
 
 import gl_common as gl
 import ledger as ledger_mod
+import state_store as ss
 import gltrace as tr
 import probes
 
@@ -212,8 +212,6 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
     spark.sql(f"CREATE TABLE IF NOT EXISTS {tm_table} ({TABLE_METRICS_DDL}) USING iceberg")
     gl.ensure_columns(spark, pm_table, PARTITION_METRICS_DDL)
     gl.ensure_columns(spark, tm_table, TABLE_METRICS_DDL)
-    pm_schema = spark.table(pm_table).schema
-    tm_schema = spark.table(tm_table).schema
 
     wanted = set(tables)
     names = sorted(r.tableName for r in spark.sql(f"SHOW TABLES IN {namespace}").collect()
@@ -222,8 +220,16 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
     names = first + [n for n in names if n not in first]
     print(f"=== Scan {scan_id}: {len(names)} tables in {namespace} ===", flush=True)
 
+    t_prev = time.perf_counter()
     prev, prev_parts = load_previous(spark, tm_table, pm_table, namespace)
-    led = ledger_mod.Ledger(spark, config, scan_id)
+    # logs (table_metrics, partition_metrics, incremental_check) are buffered and
+    # written once at the end: one Iceberg commit per table instead of two per scanned table
+    log = ss.IcebergLogSink(spark, gl.OPS_NAMESPACE)
+    # the run's tables we already know (new ones load on their own when first seen)
+    known = sorted({p.get("table_uuid") for n, p in prev.items()
+                    if p.get("table_uuid") and n.rsplit(".", 1)[-1] in set(names)})
+    led = ledger_mod.Ledger(spark, config, scan_id, log=log, uuids=known if wanted else None)
+    t_prev = time.perf_counter() - t_prev
     snap_source = "ledger" if led.mode == "on" else "full"
     ages = action_ages(spark)
     summary, modes, t_start = [], {"full": 0, "reused": 0}, time.perf_counter()
@@ -252,9 +258,8 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
                 tr.log("path", "2B reused: metadata.json unchanged since the last scan",
                        snapshot_metrics_from=snap_source)
                 tm, pm_rows = reuse(spark, table, cfg, p, prev_parts.get(table, []), scanned_at, snap_source)
-                rows = [dict(r, scan_id=scan_id, scanned_at=scanned_at, table_name=table) for r in pm_rows]
-                if rows:
-                    spark.createDataFrame([as_row(r, pm_schema) for r in rows], pm_schema).writeTo(pm_table).append()
+                log.append("partition_metrics", [dict(r, scan_id=scan_id, scanned_at=scanned_at, table_name=table)
+                                                 for r in pm_rows])
             else:
                 tr.log("path", "2A full measure: " + ("--full" if full else "first scan of this table" if not p
                                                       else "metadata.json changed"))
@@ -264,10 +269,8 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
                 tr.rows("partition", pm_rows, ["partition_key", "data_files", "data_bytes", "small_files",
                                                "ideal_files", "excess_files", "oversized_files", "delete_files_pos",
                                                "delete_files_eq", "delete_records", "records", "minutes_since_update"])
-                out = (pm.withColumn("scan_id", F.lit(scan_id))
-                         .withColumn("scanned_at", F.lit(scanned_at).cast("timestamp"))
-                         .withColumn("table_name", F.lit(table)))
-                out.select(*[F.col(f.name).cast(f.dataType) for f in pm_schema]).writeTo(pm_table).append()
+                log.append("partition_metrics", [dict(r.asDict(), scan_id=scan_id, scanned_at=scanned_at,
+                                                      table_name=table) for r in pm_rows])
                 rmode = str(cfg.get("retained_bytes", "full"))
                 # "ledger": the summary formula fills it in; the full query stays as the
                 # rationed fallback for tables where the formula is unknown (refs other
@@ -339,13 +342,23 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
             "avg_overwrite_rewrite_share", "table_turnover_24h", "minutes_since_writer_commit", "orphan_files",
             "ledger_event", "activity_event", "hot_window_min", "settle_window_h", "load_error")})
         tr.begin(None)
-        spark.createDataFrame([as_row(tm, tm_schema)], tm_schema).writeTo(tm_table).append()
+        log.append("table_metrics", [tm])
         summary.append(tm)
         modes[tm.get("scan_mode", "full")] = modes.get(tm.get("scan_mode", "full"), 0) + 1
         print(f"  {tm.get('scan_mode', 'full'):6} {table}  {tm['scan_seconds']:.1f}s", flush=True)
-    print(f"=== {len(names)} tables in {time.perf_counter() - t_start:.1f}s: "
+    t_tables = time.perf_counter() - t_start
+    print(f"=== {len(names)} tables in {t_tables:.1f}s: "
           + ", ".join(f"{k} {v}" for k, v in modes.items() if v) + " ===", flush=True)
-    led.report()
+    t_w = time.perf_counter()
+    led.report()                      # writes the ledger's state and the buffered logs
+    log.flush()
+    t_w = time.perf_counter() - t_w
+    st = led.store.stats
+    print(f"=== Timing: load (previous scan + state preload) {t_prev:.1f}s, tables {t_tables:.1f}s, writes + report {t_w:.1f}s; "
+          f"state store: {st['queries']} queries, {st['table_loads']} table loads, {st['ranges']} range / "
+          f"{st['gets']} get calls served"
+          + (f"; not preloaded (too big): {st['preload_skipped']}" if st["preload_skipped"] else "") + " ===",
+          flush=True)
 
     if report:
         print("\n=== Table metrics (selected) ===", flush=True)

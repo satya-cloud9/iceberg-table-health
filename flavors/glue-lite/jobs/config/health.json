@@ -104,7 +104,11 @@
     "histogram_days": 30,
     "adaptive_lookback": true,
     "lookback_max_days": 365,
-    "retention_days": 365
+    "retention_days": 365,
+    "_store_comment": "Step 1 state store (state_store.py). store_preload_days: commits and partition activity are read in bulk this far back (default: max(histogram_days, 30) + 1); a table whose retained snapshots go further back is read again on its own. store_preload_max_rows: a kind with more rows than this in the window is not read in bulk; tables then load one by one. partition_state_keep_days: a partition no longer in the table, with no write or compaction for this long, is dropped from partition_state. retention_days also applies to partition_activity.",
+    "store_preload_days": 31,
+    "store_preload_max_rows": 2000000,
+    "partition_state_keep_days": 7
   },
   "tables": {
     "glue.demo.s0_small_appends":     { "filter_columns": ["customer_id"] },

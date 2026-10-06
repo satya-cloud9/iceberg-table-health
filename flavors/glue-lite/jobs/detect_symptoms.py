@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -21,6 +22,7 @@ import gl_common as gl
 import gltrace as tr
 import holds as hl
 import probes
+import state_store as ss
 import symptom_rules
 import windows as win
 from ledger import CHECK_DDL, mode_of
@@ -81,20 +83,17 @@ def load_history(spark, tms, scan_id):
     return history, actions
 
 
-def load_partition_state(spark, tms):
+def _uuids(tms):
+    return sorted({t["table_uuid"] for t in tms if t.get("table_uuid")})
+
+
+def load_partition_state(store, tms):
     """Family 2's per-partition state, by table UUID (empty when family 2 never ran)."""
-    ps = f"{gl.OPS_NAMESPACE}.partition_state"
-    uuids = sorted({t["table_uuid"] for t in tms if t.get("table_uuid")})
-    if not uuids or not spark.catalog.tableExists(ps):
-        return {}
     out = {}
-    ids = ", ".join(f"'{u}'" for u in uuids)
-    cols = {f.name for f in spark.table(ps).schema}
-    label = "last_write_label" if "last_write_label" in cols else "CAST(NULL AS STRING) AS last_write_label"
-    for r in spark.sql(f"SELECT table_uuid, partition_key, last_write_ms, {label} FROM {ps} "
-                       f"WHERE table_uuid IN ({ids})").collect():
-        out.setdefault(r.table_uuid, {})[r.partition_key] = {"last_write_ms": r.last_write_ms,
-                                                             "last_write_label": r.last_write_label}
+    for u in _uuids(tms):
+        for r in store.range("partition_state", (u,)):
+            out.setdefault(u, {})[r["partition_key"]] = {"last_write_ms": r.get("last_write_ms"),
+                                                        "last_write_label": r.get("last_write_label")}
     return out
 
 
@@ -102,74 +101,60 @@ def _mb(n):
     return "n/a" if n is None else f"{n / 1048576:.1f} MiB" if n >= 104858 else f"{n / 1024:.0f} KiB"
 
 
-def _uuid_list(tms):
-    return ", ".join(f"'{u}'" for u in sorted({t["table_uuid"] for t in tms if t.get("table_uuid")}))
-
-
-def load_compactions(spark, tms):
-    """Compaction times per partition (family 2's activity rows), by table UUID."""
-    pa = f"{gl.OPS_NAMESPACE}.partition_activity"
-    ids = _uuid_list(tms)
-    if not ids or not spark.catalog.tableExists(pa):
-        return {}
+def load_compactions(store, tms, since_ms=None):
+    """Compaction times per partition (family 2's activity rows), by table UUID.
+    since_ms: only compactions a rule can still count (the settle window)."""
     out = {}
-    for r in spark.sql(f"SELECT table_uuid, partition_key, collect_list(ts_ms) AS ts FROM {pa} "
-                       f"WHERE table_uuid IN ({ids}) AND operation = 'replace' AND data_files_added > 0 "
-                       f"GROUP BY table_uuid, partition_key").collect():
-        out.setdefault(r.table_uuid, {})[r.partition_key] = sorted(int(t) for t in r.ts)
+    for u in _uuids(tms):
+        for r in store.range("commit_partition", (u,), start=since_ms):
+            if r.get("operation") == "replace" and (r.get("data_files_added") or 0) > 0:
+                out.setdefault(u, {}).setdefault(r["partition_key"], []).append(int(r["ts_ms"]))
+    for parts in out.values():
+        for pk in parts:
+            parts[pk].sort()
     return out
 
 
-def load_late_hists(spark, tms, default_days=30):
+def load_late_hists(store, tms, default_days=30):
     """Lateness bucket counts by table UUID, over each table's own lookback
     (lateness_lookback_days from the scan: adaptive, see windows.py)."""
-    lh = f"{gl.OPS_NAMESPACE}.lateness_hist"
-    ids = _uuid_list(tms)
-    if not ids or not spark.catalog.tableExists(lh):
-        return {}
     days = {t.get("table_uuid"): int(t.get("lateness_lookback_days") or default_days) for t in tms}
+    today = datetime.now(timezone.utc).date()
     out = {}
-    for r in spark.sql(f"SELECT table_uuid, datediff(current_date(), day) AS age, bucket_max_h, sum(batches) AS n "
-                       f"FROM {lh} WHERE table_uuid IN ({ids}) AND day >= date_sub(current_date(), {max(days.values())}) "
-                       f"GROUP BY table_uuid, day, bucket_max_h").collect():
-        if r.age >= days.get(r.table_uuid, default_days):
-            continue
-        b = r.bucket_max_h
-        b = None if b is None else (int(b) if float(b).is_integer() else float(b))
-        t = out.setdefault(r.table_uuid, {})
-        t[b] = t.get(b, 0) + int(r.n)
+    for u in _uuids(tms):
+        for r in store.range("late_hist", (u,), start=today - timedelta(days=max(days.values()))):
+            if (today - r["day"]).days >= days.get(u, default_days):
+                continue
+            t = out.setdefault(u, {})
+            t[r["bucket_max_h"]] = t.get(r["bucket_max_h"], 0) + int(r["batches"] or 0)
     return out
 
 
-def load_holds_activity(spark, tms, scan_ms, window_h, hot_cap_min):
+def load_holds_activity(store, tms, scan_ms, window_h, hot_cap_min):
     """Family 2's activity summed per partition for the revised holds (holds.py),
     by table UUID. Reads back max(churn window, hot cap) from the scan time."""
-    pa = f"{gl.OPS_NAMESPACE}.partition_activity"
-    ids = _uuid_list(tms)
-    if not ids or not spark.catalog.tableExists(pa):
-        return {}
     churn_since = scan_ms - int(window_h * 3600000)
     since = min(churn_since, scan_ms - int(hot_cap_min * 60000))
     out = {}
-    for r in spark.sql(hl.activity_sql(pa, ids, since, churn_since)).collect():
-        out.setdefault(r.table_uuid, {})[r.partition_key] = {
-            "last_conflict_ms": r.last_conflict_ms, "removed_bytes": r.removed_bytes,
-            "rewrite_commits": r.rewrite_commits}
+    for u in _uuids(tms):
+        a = hl.activity_from_rows(store.range("commit_partition", (u,), start=since), since, churn_since)
+        if a:
+            out[u] = a
     return out
 
 
-def record_holds_changes(spark, scan_id, at, mode, changes, report=True,
+CHECK_COLS = ["scan_id", "checked_at", "table_name", "table_uuid", "family", "metric", "full_value",
+              "ledger_value", "agree", "note"]
+
+
+def record_holds_changes(log, scan_id, at, mode, changes, report=True,
                          family="partition_holds", title="Partition holds", baseline="today's holds"):
-    """What a variant of the rules changes, per table (glue.ops.incremental_check;
-    agree = no change). Families: partition_holds (GL2.6b), new_findings (GL2.6c)."""
-    ic = f"{gl.OPS_NAMESPACE}.incremental_check"
-    spark.sql(f"CREATE TABLE IF NOT EXISTS {ic} ({CHECK_DDL}) USING iceberg")
-    schema = spark.table(ic).schema
-    rows = [tuple(coerce(v, c.dataType) for v, c in zip(
-        [scan_id, at, tm["table_name"], tm.get("table_uuid"), family, "findings",
-         baseline, note, not d, "; ".join(d)[:2000]], schema)) for tm, d, note in changes]
-    if rows:
-        spark.createDataFrame(rows, schema).writeTo(ic).append()
+    """What a variant of the rules changes, per table (log incremental_check;
+    agree = no change). Families: partition_holds (GL2.6b), new_findings (GL2.6c),
+    expiry_policy (GL2.6e)."""
+    log.append("incremental_check", [dict(zip(CHECK_COLS, [
+        scan_id, at, tm["table_name"], tm.get("table_uuid"), family, "findings",
+        baseline, note, not d, "; ".join(d)[:2000]])) for tm, d, note in changes])
     changed = [c for c in changes if c[1]]
     print(f"\n=== {title} ({mode}): {len(changed)}/{len(changes)} tables would change"
           f"{'' if mode == 'shadow' else ' (applied)'} ===", flush=True)
@@ -180,21 +165,16 @@ def record_holds_changes(spark, scan_id, at, mode, changes, report=True,
                 print(f"  {'':26}   {line}", flush=True)
 
 
-def record_window_changes(spark, scan_id, at, mode, changes, report=True):
-    """What the learned windows change, per table (glue.ops.incremental_check,
+def record_window_changes(log, scan_id, at, mode, changes, report=True):
+    """What the learned windows change, per table (log incremental_check,
     family learned_windows; agree = no change)."""
-    ic = f"{gl.OPS_NAMESPACE}.incremental_check"
-    spark.sql(f"CREATE TABLE IF NOT EXISTS {ic} ({CHECK_DDL}) USING iceberg")
-    schema = spark.table(ic).schema
     rows = []
     for tm, d in changes:
         windows = (f"hot {tm.get('hot_window_min')} min ({tm.get('hot_window_source')}); "
                    f"settle {tm.get('settle_window_h')} h ({tm.get('settle_window_source')})")
-        rows.append(tuple(coerce(v, c.dataType) for v, c in zip(
-            [scan_id, at, tm["table_name"], tm.get("table_uuid"), "learned_windows", "findings",
-             "configured windows", windows, not d, "; ".join(d)[:2000]], schema)))
-    if rows:
-        spark.createDataFrame(rows, schema).writeTo(ic).append()
+        rows.append(dict(zip(CHECK_COLS, [scan_id, at, tm["table_name"], tm.get("table_uuid"), "learned_windows",
+                                          "findings", "configured windows", windows, not d, "; ".join(d)[:2000]])))
+    log.append("incremental_check", rows)
     changed = [(tm, d) for tm, d in changes if d]
     print(f"\n=== Learned windows ({mode}): {len(changed)}/{len(changes)} tables would change"
           f"{'' if mode == 'shadow' else ' (applied)'} ===", flush=True)
@@ -218,7 +198,6 @@ def run_detect(spark, scan_id, config, report=True):
     pm_table = f"{gl.OPS_NAMESPACE}.partition_metrics"
     sy_table = f"{gl.OPS_NAMESPACE}.symptoms"
     spark.sql(f"CREATE TABLE IF NOT EXISTS {sy_table} ({SYMPTOMS_DDL}) USING iceberg")
-    schema = spark.table(sy_table).schema
 
     tms = [r.asDict() for r in spark.sql(f"SELECT *, unix_millis(scanned_at) AS scanned_ms FROM {tm_table} "
                                          f"WHERE scan_id = '{scan_id}'").collect()]
@@ -229,15 +208,33 @@ def run_detect(spark, scan_id, config, report=True):
     history, actions = load_history(spark, tms, scan_id)
     detected_at = probes.now_utc()
     findings = []
+    store = ss.IcebergStateStore(spark, gl.OPS_NAMESPACE)
+    log = ss.IcebergLogSink(spark, gl.OPS_NAMESPACE)
     mode3 = mode_of(config, "learned_windows")
-    pstate = load_partition_state(spark, tms) if mode3 != "off" else {}
-    compactions, late_hists = (load_compactions(spark, tms), load_late_hists(spark, tms)) if mode3 != "off" else ({}, {})
-    changes = []
     mode4 = mode_of(config, "partition_holds")
     inc = config.get("incremental") or {}
+    scan_ms = max((t["scanned_ms"] for t in tms), default=0)
+    # activity is read back only as far as a rule looks: the settle window (compactions
+    # since a partition ended), the churn window and the hot cap (holds)
+    act_from = scan_ms - int(max(float(inc.get("settle_cap_hours", 168)) * 3600000,
+                                 float(inc.get("churn_window_h", 24)) * 3600000,
+                                 float(inc.get("hot_cap_minutes", 1440)) * 60000))
+    if mode3 != "off" or mode4 != "off":       # one read per kind, then per-table lookups in memory
+        uu = _uuids(tms)
+        cap = int(inc.get("store_preload_max_rows", 2000000))
+        store.preload("partition_state", uuids=uu, max_rows=cap)
+        store.preload("commit_partition", start=act_from, uuids=uu, max_rows=cap)
+        if mode3 != "off":
+            days = max([int(t.get("lateness_lookback_days") or 30) for t in tms] or [30])
+            store.preload("late_hist", start=datetime.now(timezone.utc).date() - timedelta(days=days),
+                          uuids=uu, max_rows=cap)
+    pstate = load_partition_state(store, tms) if mode3 != "off" else {}
+    compactions, late_hists = ((load_compactions(store, tms, act_from), load_late_hists(store, tms))
+                               if mode3 != "off" else ({}, {}))
+    changes = []
     if mode4 != "off" and not pstate:
-        pstate = load_partition_state(spark, tms)
-    hold_act = (load_holds_activity(spark, tms, max((t["scanned_ms"] for t in tms), default=0),
+        pstate = load_partition_state(store, tms)
+    hold_act = (load_holds_activity(store, tms, max((t["scanned_ms"] for t in tms), default=0),
                                     float(inc.get("churn_window_h", 24)), float(inc.get("hot_cap_minutes", 1440)))
                 if mode4 != "off" and tms else {})
     hold_changes = []
@@ -329,24 +326,24 @@ def run_detect(spark, scan_id, config, report=True):
         tr.begin(None)
         findings += mine
     if mode3 != "off":
-        record_window_changes(spark, scan_id, detected_at, mode3, changes, report)
+        record_window_changes(log, scan_id, detected_at, mode3, changes, report)
     if mode4 != "off":
-        record_holds_changes(spark, scan_id, detected_at, mode4, hold_changes, report)
+        record_holds_changes(log, scan_id, detected_at, mode4, hold_changes, report)
     if mode5 != "off":
-        record_holds_changes(spark, scan_id, detected_at, mode5, new_changes, report,
+        record_holds_changes(log, scan_id, detected_at, mode5, new_changes, report,
                              family="new_findings", title="New findings", baseline="today's findings")
     if mode6 != "off":
-        record_holds_changes(spark, scan_id, detected_at, mode6, exp_changes, report,
+        record_holds_changes(log, scan_id, detected_at, mode6, exp_changes, report,
                              family="expiry_policy", title="Expiry by policy", baseline="count/age rule")
+    if log.pending("incremental_check"):
+        spark.sql(f"CREATE TABLE IF NOT EXISTS {gl.OPS_NAMESPACE}.incremental_check ({CHECK_DDL}) USING iceberg")
 
     print(f"=== Symptoms for scan {scan_id}: {len(findings)} findings over {len(tms)} tables ===",
           flush=True)
-    if findings:
-        rows = []
-        for f in findings:
-            f.update(scan_id=scan_id, detected_at=detected_at)
-            rows.append(tuple(coerce(f.get(c.name), c.dataType) for c in schema))
-        spark.createDataFrame(rows, schema).writeTo(sy_table).append()
+    for f in findings:
+        f.update(scan_id=scan_id, detected_at=detected_at)
+    log.append("symptoms", findings)
+    log.flush()
 
     findings.sort(key=lambda f: (ACTION_ORDER.get(f["action"], 9), -f["score"]))
     print("\n=== Per table ===")
