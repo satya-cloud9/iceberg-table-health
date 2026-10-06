@@ -330,7 +330,7 @@ def snapshot_metrics(spark, table, cfg, data_bytes):
     return m
 
 
-def table_metrics(spark, table, info, cfg, pm_rows, retained=True):
+def table_metrics(spark, table, info, cfg, pm_rows, retained=True, retained_meta=False):
     """P1-P4, M1-M5, M7, M8, C1-C3, W1 for one table; pm_rows = partition metric rows."""
     target = int(cfg["target_file_bytes"])
     undersized_limit = target * float(cfg["undersized_partition_ratio"])
@@ -370,9 +370,10 @@ def table_metrics(spark, table, info, cfg, pm_rows, retained=True):
 
     # M8: bytes only old snapshots reference (storage you pay for but can't query).
     # Reads the manifests of every retained snapshot; the scan runs it less often.
-    if not retained:
-        m["retained_bytes"] = m["retained_metadata_bytes"] = None
-    else:
+    # retained_meta: only the manifest query (cheap: manifest lists, not manifests'
+    # entries), for retained_bytes "ledger" where the summary formula gives M8
+    m["retained_bytes"] = m["retained_metadata_bytes"] = None
+    if retained or retained_meta:
         # M36: manifests only old snapshots reference (manifest lists are not
         # counted: their sizes need one file-size call per snapshot)
         r = _one(spark, f"""
@@ -382,6 +383,7 @@ def table_metrics(spark, table, info, cfg, pm_rows, retained=True):
               (SELECT coalesce(sum(length), 0) FROM {table}.manifests) AS retained
         """)
         m["retained_metadata_bytes"] = max(0, int(r.retained or 0))
+    if retained:
         r = _one(spark, f"""
             SELECT
               (SELECT coalesce(sum(sz), 0) FROM

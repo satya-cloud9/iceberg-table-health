@@ -11,7 +11,9 @@
           ]
         },
         {
-          "symptom": "SNAPSHOT_BUILDUP"
+          "symptom": "SNAPSHOT_BUILDUP",
+          "optional": true,
+          "_comment": "policy-driven since GL2.6f: appears only once snapshots are older than the retention policy (batch 120 h, keep 10), so a table built in the last 5 days doesn't show it"
         }
       ],
       "after": {
@@ -65,11 +67,13 @@
           "not_newest": true
         },
         {
-          "symptom": "SNAPSHOT_BUILDUP"
+          "symptom": "SNAPSHOT_BUILDUP",
+          "optional": true,
+          "_comment": "policy-driven since GL2.6f: appears only once snapshots are older than the retention policy (batch 120 h, keep 10), so a table built in the last 5 days doesn't show it"
         }
       ],
       "after": {
-        "_comment": "past day compacted, snapshots expired, today held while hot. Today may still be hot (HOT_PARTITION), cooled but not yet compacted (SMALL_FILES, next run's work), or compacted by a second run (healthy). Anything on the past day, or SNAPSHOT_BUILDUP, fails.",
+        "_comment": "past day compacted, snapshots expired, today held while hot. Today may still be hot (HOT_PARTITION), cooled but not yet compacted (SMALL_FILES, next run's work), or compacted by a second run (healthy). Anything on the past day fails.",
         "expect": [
           {
             "symptom": "HOT_PARTITION",
@@ -90,7 +94,9 @@
           "symptom": "MANIFEST_BLOAT"
         },
         {
-          "symptom": "SNAPSHOT_BUILDUP"
+          "symptom": "SNAPSHOT_BUILDUP",
+          "optional": true,
+          "_comment": "policy-driven since GL2.6f: appears only once snapshots are older than the retention policy (batch 120 h, keep 10), so a table built in the last 5 days doesn't show it"
         }
       ],
       "after": {
@@ -119,7 +125,9 @@
           "count": 1
         },
         {
-          "symptom": "SNAPSHOT_BUILDUP"
+          "symptom": "SNAPSHOT_BUILDUP",
+          "optional": true,
+          "_comment": "policy-driven since GL2.6f: appears only once snapshots are older than the retention policy (batch 120 h, keep 10), so a table built in the last 5 days doesn't show it"
         }
       ],
       "after": {
@@ -343,7 +351,7 @@
       }
     },
     "glue.demo.s21_expiry_policy": {
-      "_comment": "GL2.6e: the writer's own retention (10 min, keep 3) wins. Today: SMALL_FILES only (16 snapshots < 30). In the expiry-policy shadow, once 10 minutes old: SNAPSHOT_BUILDUP (12 expirable: 16 minus the newest 3 minus the tagged one), and STALE_REF once the tag is over 1 h old; optional here so the check holds in both modes.",
+      "_comment": "GL2.6e/f: the writer's own retention (10 min, keep 3) wins. 15 snapshots (15 appends); once 10 minutes old: SNAPSHOT_BUILDUP (11 expirable: 15 minus the newest 3 minus the tagged one), and STALE_REF once the tag is over 1 h old. Both optional so a scan in the first 10 minutes after the build passes too.",
       "expect": [
         {
           "symptom": "SMALL_FILES",

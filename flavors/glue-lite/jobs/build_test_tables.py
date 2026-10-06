@@ -477,11 +477,11 @@ def s20_delete_sprawl(b, args):
 def s21_expiry_policy(b, args):
     """Expiry by policy (GL2.6e). The writer declares its own retention in the
     table properties (10 minutes, keep 3), which wins over the advisor's batch
-    default (120 h / 10). 15 appends, so 16 snapshots: well under today's count
+    default (120 h / 10). 15 appends, so 15 snapshots (CREATE TABLE commits none): well under today's count
     threshold (30), so today's rule never expires them; under the policy, every
     snapshot older than 10 minutes beyond the newest 3 is expirable, except the
-    one the tag points at (expire_snapshots never removes a ref's snapshot). The
-    tag has no retention of its own, so once it is older than stale_ref_hours it
+    one the tag points at (expire_snapshots never removes a ref's snapshot):
+    11 expirable. The tag has no retention of its own, so once it is older than stale_ref_hours it
     is STALE_REF. The summary formula for retained bytes reports unknown here
     (a ref other than main)."""
     t = f"{NS}.s21_expiry_policy"

@@ -269,20 +269,29 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
                          .withColumn("table_name", F.lit(table)))
                 out.select(*[F.col(f.name).cast(f.dataType) for f in pm_schema]).writeTo(pm_table).append()
                 rmode = str(cfg.get("retained_bytes", "full"))
-                retained_due = rmode == "full" and due(p, "retained_age_h", cfg.get("retained_bytes_every_hours", 24))
+                # "ledger": the summary formula fills it in; the full query stays as the
+                # rationed fallback for tables where the formula is unknown (refs other
+                # than main, history off the lineage, no size summaries) or not yet seen
+                fallback = rmode == "ledger" and (not p or p.get("retained_bytes_ledger") is None)
+                is_due = rmode != "off" and due(p, "retained_age_h", cfg.get("retained_bytes_every_hours", 24))
+                retained_due = is_due and (rmode == "full" or fallback)
+                meta_due = is_due and not retained_due          # ledger mode: old manifests only
                 tr.log("retained", "measure now (all_files, all_manifests)" if retained_due else
-                       ("carried from the last scan" if rmode == "full" else
-                        f"not measured (retained_bytes={rmode}: the ledger's summary formula fills it in)"),
-                       every_hours=cfg.get("retained_bytes_every_hours", 24), mode=rmode)
-                tm = probes.table_metrics(spark, table, info, cfg, pm_rows, retained=retained_due)
-                if retained_due:
+                       "measure old manifests now (all_manifests); data bytes from the ledger's summary formula"
+                       if meta_due else "carried from the last scan" if rmode != "off" else "off",
+                       every_hours=cfg.get("retained_bytes_every_hours", 24), mode=rmode,
+                       ledger_fallback=fallback)
+                tm = probes.table_metrics(spark, table, info, cfg, pm_rows, retained=retained_due,
+                                          retained_meta=meta_due)
+                if retained_due or meta_due:
                     tm["retained_scanned_at"] = scanned_at
-                    tm["_retained_fresh"] = True          # the ledger compares its formula with it
-                elif rmode != "full":
-                    tm["retained_bytes"] = tm["retained_metadata_bytes"] = None
-                elif p:
-                    tm["retained_bytes"], tm["retained_scanned_at"] = p.get("retained_bytes"), p.get("retained_scanned_at")
+                    if retained_due:
+                        tm["_retained_fresh"] = True      # the ledger compares its formula with it
+                elif rmode != "off" and p:
+                    tm["retained_scanned_at"] = p.get("retained_scanned_at")
                     tm["retained_metadata_bytes"] = p.get("retained_metadata_bytes")
+                    if rmode == "full" or fallback:   # ledger mode, formula known: the ledger fills it in
+                        tm["retained_bytes"] = p.get("retained_bytes")
                 tm["minutes_since_writer_commit"] = wm
                 tm["scan_mode"] = "full"
                 carry_orphans(tm, p)

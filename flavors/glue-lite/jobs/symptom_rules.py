@@ -25,7 +25,7 @@ import re
 import gltrace as tr
 import holds as hl
 
-RULE_VERSION = "2.6e-1"
+RULE_VERSION = "2.6f-1"
 
 # symptom -> (category, level, action, remedy)
 CATALOG = {

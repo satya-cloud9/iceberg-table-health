@@ -1242,7 +1242,7 @@ snapshots sit off the current lineage, or when a snapshot has no size summary.
 `retained_bytes`: `full` (today's query, now also compared with the formula:
 `=== Retained bytes, summary formula vs full query ===` and
 `incremental_check` family `retained_ledger`), `ledger` (formula only) or `off`.
-Kept at `full` until the comparison agrees on the cluster.
+Kept at `full` until the comparison agrees on the cluster (it did: `ledger` since GL2.6f).
 
 Also: the orphan listing counts `*.metadata.json` files in storage
 (`metadata_json_files`, the A9 check after delete-after-commit), and probe ages
@@ -1250,9 +1250,9 @@ use millisecond timestamps (an action and an orphan listing in the same second
 could re-list once more).
 
 New scenario **s21_expiry_policy**: the writer's own retention (10 min, keep 3),
-16 snapshots, a tag on the 3rd. Today: SMALL_FILES only (16 < 30 snapshots).
-Shadow, once 10 minutes old: `(table): - -> SNAPSHOT_BUILDUP:auto` (12
-expirable: 16 − newest 3 − the tagged one); STALE_REF once the tag is over 1 h
+15 snapshots, a tag on the 3rd. Today: SMALL_FILES only (15 < 30 snapshots).
+Shadow, once 10 minutes old: `(table): - -> SNAPSHOT_BUILDUP:auto` (11
+expirable: 15 − newest 3 − the tagged one); STALE_REF once the tag is over 1 h
 old. Expected shadow lines elsewhere: the count rule's SNAPSHOT_BUILDUP on s3,
 s4 (and s0 if rebuilt) goes away (nothing older than the policy).
 
@@ -1261,4 +1261,42 @@ make gl-image
 JOB_TIMEOUT_MIN=20 bash scripts/run-job.sh py build_test_tables.py --only s21
 sleep 600; make gl-scan SCAN_ARGS=--full    # Expiry by policy (shadow) + Retained bytes comparison
 make gl-scan TRACE=s21_expiry_policy         # expiry / retained_ledger / rule.SNAPSHOT_BUILDUP(policy) lines
+```
+
+## GL2.6f — Expiry by policy and retained bytes from the ledger switched on
+
+Shadow evidence (GL2.6e, 2026-10-05): s21 gained SNAPSHOT_BUILDUP by policy (11
+expirable); s3 and s4 lost the count rule's SNAPSHOT_BUILDUP (nothing older than
+the 120 h batch policy); the other 24 tables unchanged. The summary formula for
+retained bytes agreed with the full `all_files` query on 27 of 27 tables.
+
+- `incremental.expiry_policy: on`: SNAPSHOT_BUILDUP comes from the retention
+  policy (the table's `history.expire.*` > `advisor.expire.*` > `defaults.expiry`
+  batch / streaming, never under the in-flight floor), STALE_REF reports old
+  tags and branches, and the plan expires with `older_than = now − policy age`,
+  `retain_last = policy min-snapshots`.
+- `defaults.retained_bytes: ledger`: data bytes only old snapshots reference
+  come from the snapshot summaries (free). The scan still runs, on
+  `retained_bytes_every_hours`:
+  - the old-manifest query (`all_manifests`, cheap) for METADATA_BLOAT;
+  - the full `all_files` query **only as the fallback** for a table whose
+    formula is unknown (a tag or branch other than main, history off the current
+    lineage, no size summaries) or not yet computed (first scan in this mode).
+    The trace shows it as `retained ... ledger_fallback=True`.
+  Whenever the full query runs, the comparison with the formula still goes to
+  `ops.incremental_check` (family `retained_ledger`).
+- Expectations: SNAPSHOT_BUILDUP is optional on s0, s3, s4 and s7 (it appears
+  only once their snapshots pass 120 h); s21 keeps SNAPSHOT_BUILDUP and STALE_REF
+  optional (a scan in the first 10 minutes after the build has neither).
+- s21 counts corrected: 15 snapshots (CREATE TABLE commits none), 11 expirable.
+
+Verify:
+
+```bash
+make gl-image
+make gl-scan SCAN_ARGS=--full            # scorecard; s21 SNAPSHOT_BUILDUP (+ STALE_REF after 1 h)
+make gl-scan TRACE=s21_expiry_policy     # retained ... ledger_fallback=True (s21 has a tag)
+make gl-plan T=s21                       # expire_snapshots(older_than => now − 10 min, retain_last => 3)
+make gl-plan T=s21 APPLY=1               # then: snapshots left = newest 3 + the tagged one (+ the compaction's)
+make gl-scan                             # s21 'after': healthy, STALE_REF allowed
 ```
