@@ -1393,3 +1393,53 @@ their `scanned_at` bounds. A table not scanned within the window is measured in
 full, which is always correct. The Timing line now shows the previous-scan read
 and the state preload separately. (In the design these carried values move into
 the state store's `table_state`, and the scan path stops reading logs.)
+
+## Step 2 — Profiles, groups and claims
+
+Several runs can now work at the same time without stepping on each other:
+different groups of tables, or several shards of one group.
+
+- **Profile** (`jobs/config/profile.json`, read by `profiles.py`): one target
+  (catalog and namespaces) with named groups. A group's selector can use
+  namespaces, include/exclude glob patterns on the table name, an explicit
+  table list, a table property (`advisor.group=batch`), and a hash shard
+  (`--shard i/N`, crc32 of the full name). The homelab profile has `group_a`
+  (everything except s10–s21), `group_b` (s10–s21) and `all`.
+- **Claims** (`coordinator.py`): conditional writes to a DynamoDB table
+  (`advisor-coordination`; Floci here, reached at `GL_AWS_ENDPOINT` from the
+  pods). Each claim expires on its own, so a dead run blocks nothing for long.
+  - **Group run:** one run per (group, shard). A second run starting while the
+    first holds it writes `skipped: group held` to the journal and exits.
+  - **Table:** claimed before it is measured, released after. A table held by
+    another run is skipped and shows as `claimed_elsewhere` in coverage.
+  - **Housekeeping:** the store's retention pass (expire, compact) runs in one
+    run at a time, at most every `housekeeping_every_hours` (6).
+- **Run journal and coverage:** `glue.ops.run_journal` gets one row per run
+  (group, shard, status, tables matched/done/skipped/failed, housekeeping,
+  rule version). `glue.ops.coverage` gets one row per table per run, with its
+  status. `make gl-coverage` shows the latest runs and which run scanned each
+  table.
+- **Concurrent commits:** two runs writing the same `ops` table can collide on
+  MERGE, DELETE or INSERT OVERWRITE. Those are retried with backoff when
+  Iceberg reports a conflict (`state_store.retry_on_conflict`); appends need no
+  retry.
+- **Plan** now uses each table's own latest scan (within
+  `previous_scan_window_hours`), since a group run covers only its tables.
+- **Image:** `boto3` added; rebuild with `make gl-image`.
+
+`make gl-scan` without a group behaves as before (no claims, local
+coordinator), except that it also writes coverage rows.
+
+Gate (two groups in parallel cover every table exactly once, findings unchanged):
+
+```bash
+make gl-image
+make gl-groups-parallel     # group_a and group_b at once, small pods; then coverage
+# coverage: 27 tables, each with runs = 1 and status done; journal: both runs ok,
+# housekeeping true in exactly one of them
+make gl-group G=group_a & sleep 5; make gl-group G=group_a   # second one: "another run holds it; exiting"
+```
+
+Then compare findings with the last single-run scan (`scan-...-b07d93` or newer):
+each table's latest findings should be the same. The README's comparison query
+works per group run, using each run's scan_id.

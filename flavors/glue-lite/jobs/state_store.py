@@ -48,6 +48,8 @@ buffered and flushed once per scan (one append per table, one MERGE and one
 DELETE for partition_state). The DynamoDB backend will range per table instead.
 """
 import contextlib
+import random
+import time
 from datetime import datetime, timezone
 
 INF = float("inf")
@@ -347,6 +349,25 @@ def _q(v):
     return "'" + str(v).replace("'", "''") + "'"
 
 
+CONFLICT_MARKERS = ("CommitFailedException", "ValidationException", "conflicting files",
+                    "Found conflicting", "concurrent", "Cannot commit")
+
+
+def retry_on_conflict(fn, what, attempts=5, sleep=time.sleep):
+    """Run a row-level write (MERGE, DELETE, INSERT OVERWRITE) again when a
+    concurrent run committed to the same table first. Appends need no retry:
+    Iceberg retries them itself. -> fn's result; re-raises other errors."""
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:                       # py4j wraps the Java exception
+            text = f"{type(e).__name__}: {e}"
+            if i == attempts - 1 or not any(m in text for m in CONFLICT_MARKERS):
+                raise
+            print(f"  ({what}: concurrent commit, retry {i + 1}/{attempts - 1})", flush=True)
+            sleep(min(2 ** i, 15) + random.random())
+
+
 class IcebergStateStore(MemoryState):
     """Today's glue.ops tables behind the interface."""
 
@@ -410,13 +431,15 @@ class IcebergStateStore(MemoryState):
         for key in keys:
             by_table.setdefault(key[0], []).append(key[1])
         for u, rest in by_table.items():
-            self.spark.sql(f"DELETE FROM {self.ops}.{k.table} WHERE table_uuid = {_q(u)} "
-                           f"AND {k.key[1]} IN ({', '.join(_q(x) for x in rest)})")
+            sql = (f"DELETE FROM {self.ops}.{k.table} WHERE table_uuid = {_q(u)} "
+                   f"AND {k.key[1]} IN ({', '.join(_q(x) for x in rest)})")
+            retry_on_conflict(lambda: self.spark.sql(sql), f"delete from {k.table}")
 
     def expire(self, kind, older_than_days):
         k = KINDS[kind]
         if k.age and self._exists(kind):
-            self.spark.sql(f"DELETE FROM {self.ops}.{k.table} WHERE {_age_sql(*k.age, older_than_days)}")
+            sql = f"DELETE FROM {self.ops}.{k.table} WHERE {_age_sql(*k.age, older_than_days)}"
+            retry_on_conflict(lambda: self.spark.sql(sql), f"expire {k.table}")
             self._forget(kind)               # re-read on next use
 
     def compact(self, kind):
@@ -432,7 +455,8 @@ class IcebergStateStore(MemoryState):
         from scan_metrics import as_row
         sch = self.spark.table(t).schema
         self.spark.createDataFrame([as_row(r, sch) for r in latest], sch).createOrReplaceTempView("gl_state_compact")
-        self.spark.sql(f"INSERT OVERWRITE {t} SELECT * FROM gl_state_compact")
+        retry_on_conflict(lambda: self.spark.sql(f"INSERT OVERWRITE {t} SELECT * FROM gl_state_compact"),
+                          f"compact {k.table}")
         self._forget(kind)
         return n - len(latest)
 
@@ -448,10 +472,10 @@ class IcebergStateStore(MemoryState):
         self.spark.createDataFrame([as_row(r, sch) for r in last.values()], sch) \
             .createOrReplaceTempView("gl_state_merge")
         on = " AND ".join(f"t.{c} = u.{c}" for c in k.key)
-        self.spark.sql(f"""
+        retry_on_conflict(lambda: self.spark.sql(f"""
             MERGE INTO {t} t USING gl_state_merge u ON {on}
             WHEN MATCHED THEN UPDATE SET *
-            WHEN NOT MATCHED THEN INSERT *""")
+            WHEN NOT MATCHED THEN INSERT *"""), f"merge into {k.table}")
 
 
 class LogSink:
@@ -480,7 +504,8 @@ class IcebergLogSink(LogSink):
         return list(self._pending.get(kind, []))
 
     def expire(self, kind, older_than_days):
-        self.spark.sql(f"DELETE FROM {self.ops}.{kind} WHERE {_age_sql(LOG_AGE[kind], 'ts', older_than_days)}")
+        sql = f"DELETE FROM {self.ops}.{kind} WHERE {_age_sql(LOG_AGE[kind], 'ts', older_than_days)}"
+        retry_on_conflict(lambda: self.spark.sql(sql), f"expire {kind}")
 
     def flush(self):
         from scan_metrics import as_row

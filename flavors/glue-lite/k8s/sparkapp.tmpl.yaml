@@ -59,6 +59,9 @@ ${JOB_ARGS}
     spark.kubernetes.executor.secretKeyRef.AWS_ACCESS_KEY_ID: aws-creds:AWS_ACCESS_KEY_ID
     spark.kubernetes.executor.secretKeyRef.AWS_SECRET_ACCESS_KEY: aws-creds:AWS_SECRET_ACCESS_KEY
     spark.kubernetes.driverEnv.AWS_REGION: ${AWS_REGION}
+    # where the driver's boto3 calls (the coordinator's DynamoDB claims) go;
+    # the eks overlay drops it so real AWS endpoints are used
+    spark.kubernetes.driverEnv.GL_AWS_ENDPOINT: ${AWS_ENDPOINT}
     spark.executorEnv.AWS_REGION: ${AWS_REGION}
   driver:
     cores: 1

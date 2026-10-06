@@ -497,7 +497,6 @@ def match_tables(all_tables, wanted):
 def main():
     import gl_common as gl
     import probes
-    from detect_symptoms import latest_scan_id
     from pyspark.sql import SparkSession
 
     p = argparse.ArgumentParser()
@@ -512,15 +511,28 @@ def main():
 
     config = gl.load_config(a.config)
     spark = SparkSession.builder.appName("gl25-plan").getOrCreate()
-    scan_id = a.scan_id or latest_scan_id(spark)
-    if not scan_id:
-        sys.exit("No scan found: run make gl-scan first.")
     ns = gl.OPS_NAMESPACE
-    tms = {r.table_name: r.asDict() for r in
-           spark.sql(f"SELECT * FROM {ns}.table_metrics WHERE scan_id = '{scan_id}'").collect()}
+    window_h = int(float((config.get("incremental") or {}).get("previous_scan_window_hours", 168)))
+    if a.scan_id:
+        tms = {r.table_name: r.asDict() for r in
+               spark.sql(f"SELECT * FROM {ns}.table_metrics WHERE scan_id = '{a.scan_id}'").collect()}
+    else:
+        # each table's own latest scan: group runs scan only their tables, so the
+        # newest scan of the whole catalog no longer covers every table
+        tms = {r.table_name: {k: v for k, v in r.asDict().items() if k != "rn"} for r in spark.sql(f"""
+            SELECT * FROM (SELECT t.*, row_number() OVER (PARTITION BY table_name ORDER BY scanned_at DESC) AS rn
+                           FROM {ns}.table_metrics t
+                           WHERE scanned_at > current_timestamp() - INTERVAL {window_h} HOURS) WHERE rn = 1
+            """).collect()}
+    if not tms:
+        sys.exit("No scan found: run make gl-scan first.")
+    pairs = {(t, m["scan_id"]) for t, m in tms.items()}
+    scan_list = ", ".join(sorted({f"'{sid}'" for _, sid in pairs}))
     findings = {}
-    for r in spark.sql(f"SELECT * FROM {ns}.symptoms WHERE scan_id = '{scan_id}'").collect():
-        findings.setdefault(r.table_name, []).append(r.asDict())
+    for r in spark.sql(f"SELECT * FROM {ns}.symptoms WHERE scan_id IN ({scan_list})").collect():
+        if (r.table_name, r.scan_id) in pairs:
+            findings.setdefault(r.table_name, []).append(r.asDict())
+    scan_id = a.scan_id or (next(iter(pairs))[1] if len({s for _, s in pairs}) == 1 else "per-table latest")
 
     tables = match_tables(sorted(tms), [t.strip() for t in a.tables.split(",") if t.strip()])
     run_id = gl.new_run_id("plan")
@@ -583,7 +595,7 @@ def main():
                 hint = rollback_hint(ident_t, before, after) if status == "ok" else None
                 print(f"  -> {kind}: {status} in {dur}s  snapshot {before} -> {after}  {result[:300]}",
                       flush=True)
-                records.append(action_row(schema, run_id=run_id, scan_id=scan_id, started_at=now,
+                records.append(action_row(schema, run_id=run_id, scan_id=tms[t]["scan_id"], started_at=now,
                                           table_name=t, table_uuid=uuid, kind=kind,
                                           symptoms=",".join(s["symptoms"]), statement=stmt, status=status,
                                           duration_s=float(dur), result_json=result,
@@ -599,7 +611,7 @@ def main():
                 after = current_snapshot(spark, t)
                 print(f"  -> {s['kind']} (retry without remove-dangling-deletes): {status} in {dur}s  "
                       f"{result[:300]}", flush=True)
-                records.append(action_row(schema, run_id=run_id, scan_id=scan_id,
+                records.append(action_row(schema, run_id=run_id, scan_id=tms[t]["scan_id"],
                                           started_at=datetime.now(timezone.utc), table_name=t,
                                           table_uuid=uuid, kind=s["kind"], symptoms=",".join(s["symptoms"]),
                                           statement=retry, status=status, duration_s=float(dur),

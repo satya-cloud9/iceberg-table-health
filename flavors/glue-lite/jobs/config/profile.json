@@ -1,0 +1,11 @@
+{
+  "_comment": "Profile for the homelab target (profiles.py). Groups run as separate jobs: make gl-group G=<group> [SHARD=i/N]. group_a and group_b split glue.demo between them with no overlap; 'all' is every table (what make gl-scan does without a group). Claims go to DynamoDB (Floci here, reached at GL_AWS_ENDPOINT from the pods; real DynamoDB on AWS with no endpoint).",
+  "target": "homelab",
+  "namespaces": ["glue.demo"],
+  "coordination": {"backend": "dynamodb", "table": "advisor-coordination"},
+  "groups": {
+    "group_a": {"select": {"exclude": ["s1?_*", "s2?_*"]}, "shards": 1, "claim_hours": 3, "housekeeping_every_hours": 6},
+    "group_b": {"select": {"include": ["s1?_*", "s2?_*"]}, "shards": 1, "claim_hours": 3, "housekeeping_every_hours": 6},
+    "all":     {"select": {}, "shards": 1, "claim_hours": 3, "housekeeping_every_hours": 6}
+  }
+}

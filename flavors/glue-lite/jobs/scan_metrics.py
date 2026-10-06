@@ -94,6 +94,10 @@ def as_row(values, schema):
 
 REUSE_DROP = {"rn", "elapsed_min", "orphan_age_h", "retained_age_h"}
 
+COVERAGE_DDL = """
+    run_id STRING, scan_id STRING, target STRING, group_name STRING, shard STRING,
+    table_name STRING, status STRING, note STRING, at TIMESTAMP"""
+
 
 def load_previous(spark, tm_table, pm_table, namespace, window_hours=168):
     """Each table's latest successful scan row (with ages computed in SQL, so
@@ -204,7 +208,8 @@ def reuse(spark, table, cfg, p, prev_rows, scanned_at, snapshot_source="full"):
     return tm, rows
 
 
-def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), report=True, full=False):
+def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), report=True, full=False,
+             coord=None, run=None, housekeeping=True):
     """Measure every table in the namespace (or just `tables`); return the scan_id.
 
     `priority` tables are measured first (gl-scan puts s3 first so its hot
@@ -212,6 +217,11 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
 
     Tables whose metadata.json location is the same as at their last scan are
     reused (see reuse()); `full=True` measures everything from scratch.
+
+    coord (coordinator.py): each table is claimed before it is measured and
+    released after; a table another run holds is skipped and recorded so in
+    coverage. run: {run_id, target, group, shard} for the coverage log.
+    housekeeping: whether this run does the store's retention pass.
     """
     scan_id = scan_id or gl.new_run_id("scan")
     spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {gl.OPS_NAMESPACE}")
@@ -245,8 +255,21 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
     snap_source = "ledger" if led.mode == "on" else "full"
     ages = action_ages(spark, window_h)
     summary, modes, t_start = [], {"full": 0, "reused": 0}, time.perf_counter()
+    run = run or {}
+    coverage = []
+
+    def covered(table, status, note=None):
+        coverage.append({"run_id": run.get("run_id", scan_id), "scan_id": scan_id, "target": run.get("target"),
+                         "group_name": run.get("group"), "shard": run.get("shard"), "table_name": table,
+                         "status": status, "note": note, "at": probes.now_utc()})
+
     for name in names:
         table = f"{namespace}.{name}"
+        if coord is not None and not coord.claim_table(table, "scan"):
+            print(f"  skip   {table}  (claimed by another run)", flush=True)
+            covered(table, "claimed_elsewhere")
+            modes["skipped"] = modes.get("skipped", 0) + 1
+            continue
         cfg = gl.table_config(config, table)
         scanned_at = probes.now_utc()
         t0 = time.perf_counter()
@@ -357,12 +380,18 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
         log.append("table_metrics", [tm])
         summary.append(tm)
         modes[tm.get("scan_mode", "full")] = modes.get(tm.get("scan_mode", "full"), 0) + 1
+        covered(table, "failed" if tm.get("scan_mode") == "failed" else "done", tm.get("scan_mode"))
+        if coord is not None:
+            coord.release_table(table, "scan")
         print(f"  {tm.get('scan_mode', 'full'):6} {table}  {tm['scan_seconds']:.1f}s", flush=True)
     t_tables = time.perf_counter() - t_start
     print(f"=== {len(names)} tables in {t_tables:.1f}s: "
           + ", ".join(f"{k} {v}" for k, v in modes.items() if v) + " ===", flush=True)
     t_w = time.perf_counter()
-    led.report()                      # writes the ledger's state and the buffered logs
+    led.report(housekeeping=housekeeping)   # writes the ledger's state and the buffered logs
+    if coverage:
+        spark.sql(f"CREATE TABLE IF NOT EXISTS {gl.OPS_NAMESPACE}.coverage ({COVERAGE_DDL}) USING iceberg")
+        log.append("coverage", coverage)
     log.flush()
     t_w = time.perf_counter() - t_w
     st = led.store.stats

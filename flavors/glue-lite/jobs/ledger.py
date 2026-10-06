@@ -837,7 +837,9 @@ class Ledger:
         self.log.flush()
 
     # -- end of scan -------------------------------------------------------
-    def report(self):
+    def report(self, housekeeping=True):
+        """Flush, print the comparisons, and (when this run holds the
+        housekeeping claim) do the retention pass."""
         if self.mode == "off" and self.mode2 == "off":
             return
         self.flush()
@@ -875,6 +877,8 @@ class Ledger:
         for table, agree, n, dis, _, event in self.results:
             for m, f, l, note in dis:
                 print(f"  {table.rsplit('.', 1)[-1]:26} {m}: full={f} ledger={l}  {note} [{event}]", flush=True)
+        if not housekeeping:
+            return
         try:   # keep the stores bounded (DynamoDB: a TTL attribute instead)
             self.log.expire("incremental_check", 30)
             keep = max(self.hist_days * 3, 90, self.max_days + 1)
