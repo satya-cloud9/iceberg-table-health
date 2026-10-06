@@ -1323,9 +1323,10 @@ how state is read and written.
   in one query and serves `get` and `range` from memory, buffers writes, and
   flushes once per scan (one append per table, one MERGE for partition_state).
 - **The ledger runs no per-table SQL any more.** Before, it ran about 12 queries
-  per table; now each of its 7 kinds costs one count (for the size guard) and one
-  read per scan, about 14 queries whatever the table count, plus a table load
-  for any table whose retained snapshots reach past the window. Detect reads
+  per table; now each of its 7 kinds costs one read per scan, whatever the table
+  count, plus a table load for any table whose retained snapshots reach past
+  the window. The size guard needs no count query: the read asks for
+  `store_preload_max_rows + 1` rows, and gets dropped when it returns more. Detect reads
   partition state, activity and lateness through the store. The holds
   aggregation moved from SQL into `holds.activity_from_rows`, which matches the
   SQL on random data.
@@ -1342,8 +1343,9 @@ how state is read and written.
   - **Only this run's tables** when `--tables` is given; new tables load on
     their own.
   - **A size guard.** A kind with more than `store_preload_max_rows` rows in
-    its window (2M) isn't read in bulk; tables then load one by one, and the
-    Timing line counts those loads.
+    its window (2M) isn't read in bulk (the read is a `LIMIT max_rows + 1`, so
+    no count query); tables then load one by one, and the Timing line counts
+    those loads.
   - **The latest full refresh** is kept in `activity_state`
     (`last_full_refresh_ms`, seeded once from history), so no read goes back
     to the start of history.
@@ -1376,3 +1378,8 @@ make gl-sql Q="(SELECT 'before' AS side, table_name, partition_key, symptom, act
 
 The scorecard and the incremental-check sections (ledger, activity, retained
 bytes, holds, new findings, expiry) should read the same as in the baseline.
+
+Gate result (homelab, 27 tables, `--full`): findings identical to the last
+scan before the change (empty diff); per-table time 75.2 s → 51.5 s; steady
+state 0 table loads. Follow-up: the size guard's count queries were replaced by
+a `LIMIT` read (half the store queries) and table-existence checks are cached.

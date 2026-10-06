@@ -41,8 +41,8 @@ is a range on DynamoDB too.
 
 IcebergStateStore (this step) keeps today's ops tables. preload(kind, start,
 uuids, max_rows) reads a kind in one query, bounded to a time window and the
-run's tables, and skips the bulk read when the kind is bigger than max_rows
-(tables then load one by one). get / range are served from memory; a range
+run's tables, and drops the bulk read when more than max_rows come back (it
+reads max_rows + 1, so no separate count; tables then load one by one). get / range are served from memory; a range
 reaching further back than what's loaded re-reads that one table. Writes are
 buffered and flushed once per scan (one append per table, one MERGE and one
 DELETE for partition_state). The DynamoDB backend will range per table instead.
@@ -183,13 +183,10 @@ class MemoryState(StateStore):
                       "table_loads": 0, "preload_skipped": []}
 
     # backend hooks
-    def _load(self, kind, start=None, uuids=None):
+    def _load(self, kind, start=None, uuids=None, limit=None):
         """-> rows of the kind (latest kinds: the latest per key), from `start` on
-        (first sort field), for `uuids` (None = every table)."""
+        (first sort field), for `uuids` (None = every table), at most `limit`."""
         return []
-
-    def _count(self, kind, start=None, uuids=None):
-        return 0
 
     def _write(self, kind, rows):
         pass
@@ -204,12 +201,12 @@ class MemoryState(StateStore):
         one by one as they're used. -> True when preloaded."""
         if self._kind_cover[kind] is not _UNSET and _covers(self._kind_cover[kind], start) and uuids is None:
             return True
-        if max_rows:
-            n = self._count(kind, start, uuids)
-            if n > max_rows:
-                self.stats["preload_skipped"].append((kind, n))
-                return False
-        rows = self._load(kind, start, uuids)
+        # one query: read up to max_rows + 1; more than max_rows back = too big,
+        # dropped, and tables load one by one instead (no separate count query)
+        rows = self._load(kind, start, uuids, limit=(max_rows + 1) if max_rows else None)
+        if max_rows and len(rows) > max_rows:
+            self.stats["preload_skipped"].append((kind, f"> {max_rows}"))
+            return False
         if uuids is None:
             self._cache[kind] = {}
             self._fill(kind, rows)
@@ -356,13 +353,16 @@ class IcebergStateStore(MemoryState):
     def __init__(self, spark, ops):
         super().__init__()
         self.spark, self.ops = spark, ops
+        self._exists_cache = {}
 
     def _rows(self, sql):
         self.stats["queries"] += 1
         return [r.asDict() for r in self.spark.sql(sql).collect()]
 
     def _exists(self, kind):
-        return self.spark.catalog.tableExists(f"{self.ops}.{KINDS[kind].table}")
+        if kind not in self._exists_cache:      # one catalog call per kind per run
+            self._exists_cache[kind] = self.spark.catalog.tableExists(f"{self.ops}.{KINDS[kind].table}")
+        return self._exists_cache[kind]
 
     def _where(self, kind, start, uuids):
         k = KINDS[kind]
@@ -386,19 +386,14 @@ class IcebergStateStore(MemoryState):
                     f"ORDER BY {k.version} DESC) AS rn FROM {t} s {where}) WHERE rn = 1")
         return f"SELECT * FROM {t} s {where}"
 
-    def _load(self, kind, start=None, uuids=None):
+    def _load(self, kind, start=None, uuids=None, limit=None):
         if not self._exists(kind):
             return []
-        rows = self._rows(self._select(kind, self._where(kind, start, uuids)))
+        rows = self._rows(self._select(kind, self._where(kind, start, uuids))
+                          + (f" LIMIT {int(limit)}" if limit else ""))
         for r in rows:
             r.pop("rn", None)
         return rows
-
-    def _count(self, kind, start=None, uuids=None):
-        if not self._exists(kind):
-            return 0
-        return int(self._rows(f"SELECT count(*) AS n FROM {self.ops}.{KINDS[kind].table} s "
-                              f"{self._where(kind, start, uuids)}")[0]["n"])
 
     def _write(self, kind, rows):
         from scan_metrics import as_row
