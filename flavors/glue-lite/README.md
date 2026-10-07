@@ -1443,3 +1443,17 @@ make gl-group G=group_a & sleep 5; make gl-group G=group_a   # second one: "anot
 Then compare findings with the last single-run scan (`scan-...-b07d93` or newer):
 each table's latest findings should be the same. The README's comparison query
 works per group run, using each run's scan_id.
+
+**Claim fix.** On the first cluster test a second run of a running group was not
+turned away: Floci's DynamoDB let a claim through whose condition was one OR
+expression (`attribute_not_exists(pk) OR expires_at < :now OR run_id = :me`).
+Claims now use three single-clause conditional puts in turn (free, expired,
+ours), each of which Floci enforces; `spike/claim-check.sh` shows both
+behaviours and lists the coordination table's items. Real DynamoDB handles
+either form.
+
+```bash
+bash flavors/glue-lite/spike/claim-check.sh      # A may FAIL on Floci (the OR form); B1-B4 and C must pass
+make gl-image
+make gl-group G=group_a > /tmp/g1.log 2>&1 & sleep 20; make gl-group G=group_a 2>&1 | grep -E "=== Group|holds it"
+```

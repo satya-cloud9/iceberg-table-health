@@ -137,18 +137,26 @@ class DynamoCoordinator(Coordinator):
         return {"N": str(v)} if isinstance(v, (int, float)) and not isinstance(v, bool) else {"S": str(v)}
 
     def _acquire(self, pk, sk, ttl_s, extra=None):
+        """Take the claim when nobody holds it, its holder's time ran out, or we
+        already hold it. Three single-clause conditional puts, tried in turn,
+        rather than one OR condition: each clause on its own is what the Floci
+        check proved, and the OR form was let through there. Races stay safe:
+        once one run's put lands, the others' conditions are false."""
         item = {"pk": {"S": pk}, "sk": {"S": sk}, "run_id": {"S": self.run_id},
                 "expires_at": {"N": str(now_s() + ttl_s)}}
         for k, v in (extra or {}).items():
             item[k] = self._av(v)
-        try:
-            self.db.put_item(
-                TableName=self.table, Item=item,
-                ConditionExpression="attribute_not_exists(pk) OR expires_at < :now OR run_id = :me",
-                ExpressionAttributeValues={":now": {"N": str(now_s())}, ":me": {"S": self.run_id}})
-            return True
-        except self.db.exceptions.ConditionalCheckFailedException:
-            return False
+        attempts = (("attribute_not_exists(pk)", None),
+                    ("expires_at < :now", {":now": {"N": str(now_s())}}),
+                    ("run_id = :me", {":me": {"S": self.run_id}}))
+        for cond, vals in attempts:
+            kw = {"ExpressionAttributeValues": vals} if vals else {}
+            try:
+                self.db.put_item(TableName=self.table, Item=item, ConditionExpression=cond, **kw)
+                return True
+            except self.db.exceptions.ConditionalCheckFailedException:
+                continue
+        return False
 
     def _release(self, pk, sk, extra=None):
         sets, vals = ["expires_at = :zero"], {":zero": {"N": "0"}, ":me": {"S": self.run_id}}
