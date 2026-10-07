@@ -116,7 +116,7 @@ def decide(facts, cfg, partitions=None):
         out.append(("rewrite_manifests", f"{facts['manifests']} manifests > {cfg['max_manifests']}"))
     if facts["expirable"] >= cfg["min_expire"]:
         out.append(("expire_snapshots", f"{facts['expirable']} of {facts['snapshots']} snapshots not current in "
-                                        f"the last {cfg['safe_age_hours']} h, beyond the newest {cfg['retain_last']}"))
+                                        f"the last {float(cfg['safe_age_hours']):.4g} h, beyond the newest {cfg['retain_last']}"))
     return out
 
 

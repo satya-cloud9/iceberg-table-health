@@ -7,7 +7,11 @@ glue.ops.table_metrics. For each table it builds, in order:
        SMALL_FILES / SCATTERED_SMALL_FILES / OVERSIZED_FILES / DELETE_BUILDUP;
        top max_partitions_per_run by score; hot partitions are never included
   2. rewrite_manifests                       MANIFEST_BLOAT
-  3. expire_snapshots (retain_last N)        SNAPSHOT_BUILDUP
+  3. expire_keep_files                       SNAPSHOT_BUILDUP
+       expire snapshots to the retention policy WITHOUT deleting files; the
+       files that freed are recorded (freed_files.py) with their due time
+  4. delete_freed_files                      files earlier expiries freed whose
+       grace (the longest a reader can run) has passed
 
 Options come from the same config the scan used, so a flagged partition is
 always one the rewrite will change: target size = the target the scan judged
@@ -188,8 +192,15 @@ def _sql_str(s):
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def plan_table(table, findings, tm, cfg, now=None):
-    """-> list of steps: dict(kind, auto, symptoms, statement, note)."""
+def ts_text(ms):
+    return datetime.fromtimestamp(ms / 1000.0, timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + "+00:00"
+
+
+def plan_table(table, findings, tm, cfg, now=None, freed=None):
+    """-> list of steps: dict(kind, auto, symptoms, statement, note[, op, params]).
+    freed: freed_files.summary() of this table's recorded files, or None.
+    Steps with an "op" run through Python (freed_files.py), not SQL; their
+    statement is a readable description."""
     th, rw = cfg["thresholds"], cfg.get("rewrite", {})
     ident = table.split(".", 1)[1] if table.startswith("glue.") else table
     fields = json.loads(tm.get("partition_fields_json") or "[]")
@@ -331,32 +342,48 @@ def plan_table(table, findings, tm, cfg, now=None):
                                        f"('commit.manifest-merge.enabled' = 'true')",
                           "note": "needs approval: otherwise the manifests pile up again"})
 
-    # 3. snapshots last, so the snapshots the rewrites replaced can expire too
+    # 3. snapshots last, so the snapshots the rewrites replaced can expire too.
+    #    Files are kept: the expiry records what it freed, deleted after the grace (4).
+    exp = cfg.get("expiry") or {}
     sb = next((f for f in active if f["symptom"] == "SNAPSHOT_BUILDUP" and f["action"] == "auto"), None)
     if sb:
         keep = int(rw.get("expire_retain_last", 5))
-        older, note = "{now}", f"keeps the last {keep} snapshots"
         pol = json.loads(sb.get("evidence_json") or "{}")
-        cut_ms = None
+        now_ms = (now or datetime.now(timezone.utc)).timestamp() * 1000
+        cut_ms = now_ms
+        note = f"keeps the last {keep} snapshots"
         if pol.get("policy_age_h") is not None:
-            # GL2.6e: expire to the retention policy, never inside it
+            # expire to the retention policy, never inside it
             keep = int(pol.get("policy_min_keep") or keep)
-            cut_ms = (now or datetime.now(timezone.utc)).timestamp() * 1000 - float(pol["policy_age_h"]) * 3600000
-            older = "TIMESTAMP '" + datetime.fromtimestamp(cut_ms / 1000.0, timezone.utc) \
-                .strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + "+00:00'"
+            cut_ms = now_ms - float(pol["policy_age_h"]) * 3600000
             note = (f"policy: older than {float(pol['policy_age_h']):g} h, keeping the last {keep} "
                     f"({pol.get('policy_source')})")
         pre = tm.get("pre_refresh_snapshot_ms")
-        if pre and int(cfg.get("keep_full_copies", 1)) >= 1 and (cut_ms is None or int(pre) < cut_ms):
-            # GL2.5o+: keep the copy before the latest possible full refresh, so a bad
+        if pre and int(cfg.get("keep_full_copies", 1)) >= 1 and int(pre) < cut_ms:
+            # keep the copy before the latest possible full refresh, so a bad
             # refresh can still be rolled back (expire only what is older than it)
-            older = "TIMESTAMP '" + datetime.fromtimestamp(int(pre) / 1000.0, timezone.utc) \
-                .strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + "+00:00'"
+            cut_ms = int(pre)
             note += "; keeps the snapshot before the latest possible full refresh"
-        steps.append({"kind": "expire_snapshots", "auto": True, "symptoms": ["SNAPSHOT_BUILDUP"],
-                      "statement": (f"CALL glue.system.expire_snapshots(table => '{ident}', "
-                                    f"older_than => {older}, retain_last => {keep})"),
-                      "note": note})
+        grace = pol.get("policy_file_grace_h")
+        gsrc = pol.get("policy_grace_source")
+        if grace is None:
+            import expiry as xp
+            grace, gsrc = xp.file_grace(json.loads(tm.get("properties_json") or "{}"), exp)
+        steps.append({"kind": "expire_keep_files", "auto": True, "symptoms": ["SNAPSHOT_BUILDUP"],
+                      "op": "expire_keep_files",
+                      "params": {"older_than_ms": int(cut_ms), "retain_last": keep, "grace_h": float(grace)},
+                      "statement": (f"expire snapshots older than {ts_text(int(cut_ms))}, retain_last {keep}, "
+                                    f"files kept; freed files deleted after {float(grace):g} h"),
+                      "note": f"{note}; file grace {float(grace):g} h ({gsrc})"})
+
+    # 4. files earlier expiries freed, past their grace
+    if freed and freed.get("due"):
+        nxt = freed.get("next_due_ms")
+        steps.append({"kind": "delete_freed_files", "auto": True, "symptoms": ["FREED_FILES"], "op": "delete_freed_files",
+                      "params": {}, "statement": f"delete {freed['due']} freed files past their grace",
+                      "note": (f"{freed['due']} files freed by earlier expiries are past their grace"
+                               + (f"; {freed['waiting']} more wait until {ts_text(nxt)} or later"
+                                  if freed.get("waiting") and nxt else ""))})
 
     # approval / needs-evidence: suggestions only
     for f in active:
@@ -381,12 +408,19 @@ def plan_table(table, findings, tm, cfg, now=None):
             stmt = (f"CALL glue.system.rewrite_data_files(table => '{ident}', "
                     f"options => map('rewrite-all', 'true', 'target-file-size-bytes', '{target}'))")
         elif f["symptom"] == "RETAINED_STORAGE":
-            # expire to the configured policy now; shortening the policy is the owner's call
+            # expire to the configured policy now, files kept for the grace;
+            # shortening the policy is the owner's call
+            import expiry as xp
             age_h = float(th.get("max_snapshot_age_h", 120))
             keep = int(rw.get("expire_retain_last", 5))
-            cut = (now or datetime.now(timezone.utc)) - timedelta(hours=age_h)
-            stmt = (f"CALL glue.system.expire_snapshots(table => '{ident}', "
-                    f"older_than => TIMESTAMP '{cut.strftime('%Y-%m-%d %H:%M:%S')}+00:00', retain_last => {keep})")
+            cut_ms = int(((now or datetime.now(timezone.utc)) - timedelta(hours=age_h)).timestamp() * 1000)
+            grace, gsrc = xp.file_grace(json.loads(tm.get("properties_json") or "{}"), cfg.get("expiry") or {})
+            steps.append({"kind": "suggest", "auto": False, "symptoms": [f["symptom"]], "op": "expire_keep_files",
+                          "params": {"older_than_ms": cut_ms, "retain_last": keep, "grace_h": float(grace)},
+                          "statement": (f"expire snapshots older than {ts_text(cut_ms)}, retain_last {keep}, "
+                                        f"files kept; freed files deleted after {float(grace):g} h"),
+                          "note": f"{f['action']}: {f['remedy']}"})
+            continue
         elif f["symptom"] == "METADATA_BLOAT":
             props = json.loads(tm.get("properties_json") or "{}")
             if str(props.get("write.metadata.delete-after-commit.enabled", "false")).lower() != "true":
@@ -399,6 +433,14 @@ def plan_table(table, findings, tm, cfg, now=None):
             stmt = (f"ALTER TABLE {table} SET TBLPROPERTIES "
                     f"('write.metadata.delete-after-commit.enabled' = 'true')")
         elif f["symptom"] == "ORPHAN_FILES":
+            waiting = (freed or {}).get("waiting", 0) + (freed or {}).get("due", 0)
+            if waiting:
+                # a freed file may be months old: orphan removal (age by creation time)
+                # would delete it before its grace is over
+                steps.append({"kind": "suggest", "auto": False, "symptoms": [f["symptom"]], "statement": "",
+                              "note": (f"held: {waiting} files freed by an expiry are waiting out their grace; "
+                                       f"orphan removal runs once none are left")})
+                continue
             stmt = (f"CALL glue.system.remove_orphan_files(table => '{ident}', "
                     f"older_than => {{orphan_cutoff}}, prefix_listing => true)")
         elif f["symptom"] == "POOR_CLUSTERING" and ev.get("column"):
@@ -445,6 +487,25 @@ def run_sql(spark, stmt):
         rows = [r.asDict() for r in spark.sql(stmt).collect()]
         status, result = "ok", json.dumps(rows, default=str)
     except Exception as e:  # record and carry on with the next step
+        status, result = "failed", f"{type(e).__name__}: {e}"[:2000]
+    return status, result, round(time.perf_counter() - t0, 2)
+
+
+def run_op(spark, step, table, uuid, store, run_id):
+    """A step with an "op" (freed_files.py). -> (status, result_json_or_error, seconds)."""
+    import freed_files as ff
+    t0 = time.perf_counter()
+    try:
+        p = step.get("params") or {}
+        if step["op"] == "expire_keep_files":
+            out = ff.expire_keep_files(spark, table, uuid, p["older_than_ms"], p["retain_last"], p["grace_h"],
+                                       store, run_id)
+        elif step["op"] == "delete_freed_files":
+            out = ff.delete_due(spark, table, uuid, store)
+        else:
+            raise ValueError(f"unknown op {step['op']}")
+        status, result = "ok", json.dumps(out, default=str)
+    except Exception as e:  # record and carry on with the next table
         status, result = "failed", f"{type(e).__name__}: {e}"[:2000]
     return status, result, round(time.perf_counter() - t0, 2)
 
@@ -545,9 +606,16 @@ def main():
         spark.sql(f"CREATE TABLE IF NOT EXISTS {ns}.actions ({ACTIONS_DDL}) USING iceberg")
         gl.ensure_columns(spark, f"{ns}.actions", ACTIONS_DDL)
         schema = spark.table(f"{ns}.actions").schema
+    import freed_files as ff
+    import state_store as ss
+    store = ss.IcebergStateStore(spark, ns)
+    ff.ensure_table(spark, ns)
+    store.preload(ff.KIND)
     records = []
     for t in tables:
-        steps = plan_table(t, findings.get(t, []), tms[t], gl.table_config(config, t))
+        t_uuid = tms[t].get("table_uuid")
+        freed = ff.summary(store.range(ff.KIND, (t_uuid,)), ff.now_ms()) if t_uuid else None
+        steps = plan_table(t, findings.get(t, []), tms[t], gl.table_config(config, t), freed=freed)
         print(f"\n--- {t}: {'nothing to do' if not steps else ''}", flush=True)
         for s in steps:
             tag = "RUN " if s["auto"] else ("HOLD" if s["kind"] == "hold" else "ASK ")
@@ -577,6 +645,20 @@ def main():
             # The +00:00 matters: a bare TIMESTAMP literal is read in the Spark session's
             # time zone; off UTC, the orphan cutoff would move (later = younger files deleted).
             kind = s["kind"] if s["auto"] else "approved:" + ",".join(s["symptoms"])
+            if s.get("op"):
+                # Python actions (freed_files.py): expiry that keeps files, deferred deletion
+                before = current_snapshot(spark, t)
+                status, result, dur = run_op(spark, s, t, uuid or t_uuid, store, run_id)
+                after = current_snapshot(spark, t)
+                print(f"  -> {kind}: {status} in {dur}s  snapshot {before} -> {after}  {result[:300]}", flush=True)
+                records.append(action_row(schema, run_id=run_id, scan_id=tms[t]["scan_id"], started_at=now,
+                                          table_name=t, table_uuid=uuid, kind=kind,
+                                          symptoms=",".join(s["symptoms"]), statement=s["statement"],
+                                          status=status, duration_s=float(dur), result_json=result,
+                                          snapshot_before=before, snapshot_after=after, rollback_hint=None))
+                if status != "ok":
+                    break
+                continue
             for stmt in [x.strip() for x in text.split("; ") if x.strip()]:   # suggestions may hold several
                 before = current_snapshot(spark, t)
                 age_min = float(cfg_t.get("orphan_min_age_minutes", 4320))

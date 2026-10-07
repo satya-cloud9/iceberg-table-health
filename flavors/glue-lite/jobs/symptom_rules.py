@@ -576,9 +576,13 @@ def expiry_findings(table, tm, th):
                             {"expirable_snapshots": n, "oldest_expirable_age_h": tm.get("oldest_expirable_age_h"),
                              "policy_age_h": tm.get("policy_age_h"), "policy_min_keep": tm.get("policy_min_keep"),
                              "policy_source": tm.get("policy_source"), "write_category": tm.get("write_category"),
-                             "snapshots": tm.get("snapshots"), "retained_bytes": tm.get("retained_bytes")},
-                            remedy=f"expire_snapshots to the policy: older than {tm.get('policy_age_h'):g} h, "
-                                   f"keeping the last {tm.get('policy_min_keep')} ({tm.get('policy_source')})"))
+                             "snapshots": tm.get("snapshots"), "retained_bytes": tm.get("retained_bytes"),
+                             "policy_file_grace_h": tm.get("policy_file_grace_h"),
+                             "policy_grace_source": tm.get("policy_grace_source"),
+                             "freed_files_waiting": tm.get("freed_files_waiting")},
+                            remedy=f"expire snapshots to the policy: older than {tm.get('policy_age_h'):g} h, "
+                                   f"keeping the last {tm.get('policy_min_keep')} ({tm.get('policy_source')}); "
+                                   f"freed files kept {tm.get('policy_file_grace_h') or 12:g} h for running readers"))
     try:
         stale = json.loads(tm.get("stale_refs_json") or "[]")
     except ValueError:

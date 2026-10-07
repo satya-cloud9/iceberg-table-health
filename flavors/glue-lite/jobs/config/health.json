@@ -19,11 +19,15 @@
     "retained_bytes_every_hours": 0,
     "retained_bytes": "ledger",
     "expiry": {
-      "_comment": "GL2.6e expiry by policy (expiry.py). Category: streaming when the table had >= streaming_min_commits_24h writer commits in the last 24 h. The table's history.expire.* properties win, then advisor.expire.max-age-hours / advisor.expire.min-snapshots, then these. inflight_floor_hours: the age is never below it; TEST SCALE 0.05 h (3 min, like the hot window), production 24. stale_ref_hours: a tag or branch other than main older than this with no retention of its own is STALE_REF; TEST SCALE 1 h, production ~720 (30 days). retained_bytes (sibling key): full = today's all_files query (rationed by retained_bytes_every_hours) with the summary formula computed and compared; ledger (on since GL2.6f, after 27/27 tables agreed on the cluster) = the summary formula for data bytes, the old-manifest query on retained_bytes_every_hours, and the full all_files query only as the rationed fallback for a table whose formula is unknown (refs other than main, branched history, no size summaries) or not yet computed; off = not measured.",
+      "_comment": "GL2.6e expiry by policy (expiry.py). Category: streaming when the table had >= streaming_min_commits_24h writer commits in the last 24 h. The table's history.expire.* properties win, then advisor.expire.max-age-hours / advisor.expire.min-snapshots, then these. max_snapshots: more snapshots inside the window shorten it (each is a metadata.json entry every commit rewrites). window_floor_hours: the window is never shorter (2 x the scan interval, so every commit reaches the ledger first); TEST SCALE 0.05 h, production ~12. Expiry of user tables deletes no files (freed_files.py): the files it frees wait out the file grace, then the plan deletes them. file grace: advisor.expire.file-grace-hours, else advisor.expire.reader-timeout-hours + clock_margin_minutes, else file_grace_hours, floored at file_grace_floor_hours unless from a declared timeout; TEST SCALE 0.1 h / 0.05 h / 1 min, production 12 h / 1 h / 10 min. stale_ref_hours: a tag or branch other than main older than this with no retention of its own is STALE_REF; TEST SCALE 1 h, production ~720 (30 days). retained_bytes (sibling key): full = today's all_files query (rationed by retained_bytes_every_hours) with the summary formula computed and compared; ledger (on since GL2.6f, after 27/27 tables agreed on the cluster) = the summary formula for data bytes, the old-manifest query on retained_bytes_every_hours, and the full all_files query only as the rationed fallback for a table whose formula is unknown (refs other than main, branched history, no size summaries) or not yet computed; off = not measured.",
       "batch": {"max_age_hours": 120, "min_snapshots": 10},
       "streaming": {"max_age_hours": 72, "min_snapshots": 10},
       "streaming_min_commits_24h": 48,
-      "inflight_floor_hours": 0.05,
+      "window_floor_hours": 0.05,
+      "max_snapshots": 3600,
+      "file_grace_hours": 0.1,
+      "file_grace_floor_hours": 0.05,
+      "clock_margin_minutes": 1,
       "stale_ref_hours": 1
     },
     "thresholds": {

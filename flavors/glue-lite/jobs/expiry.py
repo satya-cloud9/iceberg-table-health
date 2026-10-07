@@ -11,8 +11,23 @@ snapshots cost (Traceability A4). The policy, first match wins:
                                   expiry.streaming_min_commits_24h writer commits in the
                                   last 24 h, else batch (defaults: batch 120 h / 10,
                                   streaming 72 h / 10)
-  then the floor for work in flight: the age is never under expiry.inflight_floor_hours
-  (24 h by default; a long query or write still needs its starting snapshot).
+  then two bounds on that window:
+    max snapshots   advisor.expire.max-snapshots / expiry.max_snapshots (3,600):
+                    more snapshots inside the window shorten it, since each one
+                    is an entry in metadata.json that every commit rewrites
+    window floor    expiry.window_floor_hours (2 x the scan interval): never
+                    shorter, so every commit is in the advisor's commit log
+                    before Iceberg drops it
+
+The window protects time travel, incremental consumers and the advisor's own
+history, not readers already running: on user tables the expiry deletes no
+files (freed_files.py), and the freed files wait out the FILE GRACE, first match:
+
+  1. advisor.expire.file-grace-hours           the owner's word for this table
+  2. advisor.expire.reader-timeout-hours       a declared timeout every reader of
+     + expiry.clock_margin_minutes             the table runs under (no floor)
+  3. expiry.file_grace_hours (12)              no timeout known: an assumption
+  floored at expiry.file_grace_floor_hours (1) unless it comes from 2.
 
 Refs: expire_snapshots never removes a snapshot a tag or branch points at, nor
 the ancestors a branch's own retention keeps. Snapshots behind a ref other than
@@ -48,7 +63,8 @@ def category(snaps, now_ms, cfg):
 
 
 def resolve_policy(props, cfg, snaps, now_ms):
-    """-> {age_h, min_keep, source, category, writer_commits_24h, floor_h}."""
+    """-> {age_h, min_keep, source, category, writer_commits_24h, floor_h,
+    max_snapshots, file_grace_h, grace_source}."""
     exp = cfg.get("expiry") or {}
     cat, n24 = category(snaps, now_ms, cfg)
     defaults = (exp.get(cat) or {})
@@ -66,11 +82,39 @@ def resolve_policy(props, cfg, snaps, now_ms):
         if props.get("history.expire.min-snapshots-to-keep"):
             keep = int(props["history.expire.min-snapshots-to-keep"])
         source = "table property history.expire.*"
-    floor_h = float(exp.get("inflight_floor_hours", 24))
+    # metadata.json cost: at most max_snapshots inside the window
+    max_snaps = int(props.get("advisor.expire.max-snapshots") or exp.get("max_snapshots", 3600))
+    max_snaps = max(max_snaps, keep)
+    newest = sorted((s["ts_ms"] for s in snaps), reverse=True)
+    inside = [t for t in newest if t >= now_ms - age_h * H]
+    if len(inside) > max_snaps:
+        capped_h = (now_ms - newest[max_snaps - 1]) / H
+        if capped_h < age_h:
+            age_h, source = capped_h, source + f" (shortened to keep {max_snaps} snapshots)"
+    floor_h = float(exp.get("window_floor_hours", exp.get("inflight_floor_hours", 12)))
     if age_h < floor_h:
-        age_h, source = floor_h, source + f" (raised to the {floor_h:g} h in-flight floor)"
+        age_h, source = floor_h, source + f" (raised to the {floor_h:g} h window floor)"
+    grace_h, grace_source = file_grace(props, exp)
     return {"age_h": age_h, "min_keep": keep, "source": source, "category": cat,
-            "writer_commits_24h": n24, "floor_h": floor_h}
+            "writer_commits_24h": n24, "floor_h": floor_h, "max_snapshots": max_snaps,
+            "file_grace_h": grace_h, "grace_source": grace_source}
+
+
+def file_grace(props, exp):
+    """How long files an expiry freed are kept: -> (hours, source)."""
+    props = props or {}
+    floor = float(exp.get("file_grace_floor_hours", 1))
+    margin_h = float(exp.get("clock_margin_minutes", 10)) / 60
+    if props.get("advisor.expire.file-grace-hours"):
+        g, src = float(props["advisor.expire.file-grace-hours"]), "table property advisor.expire.file-grace-hours"
+    elif props.get("advisor.expire.reader-timeout-hours"):
+        g = float(props["advisor.expire.reader-timeout-hours"]) + margin_h
+        return g, f"declared reader timeout {float(props['advisor.expire.reader-timeout-hours']):g} h + margin"
+    else:
+        g, src = float(exp.get("file_grace_hours", 12)), "config expiry.file_grace_hours (no reader timeout known)"
+    if g < floor:
+        g, src = floor, src + f" (raised to the {floor:g} h floor)"
+    return g, src
 
 
 def ancestors(by_id, current):
@@ -106,6 +150,7 @@ def expiry_facts(snaps, refs, current, now_ms, policy, cfg):
     oldest = min((s["ts_ms"] for s in expirable), default=None)
     return {"policy_age_h": policy["age_h"], "policy_min_keep": policy["min_keep"],
             "policy_source": policy["source"], "write_category": policy["category"],
+            "policy_file_grace_h": policy.get("file_grace_h"), "policy_grace_source": policy.get("grace_source"),
             "writer_commits_24h": policy["writer_commits_24h"],
             "expirable_snapshots": len(expirable),
             "oldest_expirable_age_h": None if oldest is None else round((now_ms - oldest) / H, 2),

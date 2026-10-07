@@ -1539,3 +1539,62 @@ make gl-groups-parallel      # housekeeping (with upkeep) in exactly one run; co
 whether the row appended in between survived (on the homelab it was lost).
 Part C checks the expiry cutoff with three commits: S2, committed before the
 safe age but current until S3, is kept; S1 goes.
+
+## Deferred file deletion (user tables)
+
+Snapshot expiry on your own tables no longer deletes files. It runs in two
+steps, so the expiry window can stay short while readers already running keep
+their files:
+
+1. **`expire_keep_files`** (plan step for SNAPSHOT_BUILDUP):
+   `ExpireSnapshotsSparkAction.expireFiles()` commits the expiry with file
+   cleanup off and returns the files that just became unreferenced (data,
+   manifests, manifest lists, statistics). `freed_files.py` records each one in
+   the state store (`glue.ops.freed_files`) with `unreferenced_ms` and `due_ms`.
+2. **`delete_freed_files`** (plan step when files are due): deletes the files
+   whose grace has passed, in bulk through the table's `FileIO`, then drops
+   their records. A partial failure keeps the records of files still there.
+
+**Grace** (`expiry.py file_grace`), first match:
+- `advisor.expire.file-grace-hours`;
+- `advisor.expire.reader-timeout-hours` + `clock_margin_minutes` (a timeout
+  every reader of the table runs under; no floor);
+- `file_grace_hours`.
+
+It is floored at `file_grace_floor_hours` unless it comes from a declared
+timeout. Production values: 12 h, 1 h, 10 min. The homelab config uses test
+scale: 0.1 h, 0.05 h, 1 min.
+
+**Window:** the policy age as before. More than `max_snapshots` (3,600)
+snapshots inside it shorten it, and it is never shorter than
+`window_floor_hours` (production about 2 × the scan interval; this replaces
+`inflight_floor_hours`, which is still read if set).
+
+**Other changes:**
+- The scan reports `freed_files_waiting` per table. The orphan listing counts
+  waiting files apart, not as orphans.
+- The plan holds orphan removal on a table while freed files wait. A freed file
+  may be months old, so an age by creation time would not protect it.
+- The RETAINED_STORAGE suggestion expires the same way.
+- A crash between the expiry commit and the record leaves those files
+  unrecorded; the orphan sweep (an age of days) is the backstop.
+
+**Spike on the homelab** (`spike_deferred_delete.py`), all checks passed:
+- the expiry froze 6 data files, 6 manifests and 6 manifest lists, and left
+  them on S3;
+- time travel to the expired snapshot fails (`Cannot find snapshot`);
+- a reader already reading the old files keeps reading;
+- bulk delete through `S3FileIO` removes them, after which that reader fails.
+
+A time-travel DataFrame defined before the expiry plans again when used and
+fails cleanly. So only readers already executing need the grace.
+
+Gate:
+
+```bash
+make gl-image
+make gl-deferred-check       # scratch namespace glue.dd_check: ALL PASS
+make gl-plan                 # SNAPSHOT_BUILDUP tables show expire_keep_files (files kept)
+make gl-plan APPLY=1         # expire; then make gl-freed-files shows files waiting
+# after the grace (6 min at test scale): make gl-scan, then make gl-plan APPLY=1 deletes them
+```

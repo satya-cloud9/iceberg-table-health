@@ -413,6 +413,9 @@ class Ledger:
             ensure_tables(spark, self.ops)
             for kind, start in (("ledger_state", None), ("commit", commits_from), ("gap_hist", hist_from)):
                 self.store.preload(kind, start=start, uuids=uu, max_rows=cap)
+            # files earlier expiries freed and still waiting out their grace (freed_files.py):
+            # the orphan listing must not count them, and the scan reports how many wait
+            self.store.preload("freed_file", uuids=uu, max_rows=cap)
             # a log read (the last comparison per table); becomes a state field in step 3
             self.last_checked = {r.table_uuid: float(r.age_d) for r in spark.sql(f"""
                 SELECT table_uuid, (unix_timestamp(current_timestamp()) - unix_timestamp(max(checked_at)))
@@ -456,6 +459,7 @@ class Ledger:
             props = {}
         policy = xp.resolve_policy(props, cfg, snaps, now_ms)
         tm.update(xp.expiry_facts(snaps, refs, current, now_ms, policy, cfg))
+        tm["freed_files_waiting"] = len(self.store.range("freed_file", (uuid,))) if uuid else None
         led_bytes, note = xp.retained_from_summaries(snaps, refs, current)
         tm["retained_bytes_ledger"], tm["retained_ledger_note"] = led_bytes, note
         mode = str(cfg.get("retained_bytes", "full"))

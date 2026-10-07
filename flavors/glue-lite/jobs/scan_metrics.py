@@ -69,7 +69,8 @@ TABLE_METRICS_DDL = """
     retained_metadata_bytes BIGINT, policy_age_h DOUBLE, policy_min_keep BIGINT, policy_source STRING,
     write_category STRING, writer_commits_24h BIGINT, expirable_snapshots BIGINT,
     oldest_expirable_age_h DOUBLE, refs_json STRING, stale_refs_json STRING, stale_refs BIGINT,
-    retained_bytes_ledger BIGINT, retained_ledger_note STRING, metadata_json_files BIGINT"""
+    retained_bytes_ledger BIGINT, retained_ledger_note STRING, metadata_json_files BIGINT,
+    policy_file_grace_h DOUBLE, policy_grace_source STRING, freed_files_waiting BIGINT"""
 
 
 def coerce(value, data_type):
@@ -346,8 +347,11 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
                 if acted and tm["scan_mode"] == "reused":
                     tm["scan_mode"] = "reused+orphans"
                 try:
-                    tm.update(probes.orphan_metrics(spark, table, cfg), orphan_error=None,
-                              orphan_scanned_at=scanned_at)
+                    pending = [r["path"] for r in led.store.range("freed_file", (info.get("uuid"),))] \
+                        if info.get("uuid") else []
+                    om = probes.orphan_metrics(spark, table, cfg, pending=pending)
+                    om.pop("freed_files_listed", None)
+                    tm.update(om, orphan_error=None, orphan_scanned_at=scanned_at)
                 except Exception as oe:          # listing problems must not lose the table's metrics
                     tm["orphan_error"] = f"{type(oe).__name__}: {oe}"[:500]
             try:

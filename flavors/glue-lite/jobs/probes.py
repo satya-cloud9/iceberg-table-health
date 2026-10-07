@@ -430,14 +430,16 @@ def _norm_uri(path):
     return p
 
 
-def orphan_metrics(spark, table, cfg):
+def orphan_metrics(spark, table, cfg, pending=None):
     """O1: objects under the table location that no retained snapshot or
     metadata version references, older than orphan_min_age_minutes (younger
     ones may belong to a commit still in flight). Lists the location through
     the table's FileIO (S3 prefix listing), so it costs one listing of every
     object under the table plus the all_files / all_manifests reads; run it
-    sparingly on big tables."""
+    sparingly on big tables. pending: paths an expiry freed that are waiting
+    out their grace (freed_files.py); unreferenced but not orphans, counted apart."""
     jvm = spark._jvm
+    pending = {_norm_uri(p) for p in (pending or ())}
     jt = jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark._jsparkSession, table)
     cur = jt.operations().current()
     prefix = str(jt.location()).rstrip("/") + "/"          # trailing '/': not sibling tables
@@ -454,7 +456,7 @@ def orphan_metrics(spark, table, cfg):
         except Exception:
             pass
     cutoff_ms = (now_utc().timestamp() - float(cfg.get("orphan_min_age_minutes", 4320)) * 60) * 1000
-    listed = orphans = orphan_bytes = meta_json = 0
+    listed = orphans = orphan_bytes = meta_json = waiting = 0
     sample = []
     it = jt.io().listPrefix(prefix).iterator()
     while it.hasNext():
@@ -463,14 +465,20 @@ def orphan_metrics(spark, table, cfg):
         loc = _norm_uri(f.location())
         if loc.endswith(".metadata.json") and "/metadata/" in loc:
             meta_json += 1                   # every metadata.json version still in storage (A9 check)
-        if loc in refs or f.createdAtMillis() > cutoff_ms:
+        if loc in refs:
+            continue
+        if loc in pending:
+            waiting += 1
+            continue
+        if f.createdAtMillis() > cutoff_ms:
             continue
         orphans += 1
         orphan_bytes += int(f.size())
         if len(sample) < 5:
             sample.append(loc[len(prefix):] if loc.startswith(prefix) else loc)
     return {"orphan_files": orphans, "orphan_bytes": orphan_bytes, "listed_objects": listed,
-            "orphan_sample": json.dumps(sample), "metadata_json_files": meta_json}
+            "orphan_sample": json.dumps(sample), "metadata_json_files": meta_json,
+            "freed_files_listed": waiting}
 
 
 def now_utc():

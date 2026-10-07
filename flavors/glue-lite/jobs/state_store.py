@@ -77,6 +77,8 @@ KINDS = {
                      age=("day", "day")),
     "late_hist": Kind("lateness_hist", "counter", sort=("day", "bucket_max_h"), field="batches",
                       age=("day", "day")),
+    # files an expiry freed, deleted once their grace has passed (freed_files.py)
+    "freed_file": Kind("freed_files", "merge", key=("table_uuid", "path")),
 }
 
 LOG_AGE = {"incremental_check": "checked_at"}
@@ -440,9 +442,10 @@ class IcebergStateStore(MemoryState):
         for key in keys:
             by_table.setdefault(key[0], []).append(key[1])
         for u, rest in by_table.items():
-            sql = (f"DELETE FROM {self.ops}.{k.table} WHERE table_uuid = {_q(u)} "
-                   f"AND {k.key[1]} IN ({', '.join(_q(x) for x in rest)})")
-            retry_on_conflict(lambda: self.spark.sql(sql), f"delete from {k.table}")
+            for i in range(0, len(rest), 500):           # bounded statements (freed files come in thousands)
+                sql = (f"DELETE FROM {self.ops}.{k.table} WHERE table_uuid = {_q(u)} "
+                       f"AND {k.key[1]} IN ({', '.join(_q(x) for x in rest[i:i + 500])})")
+                retry_on_conflict(lambda: self.spark.sql(sql), f"delete from {k.table}")
 
     def expire(self, kind, older_than_days):
         k = KINDS[kind]
