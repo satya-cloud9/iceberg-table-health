@@ -79,6 +79,10 @@ KINDS = {
                       age=("day", "day")),
     # files an expiry freed, deleted once their grace has passed (freed_files.py)
     "freed_file": Kind("freed_files", "merge", key=("table_uuid", "path")),
+    # what the next run needs from this one (scan_state.py)
+    "table_state": Kind("table_state", "latest"),
+    "partition_facts": Kind("partition_facts", "merge", key=("table_uuid", "partition_key")),
+    "action_state": Kind("action_state", "latest"),
 }
 
 LOG_AGE = {"incremental_check": "checked_at"}
@@ -325,6 +329,18 @@ class MemoryState(StateStore):
         if k.sort:
             rows.sort(key=lambda r: tuple(_sortable(r.get(c)) for c in k.sort))
         return rows[:limit] if limit else rows
+
+    def items(self, kind):
+        """Every item of a latest / merge kind, with this run's pending puts and
+        deletes applied: [(key, item)]. Reads the whole kind once if not preloaded."""
+        k = KINDS[kind]
+        assert k.mode in ("latest", "merge"), kind
+        if self._kind_cover[kind] is _UNSET:
+            self.preload(kind)
+        got = dict(self._cache[kind])
+        for r in self._pending[kind]:
+            got[tuple(r[c] for c in k.key)] = r
+        return list(got.items())
 
     # writes
     def put(self, kind, item):

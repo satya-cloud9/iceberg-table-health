@@ -1,15 +1,22 @@
 """GL2.5b: run the metric inventory over every table in a namespace.
 
-Appends one row per partition to glue.ops.partition_metrics and one row per
-table to glue.ops.table_metrics, all under one scan_id, then prints a summary.
-Reads only Iceberg metadata. Symptom rules (2.5c) read these tables.
+Logs one row per table to glue.ops.table_metrics and, for each table measured
+this scan, one row per partition to glue.ops.partition_metrics, all under one
+scan_id, then prints a summary. Reads only Iceberg metadata.
+
+What the next run needs is state, not log (scan_state.py): table_state (each
+table's latest facts and trend), partition_facts (each partition's latest
+facts, rewritten only when it changed) and action_state (written by the plan).
+A reused table's partitions come from partition_facts and are not logged again.
+Detect and the scorecard get this scan's rows in memory (RESULTS) when they run
+in the same job, and read them back (scan_results) otherwise. Logs are flushed
+before state, so a crash between the two repeats work instead of skipping it.
 
 Usage (via scripts/run-job.sh py scan_metrics.py ...):
   scan_metrics.py [--namespace glue.demo] [--tables s0_small_appends,...]
                   [--config /opt/jobs/config/health.json]
 """
 import argparse
-import json
 import os
 import sys
 import time
@@ -20,6 +27,7 @@ from pyspark.sql import SparkSession
 
 import gl_common as gl
 import ledger as ledger_mod
+import scan_state
 import state_store as ss
 import gltrace as tr
 import probes
@@ -89,11 +97,57 @@ def coerce(value, data_type):
     return value
 
 
+_SCHEMAS = {}
+
+
+def normalize(spark, table, values):
+    """A record as it reads back from the log table: every column present, types
+    coerced, timestamps naive UTC (what Spark returns in a UTC session)."""
+    if table not in _SCHEMAS:
+        _SCHEMAS[table] = spark.table(table).schema
+    out = {}
+    for f, v in zip(_SCHEMAS[table], as_row(values, _SCHEMAS[table])):
+        if hasattr(v, "tzinfo") and v.tzinfo is not None:
+            v = scan_state.from_ms(scan_state.to_ms(v))
+        out[f.name] = v
+    for k in ("scanned_ms",):
+        if k in values:
+            out[k] = values[k]
+    return out
+
+
+def scan_results(spark, scan_id, store=None):
+    """(table rows, {table: partition rows}) of a scan: from this job's memory when
+    it ran here, else read back (the scan's logged rows; partition rows of reused
+    tables, which are not logged again, from partition_facts)."""
+    if scan_id in RESULTS:
+        r = RESULTS[scan_id]
+        return r["tms"], r["parts"]
+    ops = gl.OPS_NAMESPACE
+    tms = [r.asDict() for r in spark.sql(f"SELECT *, unix_millis(scanned_at) AS scanned_ms FROM {ops}.table_metrics "
+                                         f"WHERE scan_id = '{scan_id}'").collect()]
+    parts = {}
+    for r in spark.sql(f"SELECT * FROM {ops}.partition_metrics WHERE scan_id = '{scan_id}'").collect():
+        parts.setdefault(r.table_name, []).append(r.asDict())
+    store = store or ss.IcebergStateStore(spark, ops)
+    for tm in tms:
+        if tm["table_name"] not in parts and str(tm.get("scan_mode") or "").startswith("reused") and tm.get("table_uuid"):
+            if spark.catalog.tableExists(f"{ops}.partition_facts"):
+                parts[tm["table_name"]] = [dict(r, scan_id=scan_id, table_name=tm["table_name"])
+                                           for r in scan_state.partition_rows(
+                                               store.range("partition_facts", (tm["table_uuid"],)), tm["scanned_ms"])]
+    return tms, parts
+
+
 def as_row(values, schema):
     return tuple(coerce(values.get(f.name), f.dataType) for f in schema)
 
 
-REUSE_DROP = {"rn", "elapsed_min", "orphan_age_h", "retained_age_h"}
+REUSE_DROP = {"rn", "elapsed_min", "orphan_age_h", "retained_age_h", "_scanned_ms", "_uuid"}
+
+# this job's scan results, handed to detect and the scorecard in memory (gl_scan
+# runs all three in one job); a standalone detect or scorecard reads them back
+RESULTS = {}
 
 COVERAGE_DDL = """
     run_id STRING, scan_id STRING, target STRING, group_name STRING, shard STRING,
@@ -102,57 +156,6 @@ COVERAGE_DDL = """
 ss.declare_log("table_metrics", TABLE_METRICS_DDL, "scanned_at")
 ss.declare_log("partition_metrics", PARTITION_METRICS_DDL, "scanned_at")
 ss.declare_log("coverage", COVERAGE_DDL, "at")
-
-
-def load_previous(spark, tm_table, pm_table, namespace, window_hours=168):
-    """Each table's latest successful scan row (with ages computed in SQL, so
-    no Python datetime round trip) and that scan's partition rows.
-
-    Both are log tables that grow every scan, so the read is bounded to the last
-    window_hours (Iceberg skips older files by their scanned_at bounds). A table
-    not scanned within the window has no previous row and is measured in full,
-    which is always correct. (The design moves these carried values into the
-    state store's table_state; then the log is not read on the scan path.)"""
-    since = f"scanned_at > current_timestamp() - INTERVAL {int(window_hours)} HOURS"
-    cols = {f.name for f in spark.table(tm_table).schema}
-    if "metadata_location" not in cols:
-        return {}, {}
-    prev = {r.table_name: r.asDict() for r in spark.sql(f"""
-        SELECT * FROM (
-            SELECT t.*,
-                   row_number() OVER (PARTITION BY table_name ORDER BY scanned_at DESC) AS rn,
-                   (unix_millis(current_timestamp()) - unix_millis(scanned_at)) / 60000.0 AS elapsed_min,
-                   (unix_millis(current_timestamp()) - unix_millis(orphan_scanned_at)) / 3600000.0 AS orphan_age_h,
-                   (unix_millis(current_timestamp()) - unix_millis(retained_scanned_at)) / 3600000.0
-                       AS retained_age_h
-            FROM {tm_table} t
-            WHERE load_error IS NULL AND metadata_location IS NOT NULL
-              AND table_name LIKE '{namespace}.%' AND {since})
-        WHERE rn = 1""").collect()}
-    parts = {}
-    if prev:
-        ids = ", ".join(f"'{p['scan_id']}'" for p in prev.values())
-        for r in spark.sql(f"SELECT * FROM {pm_table} WHERE scan_id IN ({ids}) AND {since}").collect():
-            if prev.get(r.table_name, {}).get("scan_id") == r.scan_id:
-                parts.setdefault(r.table_name, []).append(r.asDict())
-    return prev, parts
-
-
-def action_ages(spark, window_hours=168):
-    """Minutes since the latest advisor action per table UUID (any status).
-    Some actions change files without a new metadata.json - remove_orphan_files
-    deletes objects but commits nothing - so an unchanged metadata location
-    does not mean the orphan count is still right."""
-    ops = gl.OPS_NAMESPACE
-    try:
-        return {r.table_uuid: float(r.age_min) for r in spark.sql(f"""
-            SELECT table_uuid,
-                   (unix_millis(current_timestamp()) - unix_millis(max(started_at))) / 60000.0 AS age_min
-            FROM {ops}.actions WHERE table_uuid IS NOT NULL
-              AND started_at > current_timestamp() - INTERVAL {int(window_hours)} HOURS
-            GROUP BY table_uuid""").collect()}
-    except Exception:          # no actions table yet
-        return {}
 
 
 def acted_since_orphan_scan(p, uuid, ages):
@@ -189,7 +192,9 @@ def reuse(spark, table, cfg, p, prev_rows, scanned_at, snapshot_source="full"):
     """Unchanged table (same metadata.json): copy the last scan's results and
     refresh only what moves with the clock - partition ages, and the
     snapshot-based metrics (from metadata.json, cheap)."""
-    elapsed = float(p.get("elapsed_min") or 0)
+    # from the last scan to this table's own scan time (not to the start of the run)
+    elapsed = (float(scan_state.to_ms(scanned_at) - int(p["_scanned_ms"])) / 60000.0
+               if p.get("_scanned_ms") is not None else float(p.get("elapsed_min") or 0))
     rows = []
     for r in prev_rows:
         r = dict(r)
@@ -246,19 +251,28 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
 
     t_prev = time.perf_counter()
     window_h = float((config.get("incremental") or {}).get("previous_scan_window_hours", 168))
-    prev, prev_parts = load_previous(spark, tm_table, pm_table, namespace, window_h)
-    t_prev = time.perf_counter() - t_prev
-    t_pre = time.perf_counter()
-    # logs (table_metrics, partition_metrics, incremental_check) are buffered and
-    # written once at the end: one Iceberg commit per table instead of two per scanned table
-    log = ss.make_log_sink(spark, config)
+    inc = config.get("incremental") or {}
+    # what the previous run left: each table's latest facts and partition facts and
+    # the latest advisor action, from the state store (scan_state.py), not the logs
+    store = ss.IcebergStateStore(spark, gl.OPS_NAMESPACE)
+    scan_state.ensure_tables(spark, gl.OPS_NAMESPACE)
+    now_ms = int(time.time() * 1000)
+    prev = scan_state.load_previous(store, namespace, now_ms, window_h)
     # the run's tables we already know (new ones load on their own when first seen)
     known = sorted({p.get("table_uuid") for n, p in prev.items()
                     if p.get("table_uuid") and n.rsplit(".", 1)[-1] in set(names)})
-    led = ledger_mod.Ledger(spark, config, scan_id, log=log, uuids=known if wanted else None)
+    if known:
+        store.preload("partition_facts", uuids=known, max_rows=int(inc.get("store_preload_max_rows", 2000000)))
+    ages = scan_state.action_ages(store, now_ms)
+    t_prev = time.perf_counter() - t_prev
+    t_pre = time.perf_counter()
+    # logs (table_metrics, partition_metrics, incremental_check) are buffered and
+    # written once at the end, before the state (a crash then means redo, not loss)
+    log = ss.make_log_sink(spark, config)
+    led = ledger_mod.Ledger(spark, config, scan_id, store=store, log=log, uuids=known if wanted else None)
     t_pre = time.perf_counter() - t_pre
     snap_source = "ledger" if led.mode == "on" else "full"
-    ages = action_ages(spark, window_h)
+    parts_out = {}
     summary, modes, t_start = [], {"full": 0, "reused": 0}, time.perf_counter()
     run = run or {}
     coverage = []
@@ -297,9 +311,10 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
                     and p["metadata_location"] == info["metadata_location"]):
                 tr.log("path", "2B reused: metadata.json unchanged since the last scan",
                        snapshot_metrics_from=snap_source)
-                tm, pm_rows = reuse(spark, table, cfg, p, prev_parts.get(table, []), scanned_at, snap_source)
-                log.append("partition_metrics", [dict(r, scan_id=scan_id, scanned_at=scanned_at, table_name=table)
-                                                 for r in pm_rows])
+                # unchanged partitions are not logged again: their facts live in partition_facts
+                stored = store.range("partition_facts", (p["_uuid"],)) if p.get("_uuid") else []
+                tm, pm_rows = reuse(spark, table, cfg, p, scan_state.partition_rows(stored, p.get("_scanned_ms")),
+                                    scanned_at, snap_source)
             else:
                 tr.log("path", "2A full measure: " + ("--full" if full else "first scan of this table" if not p
                                                       else "metadata.json changed"))
@@ -386,6 +401,22 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
             "ledger_event", "activity_event", "hot_window_min", "settle_window_h", "load_error")})
         tr.begin(None)
         log.append("table_metrics", [tm])
+        uuid = info.get("uuid")
+        if tm.get("scan_mode") != "failed":
+            parts_out[table] = [dict(r if isinstance(r, dict) else r.asDict(), scan_id=scan_id,
+                                     scanned_at=scanned_at, table_name=table) for r in pm_rows]
+            row = scan_state.table_row(tm, store.get("table_state", (uuid,)) if uuid else None, window_h,
+                                       probes.now_utc())
+            if row:
+                store.put("table_state", row)
+            if uuid and tm.get("scan_mode") == "full":
+                sms = scan_state.to_ms(scanned_at)
+                prev_at = scan_state.partition_rows(store.range("partition_facts", (uuid,)), sms)
+                puts, gone = scan_state.partition_changes(uuid, table, pm_rows, prev_at, sms)
+                for r in puts:
+                    store.put("partition_facts", r)
+                for key in gone:
+                    store.delete("partition_facts", key)
         summary.append(tm)
         modes[tm.get("scan_mode", "full")] = modes.get(tm.get("scan_mode", "full"), 0) + 1
         covered(table, "failed" if tm.get("scan_mode") == "failed" else "done", tm.get("scan_mode"))
@@ -396,10 +427,20 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
     print(f"=== {len(names)} tables in {t_tables:.1f}s: "
           + ", ".join(f"{k} {v}" for k, v in modes.items() if v) + " ===", flush=True)
     t_w = time.perf_counter()
-    led.report(housekeeping=housekeeping)   # writes the ledger's state and the buffered logs
     if coverage:
         log.append("coverage", coverage)
-    log.flush()
+    log.flush()                              # logs first ...
+    led.report(housekeeping=housekeeping)   # ... then the ledger's state (and its own logs)
+    store.flush()                            # table_state / partition_facts (also with the ledger off)
+    if housekeeping:                         # latest kinds append a row per change: keep one per table
+        try:
+            for kind in ("table_state", "action_state"):
+                store.compact(kind)
+        except Exception as e:
+            print(f"  (scan state cleanup skipped: {type(e).__name__})", flush=True)
+    RESULTS[scan_id] = {"tms": [normalize(spark, tm_table, dict(tm, scanned_ms=scan_state.to_ms(tm["scanned_at"])))
+                                for tm in summary],
+                        "parts": {t: [normalize(spark, pm_table, r) for r in rows] for t, rows in parts_out.items()}}
     t_w = time.perf_counter() - t_w
     st = led.store.stats
     print(f"=== Timing: previous scan {t_prev:.1f}s, state preload {t_pre:.1f}s, tables {t_tables:.1f}s, writes + report {t_w:.1f}s; "
@@ -418,13 +459,16 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
         spark.createDataFrame([as_row(s, sub) for s in summary], sub).show(100, truncate=False)
 
         print("=== Partitions with excess files (top 15) ===", flush=True)
-        spark.sql(f"""
-            SELECT table_name, partition_key, data_files, excess_files,
-                   delete_files_pos + delete_files_eq AS delete_files,
-                   round(minutes_since_update, 1) AS minutes_since_update
-            FROM {pm_table} WHERE scan_id = '{scan_id}' AND (excess_files > 0 OR delete_files_pos > 0)
-            ORDER BY excess_files DESC, delete_files DESC LIMIT 15
-        """).show(truncate=False)
+        top = sorted((r for rows in RESULTS[scan_id]["parts"].values() for r in rows
+                      if (r.get("excess_files") or 0) > 0 or (r.get("delete_files_pos") or 0) > 0),
+                     key=lambda r: (-(r.get("excess_files") or 0),
+                                    -((r.get("delete_files_pos") or 0) + (r.get("delete_files_eq") or 0))))[:15]
+        for r in top:
+            m = r.get("minutes_since_update")
+            print(f"  {r['table_name']:40} {str(r['partition_key'])[:40]:40} files {r.get('data_files')} "
+                  f"excess {r.get('excess_files')} deletes "
+                  f"{(r.get('delete_files_pos') or 0) + (r.get('delete_files_eq') or 0)} "
+                  f"minutes {None if m is None else round(float(m), 1)}", flush=True)
     print(f"Metrics recorded under scan_id {scan_id}", flush=True)
     return scan_id
 

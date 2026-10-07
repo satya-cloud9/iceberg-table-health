@@ -239,29 +239,36 @@ def run_scorecard(spark, scan_id, config, expectations, partial=False):
     import gltrace as tr
     import probes
 
+    import scan_metrics as sm
+    import scan_state
+    import state_store as ss
+    from detect_symptoms import FINDINGS
     sy = f"{gl.OPS_NAMESPACE}.symptoms"
-    pm = f"{gl.OPS_NAMESPACE}.partition_metrics"
-    tm = f"{gl.OPS_NAMESPACE}.table_metrics"
-    sc = f"{gl.OPS_NAMESPACE}.scorecard"
 
-    tmrows = {r.table_name: r.asDict() for r in
-              spark.sql(f"SELECT * FROM {tm} WHERE scan_id = '{scan_id}'").collect()}
+    # the scan and its findings: from this job's memory when they ran here, else read back
+    store = ss.IcebergStateStore(spark, gl.OPS_NAMESPACE)
+    tms, scan_parts = sm.scan_results(spark, scan_id, store)
+    tmrows = {t["table_name"]: t for t in tms}
     tables = sorted(tmrows)
-    last_fix = {}   # table UUID -> latest successful action ("kind ok HH:MM UTC")
-    if spark.catalog.tableExists(f"{gl.OPS_NAMESPACE}.actions"):
-        for r in spark.sql(f"""
-                SELECT table_uuid, kind, date_format(started_at, 'yyyy-MM-dd HH:mm') AS at FROM (
-                    SELECT *, row_number() OVER (PARTITION BY table_uuid ORDER BY started_at DESC) AS rn
-                    FROM {gl.OPS_NAMESPACE}.actions WHERE status = 'ok' AND table_uuid IS NOT NULL)
-                WHERE rn = 1""").collect():
-            last_fix[r.table_uuid] = f"{r.kind} ok {r.at} UTC"
+    last_fix = {}   # table UUID -> latest successful action ("kind ok HH:MM UTC"), from action_state
+    uu = sorted({t.get("table_uuid") for t in tms if t.get("table_uuid")})
+    if uu:
+        scan_state.ensure_tables(spark, gl.OPS_NAMESPACE)
+        store.preload("action_state", uuids=uu)
+        for u in uu:
+            ok = scan_state.last_ok(store.get("action_state", (u,)))
+            if ok:
+                last_fix[u] = f"{ok[0]} ok {scan_state.from_ms(ok[1]).strftime('%Y-%m-%d %H:%M')} UTC"
     fixed = set(last_fix)
-    findings, parts = {}, {}
-    for r in spark.sql(f"SELECT * FROM {sy} WHERE scan_id = '{scan_id}'").collect():
-        findings.setdefault(r.table_name, []).append(r.asDict())
-    for r in spark.sql(f"SELECT table_name, partition_key, minutes_since_update FROM {pm} "
-                       f"WHERE scan_id = '{scan_id}'").collect():
-        parts.setdefault(r.table_name, []).append(r.asDict())
+    findings = {}
+    rows = FINDINGS.get(scan_id)
+    if rows is None:
+        rows = [r.asDict() for r in spark.sql(f"SELECT * FROM {sy} WHERE scan_id = '{scan_id}'").collect()]
+    for r in rows:
+        findings.setdefault(r["table_name"], []).append(r)
+    parts = {t: [{"table_name": t, "partition_key": r.get("partition_key"),
+                  "minutes_since_update": r.get("minutes_since_update")} for r in rows]
+             for t, rows in scan_parts.items()}
 
     exp_tables = expectations.get("tables", {})
     results = []
@@ -291,7 +298,6 @@ def run_scorecard(spark, scan_id, config, expectations, partial=False):
         print(line)
 
     scored_at = probes.now_utc()
-    import state_store as ss
     log = ss.make_log_sink(spark, config)
     log.append("scorecard", [{"scan_id": scan_id, "scored_at": scored_at, "table_name": r["table_name"],
                               "status": r["status"], "found": ", ".join(r["found"]),

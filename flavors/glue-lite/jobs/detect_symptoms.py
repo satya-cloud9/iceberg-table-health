@@ -22,6 +22,7 @@ import gl_common as gl
 import gltrace as tr
 import holds as hl
 import probes
+import scan_state
 import state_store as ss
 import symptom_rules
 import windows as win
@@ -33,6 +34,10 @@ SYMPTOMS_DDL = """
     score DOUBLE, severity STRING, remedy STRING, evidence_level STRING,
     evidence_json STRING, rule_version STRING"""
 ss.declare_log("symptoms", SYMPTOMS_DDL, "detected_at")
+
+# this job's findings per scan, for the scorecard (gl_scan runs scan, detect and
+# scorecard in one job); a standalone scorecard reads them back from the log
+FINDINGS = {}
 
 ACTION_ORDER = {"auto": 0, "defer": 1, "approval": 2, "advisory": 3, "needs-evidence": 4, "acknowledged": 5}
 
@@ -57,34 +62,17 @@ def latest_scan_id(spark):
     return r[0].s if r else None
 
 
-def load_history(spark, tms, scan_id, window_hours=168):
-    """Per table UUID: earlier scans (oldest first, up to the current one) and actions,
-    from the last window_hours only (trend rules use the last few scans; the logs
-    grow every run, so the read is bounded).
-    Bounded by the scan's own timestamp in SQL: a Python datetime written back as a
-    literal would shift by the driver's local zone."""
-    uuids = sorted({t["table_uuid"] for t in tms if t.get("table_uuid")})
+def load_history(store, tms, window_hours=168):
+    """Per table UUID: earlier scans (oldest first, up to the current one) and the
+    recent advisor actions, from the state store (table_state's trend, action_state),
+    not read back from the logs. The trend keeps the last window_hours of scans."""
     history, actions = {}, {}
-    if not uuids:
-        return history, actions
-    ids = ", ".join(f"'{u}'" for u in uuids)
-    cols = {f.name for f in spark.table(f"{gl.OPS_NAMESPACE}.table_metrics").schema}
-    want = [c for c in ("excess_files_total", "delete_files", "data_manifests") if c in cols]
-    for r in spark.sql(f"""
-            SELECT table_uuid, scanned_at, unix_millis(scanned_at) AS scanned_ms, {', '.join(want)}
-            FROM {gl.OPS_NAMESPACE}.table_metrics
-            WHERE table_uuid IN ({ids}) AND scanned_at <= (
-                SELECT max(scanned_at) FROM {gl.OPS_NAMESPACE}.table_metrics WHERE scan_id = '{scan_id}')
-              AND scanned_at > current_timestamp() - INTERVAL {int(window_hours)} HOURS
-            ORDER BY scanned_at""").collect():
-        history.setdefault(r.table_uuid, []).append(r.asDict())
-    if spark.catalog.tableExists(f"{gl.OPS_NAMESPACE}.actions"):
-        for r in spark.sql(f"""
-                SELECT table_uuid, started_at, kind, status, result_json
-                FROM {gl.OPS_NAMESPACE}.actions WHERE table_uuid IN ({ids})
-                  AND started_at > current_timestamp() - INTERVAL {int(window_hours)} HOURS
-                ORDER BY started_at""").collect():
-            actions.setdefault(r.table_uuid, []).append(r.asDict())
+    for tm in tms:
+        u = tm.get("table_uuid")
+        if not u:
+            continue
+        history[u] = scan_state.trend(store.get("table_state", (u,)), upto_ms=tm.get("scanned_ms"))
+        actions[u] = scan_state.recent_actions(store.get("action_state", (u,)))
     return history, actions
 
 
@@ -199,22 +187,22 @@ def record_window_changes(log, scan_id, at, mode, changes, report=True):
 
 def run_detect(spark, scan_id, config, report=True):
     """Apply the rules to one scan, append to glue.ops.symptoms, return the findings."""
-    tm_table = f"{gl.OPS_NAMESPACE}.table_metrics"
-    pm_table = f"{gl.OPS_NAMESPACE}.partition_metrics"
     sy_table = f"{gl.OPS_NAMESPACE}.symptoms"
     spark.sql(f"CREATE TABLE IF NOT EXISTS {sy_table} ({SYMPTOMS_DDL}) USING iceberg")
 
-    tms = [r.asDict() for r in spark.sql(f"SELECT *, unix_millis(scanned_at) AS scanned_ms FROM {tm_table} "
-                                         f"WHERE scan_id = '{scan_id}'").collect()]
-    parts = {}
-    for r in spark.sql(f"SELECT * FROM {pm_table} WHERE scan_id = '{scan_id}'").collect():
-        parts.setdefault(r.table_name, []).append(r.asDict())
-
-    history, actions = load_history(spark, tms, scan_id, float(
-        (config.get("incremental") or {}).get("previous_scan_window_hours", 168)))
+    import scan_metrics as sm
+    store = ss.IcebergStateStore(spark, gl.OPS_NAMESPACE)
+    scan_state.ensure_tables(spark, gl.OPS_NAMESPACE)
+    # the scan's rows: from memory when the scan ran in this job, else read back
+    tms, parts = sm.scan_results(spark, scan_id, store)
+    tms = [dict(t) for t in tms]
+    uu = _uuids(tms)
+    if uu:
+        store.preload("table_state", uuids=uu)
+        store.preload("action_state", uuids=uu)
+    history, actions = load_history(store, tms)
     detected_at = probes.now_utc()
     findings = []
-    store = ss.IcebergStateStore(spark, gl.OPS_NAMESPACE)
     log = ss.make_log_sink(spark, config)
     mode3 = mode_of(config, "learned_windows")
     mode4 = mode_of(config, "partition_holds")
@@ -350,6 +338,7 @@ def run_detect(spark, scan_id, config, report=True):
         f.update(scan_id=scan_id, detected_at=detected_at)
     log.append("symptoms", findings)
     log.flush()
+    FINDINGS[scan_id] = [dict(f) for f in findings]     # the scorecard in this job reads them here
 
     findings.sort(key=lambda f: (ACTION_ORDER.get(f["action"], 9), -f["score"]))
     print("\n=== Per table ===")

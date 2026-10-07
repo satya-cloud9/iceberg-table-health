@@ -66,6 +66,15 @@ def record(spark, run_id, table, uuid, kind, symptom, stmt, status, dur, result,
                      duration_s=float(dur), result_json=result, snapshot_before=before, snapshot_after=after,
                      rollback_hint=rollback_hint(table.split(".", 1)[1], before, after))
     spark.createDataFrame([row], schema).writeTo(f"{ns}.actions").append()
+    # and the state the next scan and detect read (scan_state.action_state)
+    import scan_state
+    import state_store as ss
+    scan_state.ensure_tables(spark, ns)
+    store = ss.IcebergStateStore(spark, ns)
+    scan_state.record_actions(store, [{"table_uuid": uuid, "table_name": table, "kind": kind, "status": status,
+                                       "started_at": row[schema.fieldNames().index("started_at")],
+                                       "result_json": result}], datetime.now(timezone.utc))
+    store.flush()
 
 
 def s12_mor(spark, args):

@@ -59,7 +59,7 @@ SNAPSHOT_LOG_DDL = """
 LEDGER_STATE_DDL = """
     table_uuid STRING, table_name STRING, updated_at TIMESTAMP, last_ts_ms BIGINT,
     last_snapshot_id BIGINT, last_writer_ts_ms BIGINT, current_snapshot_id BIGINT,
-    event STRING, scan_id STRING"""
+    event STRING, scan_id STRING, last_checked_ms BIGINT"""
 
 GAP_HIST_DDL = """
     table_uuid STRING, day DATE, bucket_max_min DOUBLE, gaps BIGINT, scan_id STRING"""
@@ -417,11 +417,6 @@ class Ledger:
             # files earlier expiries freed and still waiting out their grace (freed_files.py):
             # the orphan listing must not count them, and the scan reports how many wait
             self.store.preload("freed_file", uuids=uu, max_rows=cap)
-            # a log read (the last comparison per table); becomes a state field in step 3
-            self.last_checked = {r.table_uuid: float(r.age_d) for r in spark.sql(f"""
-                SELECT table_uuid, (unix_timestamp(current_timestamp()) - unix_timestamp(max(checked_at)))
-                       / 86400.0 AS age_d FROM {self.ops}.incremental_check
-                WHERE family = 'snapshot_ledger' GROUP BY table_uuid""").collect()}
 
     # -- per table ---------------------------------------------------------
     def process(self, table, uuid, tm, cfg, full_fn=None, live_keys=None, partitioned=True,
@@ -548,6 +543,11 @@ class Ledger:
         tr.rows("family1.ingest", rows, ["snapshot_id", "operation", "is_writer", "gap_min", "gap_note",
                                          "added_data_files", "deleted_data_files", "added_files_size"])
         now = datetime.now(timezone.utc)
+        now_ms = int(now.timestamp() * 1000)
+        # compared with the full path this scan? (the last comparison's time is in ledger_state)
+        last_checked = (state or {}).get("last_checked_ms")
+        age_d = 1e9 if last_checked is None else (now_ms - int(last_checked)) / 86400000.0
+        check = (self.mode == "shadow" or random.random() < self.spot_share or age_d >= self.reconcile_days)
         counts = {}
         for r in rows:
             if r["gap_min"] is not None:
@@ -561,14 +561,14 @@ class Ledger:
             for (d, b), n in counts.items():
                 self.store.increment("gap_hist", {"table_uuid": uuid, "day": d, "bucket_max_min": b,
                                                   "gaps": n, "scan_id": self.scan_id}, "gaps")
-            if rows or state is None or event != "unchanged":
+            if rows or state is None or event != "unchanged" or check:
                 self.store.put("ledger_state", dict(new_state, table_uuid=uuid, table_name=table,
-                                                    updated_at=now, event=event, scan_id=self.scan_id))
+                                                    updated_at=now, event=event, scan_id=self.scan_id,
+                                                    last_checked_ms=now_ms if check else last_checked))
 
         # ledger rows needed for the metrics: the newest `recent` retained snapshots
         # plus every retained snapshot of the last 24 h (bounded by recent activity)
         recent = int(cfg["recent_commits"])
-        now_ms = int(now.timestamp() * 1000)
         by_ts = sorted(snaps, key=lambda s: (s["ts_ms"], s["snapshot_id"]), reverse=True)
         need = ({s["snapshot_id"] for s in by_ts[:recent]}
                 | {s["snapshot_id"] for s in snaps if s["ts_ms"] >= now_ms - 86400000})
@@ -583,8 +583,6 @@ class Ledger:
         tm["ledger_new_snapshots"] = len(rows)
         tm["ledger_event"] = event
 
-        check = (self.mode == "shadow" or random.random() < self.spot_share
-                 or self.last_checked.get(uuid, 1e9) >= self.reconcile_days)
         disagreements, n_checks, full = [], 0, tm
         if check:
             ref = reference_gaps(snaps)
@@ -838,8 +836,8 @@ class Ledger:
         MERGE for partition_state)."""
         if self.mode == "off" and self.mode2 == "off":
             return
+        self.log.flush()          # logs first, then state: a crash between means redo, not loss
         self.store.flush()
-        self.log.flush()
 
     # -- end of scan -------------------------------------------------------
     def report(self, housekeeping=True):

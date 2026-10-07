@@ -592,13 +592,12 @@ def main():
         tms = {r.table_name: r.asDict() for r in
                spark.sql(f"SELECT * FROM {ns}.table_metrics WHERE scan_id = '{a.scan_id}'").collect()}
     else:
-        # each table's own latest scan: group runs scan only their tables, so the
-        # newest scan of the whole catalog no longer covers every table
-        tms = {r.table_name: {k: v for k, v in r.asDict().items() if k != "rn"} for r in spark.sql(f"""
-            SELECT * FROM (SELECT t.*, row_number() OVER (PARTITION BY table_name ORDER BY scanned_at DESC) AS rn
-                           FROM {ns}.table_metrics t
-                           WHERE scanned_at > current_timestamp() - INTERVAL {window_h} HOURS) WHERE rn = 1
-            """).collect()}
+        # each table's own latest scan (group runs scan only their tables, so the newest
+        # scan of the whole catalog does not cover every table): its facts in table_state
+        import scan_state
+        import state_store as ss
+        scan_state.ensure_tables(spark, ns)
+        tms = scan_state.latest_facts(ss.IcebergStateStore(spark, ns), int(time.time() * 1000), window_h)
     if not tms:
         sys.exit("No scan found: run make gl-scan first.")
     pairs = {(t, m["scan_id"]) for t, m in tms.items()}
@@ -712,8 +711,12 @@ def main():
                                           rollback_hint=rollback_hint(ident_t, before, after)
                                           if status == "ok" else None))
     if (a.apply or approve) and records:
+        import scan_state
         log.append("actions", records)
-        log.flush()
+        log.flush()                      # the log first, then the state the next scan reads
+        scan_state.ensure_tables(spark, ns)
+        scan_state.record_actions(store, records, datetime.now(timezone.utc))
+        store.flush()
         print(f"\nRecorded {len(records)} actions in {ns}.actions under {run_id} (with snapshot "
               f"before/after and a rollback statement each). Run make gl-scan to check the result.",
               flush=True)
