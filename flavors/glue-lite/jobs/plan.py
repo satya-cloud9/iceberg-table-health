@@ -411,10 +411,16 @@ def plan_table(table, findings, tm, cfg, now=None, freed=None):
             # expire to the configured policy now, files kept for the grace;
             # shortening the policy is the owner's call
             import expiry as xp
-            age_h = float(th.get("max_snapshot_age_h", 120))
-            keep = int(rw.get("expire_retain_last", 5))
+            # the table's own resolved policy (as for SNAPSHOT_BUILDUP); the global
+            # threshold only for scans from before the policy was recorded
+            age_h = float(tm["policy_age_h"]) if tm.get("policy_age_h") is not None \
+                else float(th.get("max_snapshot_age_h", 120))
+            keep = int(tm.get("policy_min_keep") or rw.get("expire_retain_last", 5))
             cut_ms = int(((now or datetime.now(timezone.utc)) - timedelta(hours=age_h)).timestamp() * 1000)
-            grace, gsrc = xp.file_grace(json.loads(tm.get("properties_json") or "{}"), cfg.get("expiry") or {})
+            if tm.get("policy_file_grace_h") is not None:
+                grace, gsrc = float(tm["policy_file_grace_h"]), tm.get("policy_grace_source")
+            else:
+                grace, gsrc = xp.file_grace(json.loads(tm.get("properties_json") or "{}"), cfg.get("expiry") or {})
             steps.append({"kind": "suggest", "auto": False, "symptoms": [f["symptom"]], "op": "expire_keep_files",
                           "params": {"older_than_ms": cut_ms, "retain_last": keep, "grace_h": float(grace)},
                           "statement": (f"expire snapshots older than {ts_text(cut_ms)}, retain_last {keep}, "

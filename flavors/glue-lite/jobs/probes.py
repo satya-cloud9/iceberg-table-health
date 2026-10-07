@@ -15,7 +15,8 @@ from datetime import datetime, timezone
 
 import gltrace as tr
 
-# Table properties that drive write-configuration findings (W1).
+# Table properties that drive write-configuration findings (W1); every advisor.*
+# property is recorded as well (table_metrics.properties_json).
 WATCHED_PROPS = [
     "format-version",
     "write.distribution-mode",
@@ -412,7 +413,10 @@ def table_metrics(spark, table, info, cfg, pm_rows, retained=True, retained_meta
     m["write_update_mode"] = props.get("write.update.mode")
     m["write_merge_mode"] = props.get("write.merge.mode")
     m["manifest_merge_enabled"] = props.get("commit.manifest-merge.enabled")
-    m["properties_json"] = json.dumps({k: props[k] for k in WATCHED_PROPS if k in props}, sort_keys=True)
+    # the watched write settings plus every advisor.* key an owner set (advisor.mode,
+    # advisor.ack, advisor.expire.*, advisor.time-column, advisor.group, ...)
+    m["properties_json"] = json.dumps({k: props[k] for k in props
+                                       if k in WATCHED_PROPS or str(k).startswith("advisor.")}, sort_keys=True)
     m["target_file_bytes"] = target
     m["load_error"] = info["error"]
     m["table_uuid"] = info.get("uuid")
