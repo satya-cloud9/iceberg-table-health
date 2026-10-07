@@ -1478,7 +1478,7 @@ write as usual and skip it. Housekeeping is now two parts:
    | `write.metadata.delete-after-commit.enabled` / `previous-versions-max` not set | `ALTER TABLE … SET TBLPROPERTIES` |
    | a rewrite would remove ≥ `min_excess_files` files (from `<table>.partitions`, read only when the table has that many files) | `rewrite_data_files` (partial progress) |
    | manifests in the current snapshot > `max_manifests` | `rewrite_manifests` |
-   | ≥ `min_expire` snapshots older than `safe_age_hours` beyond the newest `retain_last` | `expire_snapshots(older_than = now − safe age, retain_last)` |
+   | ≥ `min_expire` snapshots not current at any time in the last `safe_age_hours`, beyond the newest `retain_last` | `expire_snapshots(older_than = safe cutoff, retain_last)` |
 
    One row per table goes to `glue.ops.ops_maintenance`. The claim is renewed
    before each table, and upkeep stops if another run has taken the claim over.
@@ -1495,9 +1495,29 @@ write as usual and skip it. Housekeeping is now two parts:
   whole-table `INSERT OVERWRITE` from rows read a moment earlier. That version
   could drop a row another run appended in between, and that table would then
   resume from an older position.
-- **Readers in other runs:** `expire_snapshots` keeps every snapshot younger
-  than `safe_age_hours` (6). That is longer than any run, so no run loses the
-  files it is reading.
+- **Readers in other runs:** a query picks a snapshot when it is planned and
+  reads that snapshot's files for seconds to minutes. Expiry keeps every
+  snapshot that was **current** at any time in the last `safe_age_hours` (6,
+  longer than any run). A snapshot's own commit time is not enough. One
+  committed 7 h ago and replaced a minute ago (by a retention DELETE, a
+  compaction or a rewrite) may still be under someone's read. The cutoff
+  comes from the table's snapshot log, which records when each snapshot became
+  current (`safe_cutoff_ms`):
+  - T = now − safe age;
+  - the snapshots current since T are the last log entry at or before T, plus
+    every entry after it;
+  - `older_than` is the earliest commit time among them (a rollback can make
+    an older snapshot current again);
+  - with no log entry at or before T, the newest snapshot committed by T
+    stands in.
+
+  The count in the checks uses the same cutoff, to the millisecond, so a
+  second pass finds nothing left to expire.
+- **A MERGE or DELETE in another run** checks the commits made since it
+  started. If its starting snapshot was expired meanwhile, Iceberg raises
+  `ValidationException` and the statement is retried from the current
+  version. With the cutoff above, a snapshot that started a run's statement
+  is still there.
 - **Orphan files** are not removed. Files another run has written but not yet
   committed look like orphans.
 
@@ -1516,4 +1536,6 @@ make gl-groups-parallel      # housekeeping (with upkeep) in exactly one run; co
 ```
 
 `gl-ops-check` part A also runs the old whole-table overwrite once and prints
-whether the row appended in between survived.
+whether the row appended in between survived (on the homelab it was lost).
+Part C checks the expiry cutoff with three commits: S2, committed before the
+safe age but current until S3, is kept; S1 goes.

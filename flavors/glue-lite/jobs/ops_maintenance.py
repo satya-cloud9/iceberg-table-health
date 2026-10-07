@@ -11,8 +11,9 @@ from its metadata, and acts only past a threshold:
   write.metadata.* properties not as configured      ALTER TABLE SET TBLPROPERTIES
   data files a rewrite would remove >= min_excess    rewrite_data_files
   manifests in the current snapshot > max_manifests  rewrite_manifests
-  snapshots older than the safe age beyond the       expire_snapshots(older_than =
-    newest retain_last >= min_expire                   now - safe age, retain_last)
+  snapshots not current at any time in the last      expire_snapshots(older_than =
+    safe age, beyond the newest retain_last,           safe cutoff, retain_last)
+    >= min_expire
 
 Facts: snapshot count and timestamps, current-snapshot summary (total data
 files and bytes) and manifest count from the Iceberg Java API; the partition
@@ -23,9 +24,10 @@ Other runs keep writing while this runs:
   appends            commit alongside a rewrite (a rewrite conflicts only with
                      a commit that removed the files it rewrites)
   MERGE / DELETE     a clash fails one side; that side is retried
-  readers            expire_snapshots keeps every snapshot younger than the
-                     safe age (longer than any run), so no run in progress
-                     loses the files it is reading
+  readers            expire_snapshots keeps every snapshot that was current at
+                     any time in the last safe age (longer than any run), found
+                     from the snapshot log (safe_cutoff_ms), so no run in
+                     progress loses the files it is reading
   orphan files       not removed: files another run has written but not yet
                      committed look like orphans
 
@@ -37,7 +39,7 @@ import argparse
 import os
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -67,10 +69,34 @@ def settings(config):
     return dict(DEFAULTS, **given, properties=props)
 
 
+def safe_cutoff_ms(log, commits, now_ms, safe_age_ms):
+    """older_than for expire_snapshots that keeps every snapshot which was
+    current at any time in the last safe_age (a run may have planned a read on
+    it then). A snapshot's own commit time is not enough: one committed 7 h ago
+    and current until a minute ago is still being read.
+
+    log: the table's snapshot log [(made_current_ms, snapshot_id)], oldest first;
+    commits: {snapshot_id: commit_ms}. The snapshots current since T = now -
+    safe_age are the last log entry at or before T plus every entry after it;
+    the cutoff is the earliest commit time among them (a rollback can make an
+    older snapshot current again). With no log entry at or before T, the
+    newest snapshot committed by T stands in. None: nothing may expire."""
+    T = now_ms - safe_age_ms
+    before = [sid for ts, sid in log if ts <= T][-1:]
+    after = [sid for ts, sid in log if ts > T]
+    if not before:
+        older = [(ts, sid) for sid, ts in commits.items() if ts <= T]
+        before = [max(older)[1]] if older else []
+    keep = [commits[sid] for sid in set(before + after) if sid in commits]
+    return min(keep) if keep else None
+
+
 def expirable(snapshots, current_id, cutoff_ms, retain_last):
     """How many snapshots expire_snapshots(older_than=cutoff, retain_last) would
-    remove: older than the cutoff, not among the newest retain_last, not the
-    current one. snapshots: [(snapshot_id, timestamp_ms)]."""
+    remove: committed before the cutoff, not among the newest retain_last, not
+    the current one. snapshots: [(snapshot_id, timestamp_ms)]; cutoff None: 0."""
+    if cutoff_ms is None:
+        return 0
     newest = {sid for sid, _ in sorted(snapshots, key=lambda s: -s[1])[:max(int(retain_last), 1)]}
     return sum(1 for sid, ts in snapshots if ts < cutoff_ms and sid not in newest and sid != current_id)
 
@@ -89,8 +115,8 @@ def decide(facts, cfg, partitions=None):
     if facts["manifests"] > cfg["max_manifests"]:
         out.append(("rewrite_manifests", f"{facts['manifests']} manifests > {cfg['max_manifests']}"))
     if facts["expirable"] >= cfg["min_expire"]:
-        out.append(("expire_snapshots", f"{facts['expirable']} of {facts['snapshots']} snapshots older than "
-                                        f"{cfg['safe_age_hours']} h beyond the newest {cfg['retain_last']}"))
+        out.append(("expire_snapshots", f"{facts['expirable']} of {facts['snapshots']} snapshots not current in "
+                                        f"the last {cfg['safe_age_hours']} h, beyond the newest {cfg['retain_last']}"))
     return out
 
 
@@ -99,12 +125,14 @@ def may_rewrite(facts, cfg):
     return facts["data_files"] >= cfg["min_excess_files"] + 1
 
 
-def table_facts(spark, table, cutoff_ms, retain_last):
-    """Metadata only: snapshots, current summary, manifest count, properties."""
+def table_facts(spark, table, now_ms, safe_age_ms, retain_last):
+    """Metadata only: snapshots, snapshot log, current summary, manifest count,
+    properties; the table's safe expiry cutoff."""
     jt = spark._jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark._jsparkSession, table)
     jt.refresh()                                  # the catalog may hand back a cached table
     meta = jt.operations().current()
     snaps = [(int(s.snapshotId()), int(s.timestampMillis())) for s in meta.snapshots()]
+    log = [(int(e.timestampMillis()), int(e.snapshotId())) for e in meta.snapshotLog()]
     cur = jt.currentSnapshot()
     facts = {"snapshots": len(snaps), "data_files": 0, "data_bytes": 0, "manifests": 0, "current_id": None}
     if cur is not None:
@@ -115,7 +143,8 @@ def table_facts(spark, table, cutoff_ms, retain_last):
         facts["manifests"] = int(cur.allManifests(jt.io()).size())
     props = jt.properties()
     facts["properties"] = {str(k): str(props.get(k)) for k in props.keySet().toArray()}
-    facts["expirable"] = expirable(snaps, facts["current_id"], cutoff_ms, retain_last)
+    facts["cutoff_ms"] = safe_cutoff_ms(log, dict(snaps), now_ms, safe_age_ms)
+    facts["expirable"] = expirable(snaps, facts["current_id"], facts["cutoff_ms"], retain_last)
     return facts
 
 
@@ -132,11 +161,13 @@ def partition_facts(spark, table, cfg):
     return {"partitions": int(r.partitions), "excess_files": int(r.excess_files)}
 
 
-def statements(table, actions, cfg, now):
+def statements(table, actions, cfg, cutoff_ms=None):
     """SQL for each action (CALL takes the catalog-relative name)."""
     import gl_common as gl
     ident = gl.catalog_relative(table)
-    cutoff = (now - timedelta(hours=float(cfg["safe_age_hours"]))).strftime("%Y-%m-%d %H:%M:%S")
+    # the table's own safe cutoff, with milliseconds: exactly what the checks counted
+    cutoff = (datetime.fromtimestamp(cutoff_ms / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+              if cutoff_ms is not None else None)
     out = []
     for action, _ in actions:
         if action == "set_properties":
@@ -149,7 +180,7 @@ def statements(table, actions, cfg, now):
                                 f"'partial-progress.enabled', 'true'))"))
         elif action == "rewrite_manifests":
             out.append((action, f"CALL glue.system.rewrite_manifests(table => '{ident}')"))
-        elif action == "expire_snapshots":
+        elif action == "expire_snapshots" and cutoff:
             out.append((action, f"CALL glue.system.expire_snapshots(table => '{ident}', "
                                 f"older_than => TIMESTAMP '{cutoff}+00:00', "
                                 f"retain_last => {int(cfg['retain_last'])})"))
@@ -182,7 +213,7 @@ def _maintain(spark, config, run_id, renew=lambda: True, dry_run=False, ops=None
         print("  ops-table upkeep: disabled", flush=True)
         return []
     now = now or datetime.now(timezone.utc)
-    cutoff_ms = int((now - timedelta(hours=float(cfg["safe_age_hours"]))).timestamp() * 1000)
+    now_ms, safe_ms = int(now.timestamp() * 1000), int(float(cfg["safe_age_hours"]) * 3600 * 1000)
     rows, t0 = [], time.time()
     print(f"\n=== Ops-table upkeep ({ops}{', dry run' if dry_run else ''}) ===", flush=True)
     for table in ops_tables(spark, ops):
@@ -192,7 +223,7 @@ def _maintain(spark, config, run_id, renew=lambda: True, dry_run=False, ops=None
         start = time.time()
         row = {"run_id": run_id, "table_name": table, "checked_at": now, "actions": "", "result": "ok"}
         try:
-            f = table_facts(spark, table, cutoff_ms, cfg["retain_last"])
+            f = table_facts(spark, table, now_ms, safe_ms, cfg["retain_last"])
             parts = partition_facts(spark, table, cfg) if may_rewrite(f, cfg) else None
             acts = decide(f, cfg, parts)
             row.update(data_files=f["data_files"], data_bytes=f["data_bytes"], manifests=f["manifests"],
@@ -205,7 +236,7 @@ def _maintain(spark, config, run_id, renew=lambda: True, dry_run=False, ops=None
             for action, reason in acts:
                 print(f"      -> {action}: {reason}", flush=True)
             if not dry_run:
-                for action, sql in statements(table, acts, cfg, now):
+                for action, sql in statements(table, acts, cfg, f["cutoff_ms"]):
                     retry_on_conflict(lambda: spark.sql(sql).collect(), f"{action} {table}")
         except Exception as e:                    # one table failing never stops the others
             row["result"] = f"{type(e).__name__}: {e}"[:300]
@@ -217,7 +248,8 @@ def _maintain(spark, config, run_id, renew=lambda: True, dry_run=False, ops=None
     if not dry_run and rows:
         t = f"{ops}.ops_maintenance"
         try:
-            spark.sql(f"CREATE TABLE IF NOT EXISTS {t} ({LOG_DDL}) USING iceberg")
+            kv = ", ".join(f"'{k}'='{v}'" for k, v in sorted(cfg["properties"].items()))
+            spark.sql(f"CREATE TABLE IF NOT EXISTS {t} ({LOG_DDL}) USING iceberg TBLPROPERTIES ({kv})")
             sch = spark.table(t).schema
             spark.createDataFrame([as_row(r, sch) for r in rows], sch).writeTo(t).append()
             retry_on_conflict(lambda: spark.sql(

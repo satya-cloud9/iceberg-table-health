@@ -7,6 +7,8 @@ Works in a scratch namespace (glue.ops_check, dropped at the end):
      the whole-table INSERT OVERWRITE it replaced is run once for contrast
   B  ops-table upkeep: many one-row appends -> rewrite_data_files,
      rewrite_manifests and expire_snapshots run and the counts drop
+  C  expiry keeps a snapshot that was current within the safe age, even when
+     it was committed before it (snapshot log, not commit time)
 
 Usage (make gl-ops-check): check_ops_upkeep.py
 """
@@ -120,10 +122,10 @@ def part_b(spark):
         spark.sql(f"INSERT INTO {t} VALUES (TIMESTAMP '{ts(i * 3600)}', {i})")    # 2 day partitions
     cfg = {"ops_maintenance": {"min_excess_files": 10, "max_manifests": 10, "retain_last": 3,
                                "safe_age_hours": 0, "min_expire": 5}}
-    before = om.table_facts(spark, t, int(time.time() * 1000), 3)
+    before = om.table_facts(spark, t, int(time.time() * 1000), 0, 3)
     rows = om.maintain(spark, cfg, "check", ops=NS)
     mine = [r for r in rows if r["table_name"] == t]
-    after = om.table_facts(spark, t, int(time.time() * 1000), 3)
+    after = om.table_facts(spark, t, int(time.time() * 1000), 0, 3)
     acts = mine[0]["actions"].split(",") if mine else []
     check("B upkeep chose all four actions",
           set(acts) == {"set_properties", "rewrite_data_files", "rewrite_manifests", "expire_snapshots"},
@@ -139,12 +141,37 @@ def part_b(spark):
           not [r for r in again if r["table_name"] == t and r["actions"]], again)
 
 
+def part_c(spark):
+    """S1, S2, then S3 eight seconds later; upkeep with a 4 s safe age right after
+    S3: S2 was current until S3, inside the safe age, so it stays although it
+    was committed more than 4 s ago. S1 goes."""
+    t = f"{NS}.timeline"
+    spark.sql(f"DROP TABLE IF EXISTS {t} PURGE")
+    spark.sql(f"CREATE TABLE {t} (v BIGINT) USING iceberg")
+    ids = []
+    for i, pause in enumerate((2, 8, 0)):
+        spark.sql(f"INSERT INTO {t} VALUES ({i})")
+        ids.append(int(spark.sql(f"SELECT snapshot_id FROM {t}.snapshots ORDER BY committed_at DESC LIMIT 1")
+                       .collect()[0].snapshot_id))
+        time.sleep(pause)
+    cfg = {"ops_maintenance": {"safe_age_hours": 4 / 3600, "retain_last": 1, "min_expire": 1,
+                               "min_excess_files": 1000}}
+    now_ms = int(time.time() * 1000)
+    f = om.table_facts(spark, t, now_ms, 4000, 1)
+    check("C safe cutoff = S2's commit time (current until S3)", f["expirable"] == 1, f)
+    om.maintain(spark, cfg, "check-c", ops=NS)
+    left = sorted(int(r.snapshot_id) for r in spark.sql(f"SELECT snapshot_id FROM {t}.snapshots").collect())
+    check("C after expiry S2 and S3 remain, S1 gone (now - 4 s alone would have removed S2)",
+          left == sorted(ids[1:]), (left, ids))
+
+
 def main():
     spark = SparkSession.builder.appName("gl-ops-check").getOrCreate()
     spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {NS}")
     try:
         part_a(spark)
         part_b(spark)
+        part_c(spark)
     finally:
         for r in spark.sql(f"SHOW TABLES IN {NS}").collect():
             spark.sql(f"DROP TABLE IF EXISTS {NS}.{r.tableName} PURGE")
