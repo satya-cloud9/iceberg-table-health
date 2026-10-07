@@ -68,6 +68,7 @@ CHECK_DDL = """
     scan_id STRING, checked_at TIMESTAMP, table_name STRING, table_uuid STRING,
     family STRING, metric STRING, full_value STRING, ledger_value STRING,
     agree BOOLEAN, note STRING"""
+ss.declare_log("incremental_check", CHECK_DDL, "checked_at", "days(checked_at)")
 
 # Upper edges in minutes; None = longer than the last edge.
 GAP_BUCKETS = [1, 2, 5, 10, 15, 30, 60, 120, 360, 720, 1440, 2880, 10080, None]

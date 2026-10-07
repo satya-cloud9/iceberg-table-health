@@ -1598,3 +1598,25 @@ make gl-plan                 # SNAPSHOT_BUILDUP tables show expire_keep_files (f
 make gl-plan APPLY=1         # expire; then make gl-freed-files shows files waiting
 # after the grace (6 min at test scale): make gl-scan, then make gl-plan APPLY=1 deletes them
 ```
+
+## Step 3a — Every advisor log through the log sink
+
+Every log the advisor writes now goes through one buffered log sink, created by
+`state_store.make_log_sink(spark, config)`. That covers scan metrics, coverage,
+symptoms, incremental checks, plan actions, the scorecard, the run journal and
+the upkeep log.
+
+- **Declarations:** each writing module declares its log kinds once:
+  `declare_log(kind, ddl, time_column, partition)`. The sink creates the store
+  for a kind from its declaration and adds new columns.
+- **Iceberg sink:** creates log tables with
+  `write.metadata.delete-after-commit.enabled=true` and
+  `previous-versions-max=20`.
+- **Backends:** chosen by config. `logs.backend` defaults to `iceberg`, the
+  only backend so far; JSON lines on S3 is added in 3c. The Iceberg sink and the
+  Iceberg state store stay; other backends are added alongside them, and
+  `state.backend` will select the state store the same way.
+- **Run journal:** a row is still flushed at once, so a run that dies leaves it.
+
+Test jobs (`scenario_step.py`, `compact.py`, `read_benchmark.py`,
+`table_health.py`) keep their own direct writes.

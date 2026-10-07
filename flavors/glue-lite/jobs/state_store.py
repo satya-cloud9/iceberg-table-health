@@ -83,6 +83,30 @@ KINDS = {
 
 LOG_AGE = {"incremental_check": "checked_at"}
 
+# Log kinds: the record shape and time column of everything the advisor appends
+# (declared by the module that writes it). A sink creates the store for a kind
+# from its declaration; the JSON-lines sink (step 3c) partitions by the time column.
+LOG_KINDS = {}
+# set on log tables when the sink creates them (upkeep keeps them so later)
+LOG_TABLE_PROPERTIES = {"write.metadata.delete-after-commit.enabled": "true",
+                        "write.metadata.previous-versions-max": "20"}
+
+
+def declare_log(kind, ddl, ts, partition=""):
+    """ddl: column list; ts: the record's time column; partition: Iceberg
+    partition clause for the Iceberg sink ('' = unpartitioned)."""
+    LOG_KINDS[kind] = {"ddl": ddl, "ts": ts, "partition": partition}
+    LOG_AGE.setdefault(kind, ts)
+
+
+def make_log_sink(spark, config=None, ops=None):
+    """The configured log sink (config logs.backend; iceberg until step 3c)."""
+    import gl_common as gl
+    backend = str(((config or {}).get("logs") or {}).get("backend", "iceberg"))
+    if backend != "iceberg":
+        raise ValueError(f"unknown logs.backend {backend!r}")
+    return IcebergLogSink(spark, ops or gl.OPS_NAMESPACE)
+
 
 def _age_sql(col, how, days):
     if how == "day":
@@ -514,6 +538,19 @@ class IcebergLogSink(LogSink):
     def __init__(self, spark, ops):
         self.spark, self.ops = spark, ops
         self._pending = {}
+        self._ready = set()
+
+    def _ensure(self, kind):
+        """Create the kind's table (or add new columns) from its declaration, once per sink."""
+        if kind in self._ready or kind not in LOG_KINDS:
+            return
+        import gl_common as gl
+        d, t = LOG_KINDS[kind], f"{self.ops}.{kind}"
+        part = f"PARTITIONED BY ({d['partition']})" if d["partition"] else ""
+        props = ", ".join(f"'{k}'='{v}'" for k, v in LOG_TABLE_PROPERTIES.items())
+        self.spark.sql(f"CREATE TABLE IF NOT EXISTS {t} ({d['ddl']}) USING iceberg {part} TBLPROPERTIES ({props})")
+        gl.ensure_columns(self.spark, t, d["ddl"])
+        self._ready.add(kind)
 
     def append(self, kind, rows):
         self._pending.setdefault(kind, []).extend(dict(r) for r in rows)
@@ -522,6 +559,8 @@ class IcebergLogSink(LogSink):
         return list(self._pending.get(kind, []))
 
     def expire(self, kind, older_than_days):
+        if not self.spark.catalog.tableExists(f"{self.ops}.{kind}"):
+            return
         sql = f"DELETE FROM {self.ops}.{kind} WHERE {_age_sql(LOG_AGE[kind], 'ts', older_than_days)}"
         retry_on_conflict(lambda: self.spark.sql(sql), f"expire {kind}")
 
@@ -529,6 +568,7 @@ class IcebergLogSink(LogSink):
         from scan_metrics import as_row
         for kind, rows in self._pending.items():
             if rows:
+                self._ensure(kind)
                 t = f"{self.ops}.{kind}"
                 sch = self.spark.table(t).schema
                 self.spark.createDataFrame([as_row(r, sch) for r in rows], sch).writeTo(t).append()

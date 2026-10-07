@@ -45,6 +45,14 @@ ACTIONS_DDL = """
     status STRING, duration_s DOUBLE, result_json STRING,
     snapshot_before BIGINT, snapshot_after BIGINT, rollback_hint STRING"""
 
+
+def _declare_actions():
+    import state_store as ss
+    ss.declare_log("actions", ACTIONS_DDL, "started_at")
+
+
+_declare_actions()
+
 MODES = ("auto", "approve-only", "off")
 
 
@@ -608,12 +616,9 @@ def main():
                       if m) or "dry run"
     print(f"=== Plan {run_id} from scan {scan_id} ({mode}) ===", flush=True)
 
-    if a.apply or approve:
-        spark.sql(f"CREATE TABLE IF NOT EXISTS {ns}.actions ({ACTIONS_DDL}) USING iceberg")
-        gl.ensure_columns(spark, f"{ns}.actions", ACTIONS_DDL)
-        schema = spark.table(f"{ns}.actions").schema
     import freed_files as ff
     import state_store as ss
+    log = ss.make_log_sink(spark, config, ns)
     store = ss.IcebergStateStore(spark, ns)
     ff.ensure_table(spark, ns)
     store.preload(ff.KIND)
@@ -657,7 +662,7 @@ def main():
                 status, result, dur = run_op(spark, s, t, uuid or t_uuid, store, run_id)
                 after = current_snapshot(spark, t)
                 print(f"  -> {kind}: {status} in {dur}s  snapshot {before} -> {after}  {result[:300]}", flush=True)
-                records.append(action_row(schema, run_id=run_id, scan_id=tms[t]["scan_id"], started_at=now,
+                records.append(dict(run_id=run_id, scan_id=tms[t]["scan_id"], started_at=now,
                                           table_name=t, table_uuid=uuid, kind=kind,
                                           symptoms=",".join(s["symptoms"]), statement=s["statement"],
                                           status=status, duration_s=float(dur), result_json=result,
@@ -683,7 +688,7 @@ def main():
                 hint = rollback_hint(ident_t, before, after) if status == "ok" else None
                 print(f"  -> {kind}: {status} in {dur}s  snapshot {before} -> {after}  {result[:300]}",
                       flush=True)
-                records.append(action_row(schema, run_id=run_id, scan_id=tms[t]["scan_id"], started_at=now,
+                records.append(dict(run_id=run_id, scan_id=tms[t]["scan_id"], started_at=now,
                                           table_name=t, table_uuid=uuid, kind=kind,
                                           symptoms=",".join(s["symptoms"]), statement=stmt, status=status,
                                           duration_s=float(dur), result_json=result,
@@ -699,7 +704,7 @@ def main():
                 after = current_snapshot(spark, t)
                 print(f"  -> {s['kind']} (retry without remove-dangling-deletes): {status} in {dur}s  "
                       f"{result[:300]}", flush=True)
-                records.append(action_row(schema, run_id=run_id, scan_id=tms[t]["scan_id"],
+                records.append(dict(run_id=run_id, scan_id=tms[t]["scan_id"],
                                           started_at=datetime.now(timezone.utc), table_name=t,
                                           table_uuid=uuid, kind=s["kind"], symptoms=",".join(s["symptoms"]),
                                           statement=retry, status=status, duration_s=float(dur),
@@ -707,7 +712,8 @@ def main():
                                           rollback_hint=rollback_hint(ident_t, before, after)
                                           if status == "ok" else None))
     if (a.apply or approve) and records:
-        spark.createDataFrame(records, schema).writeTo(f"{ns}.actions").append()
+        log.append("actions", records)
+        log.flush()
         print(f"\nRecorded {len(records)} actions in {ns}.actions under {run_id} (with snapshot "
               f"before/after and a rollback statement each). Run make gl-scan to check the result.",
               flush=True)

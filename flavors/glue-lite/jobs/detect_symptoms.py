@@ -32,6 +32,7 @@ SYMPTOMS_DDL = """
     symptom STRING, category STRING, level STRING, action STRING, automatic BOOLEAN,
     score DOUBLE, severity STRING, remedy STRING, evidence_level STRING,
     evidence_json STRING, rule_version STRING"""
+ss.declare_log("symptoms", SYMPTOMS_DDL, "detected_at")
 
 ACTION_ORDER = {"auto": 0, "defer": 1, "approval": 2, "advisory": 3, "needs-evidence": 4, "acknowledged": 5}
 
@@ -214,7 +215,7 @@ def run_detect(spark, scan_id, config, report=True):
     detected_at = probes.now_utc()
     findings = []
     store = ss.IcebergStateStore(spark, gl.OPS_NAMESPACE)
-    log = ss.IcebergLogSink(spark, gl.OPS_NAMESPACE)
+    log = ss.make_log_sink(spark, config)
     mode3 = mode_of(config, "learned_windows")
     mode4 = mode_of(config, "partition_holds")
     inc = config.get("incremental") or {}

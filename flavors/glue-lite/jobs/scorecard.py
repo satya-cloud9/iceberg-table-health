@@ -33,6 +33,14 @@ SCORECARD_DDL = """
     found STRING, missing STRING, unexpected STRING, notes STRING, phase STRING,
     last_fix STRING"""
 
+
+def _declare_scorecard():
+    import state_store as ss
+    ss.declare_log("scorecard", SCORECARD_DDL, "scored_at")
+
+
+_declare_scorecard()
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -235,8 +243,6 @@ def run_scorecard(spark, scan_id, config, expectations, partial=False):
     pm = f"{gl.OPS_NAMESPACE}.partition_metrics"
     tm = f"{gl.OPS_NAMESPACE}.table_metrics"
     sc = f"{gl.OPS_NAMESPACE}.scorecard"
-    spark.sql(f"CREATE TABLE IF NOT EXISTS {sc} ({SCORECARD_DDL}) USING iceberg")
-    gl.ensure_columns(spark, sc, SCORECARD_DDL)
 
     tmrows = {r.table_name: r.asDict() for r in
               spark.sql(f"SELECT * FROM {tm} WHERE scan_id = '{scan_id}'").collect()}
@@ -285,11 +291,14 @@ def run_scorecard(spark, scan_id, config, expectations, partial=False):
         print(line)
 
     scored_at = probes.now_utc()
-    rows = [(scan_id, scored_at, r["table_name"], r["status"], ", ".join(r["found"]),
-             "; ".join(r["missing"]), ", ".join(r["unexpected"]), r["notes"], r["phase"],
-             r.get("last_fix"))
-            for r in results]
-    spark.createDataFrame(rows, spark.table(sc).schema).writeTo(sc).append()
+    import state_store as ss
+    log = ss.make_log_sink(spark, config)
+    log.append("scorecard", [{"scan_id": scan_id, "scored_at": scored_at, "table_name": r["table_name"],
+                              "status": r["status"], "found": ", ".join(r["found"]),
+                              "missing": "; ".join(r["missing"]), "unexpected": ", ".join(r["unexpected"]),
+                              "notes": r["notes"], "phase": r["phase"], "last_fix": r.get("last_fix")}
+                             for r in results])
+    log.flush()
     return results
 
 

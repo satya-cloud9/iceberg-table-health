@@ -44,12 +44,15 @@ JOURNAL_DDL = """
     rule_version STRING, note STRING"""
 
 
-def journal(spark, row):
-    import scan_metrics
-    t = f"{gl.OPS_NAMESPACE}.run_journal"
-    spark.sql(f"CREATE TABLE IF NOT EXISTS {t} ({JOURNAL_DDL}) USING iceberg")
-    sch = spark.table(t).schema
-    spark.createDataFrame([scan_metrics.as_row(row, sch)], sch).writeTo(t).append()
+import state_store as ss  # noqa: E402
+
+ss.declare_log("run_journal", JOURNAL_DDL, "started_at")
+
+
+def journal(log, row):
+    """One run journal row, written at once (a run that dies still leaves it)."""
+    log.append("run_journal", [row])
+    log.flush()
 
 
 def group_tables(spark, profile, group, shard):
@@ -111,12 +114,13 @@ def run_group(a):
     run_id = gl.new_run_id(f"run-{a.group}")
     coord = coordination.make(profile, run_id)
     spark = SparkSession.builder.appName(f"gl-group-{a.group}").getOrCreate()
+    log = ss.make_log_sink(spark, config)
     started = probes.now_utc()
     base = {"run_id": run_id, "target": profile["target"], "group_name": a.group, "shard": shard_s,
             "started_at": started, "rule_version": symptom_rules.RULE_VERSION}
     if not coord.claim_group(a.group, shard_s, ttl_s=int(gcfg.get("claim_hours", 3) * 3600)):
         print(f"=== Group {a.group} shard {shard_s}: another run holds it; exiting ===", flush=True)
-        journal(spark, dict(base, ended_at=probes.now_utc(), status="skipped: group held"))
+        journal(log, dict(base, ended_at=probes.now_utc(), status="skipped: group held"))
         spark.stop()
         return
     try:
@@ -148,13 +152,13 @@ def run_group(a):
                 done += r.n if r.status == "done" else 0
                 skipped += r.n if r.status == "claimed_elsewhere" else 0
                 failed += r.n if r.status == "failed" else 0
-        journal(spark, dict(base, scan_id=",".join(scan_ids), ended_at=probes.now_utc(), status="ok",
+        journal(log, dict(base, scan_id=",".join(scan_ids), ended_at=probes.now_utc(), status="ok",
                             tables_matched=matched, tables_done=done, tables_skipped=skipped,
                             tables_failed=failed, housekeeping=hk and bool(scan_ids)))
         print(f"=== Group {a.group} shard {shard_s}: {done} done, {skipped} held by other runs, "
               f"{failed} failed of {matched} ===", flush=True)
     except Exception as e:
-        journal(spark, dict(base, ended_at=probes.now_utc(), status="failed", note=f"{type(e).__name__}: {e}"[:500]))
+        journal(log, dict(base, ended_at=probes.now_utc(), status="failed", note=f"{type(e).__name__}: {e}"[:500]))
         raise
     finally:
         coord.release_group(a.group, shard_s)

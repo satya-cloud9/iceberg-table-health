@@ -63,6 +63,14 @@ LOG_DDL = """
     expirable_snapshots BIGINT, actions STRING, result STRING, seconds DOUBLE"""
 
 
+def _declare_log():
+    import state_store as ss
+    ss.declare_log("ops_maintenance", LOG_DDL, "checked_at")
+
+
+_declare_log()
+
+
 def settings(config):
     given = dict((config or {}).get("ops_maintenance") or {})
     props = dict(DEFAULTS["properties"], **given.pop("properties", {}))
@@ -205,7 +213,6 @@ def _maintain(spark, config, run_id, renew=lambda: True, dry_run=False, ops=None
     housekeeping claim before each table; False (taken over) stops here.
     -> log rows (also appended to <ops>.ops_maintenance unless dry_run)."""
     import gl_common as gl
-    from scan_metrics import as_row
     from state_store import retry_on_conflict
     cfg = settings(config)
     ops = ops or gl.OPS_NAMESPACE
@@ -246,15 +253,12 @@ def _maintain(spark, config, run_id, renew=lambda: True, dry_run=False, ops=None
     acted = sum(1 for r in rows if r["actions"])
     print(f"  {len(rows)} ops tables checked, {acted} needed upkeep, {time.time() - t0:.1f}s", flush=True)
     if not dry_run and rows:
-        t = f"{ops}.ops_maintenance"
         try:
-            kv = ", ".join(f"'{k}'='{v}'" for k, v in sorted(cfg["properties"].items()))
-            spark.sql(f"CREATE TABLE IF NOT EXISTS {t} ({LOG_DDL}) USING iceberg TBLPROPERTIES ({kv})")
-            sch = spark.table(t).schema
-            spark.createDataFrame([as_row(r, sch) for r in rows], sch).writeTo(t).append()
-            retry_on_conflict(lambda: spark.sql(
-                f"DELETE FROM {t} WHERE checked_at < current_timestamp() - INTERVAL {int(cfg['log_keep_days'])} DAYS"),
-                f"expire {t}")
+            import state_store as ss
+            log = ss.make_log_sink(spark, config, ops)
+            log.append("ops_maintenance", rows)
+            log.flush()
+            log.expire("ops_maintenance", int(cfg["log_keep_days"]))
         except Exception as e:
             print(f"  (upkeep log not written: {type(e).__name__})", flush=True)
     return rows

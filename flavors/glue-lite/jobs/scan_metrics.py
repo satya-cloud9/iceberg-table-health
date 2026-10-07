@@ -99,6 +99,10 @@ COVERAGE_DDL = """
     run_id STRING, scan_id STRING, target STRING, group_name STRING, shard STRING,
     table_name STRING, status STRING, note STRING, at TIMESTAMP"""
 
+ss.declare_log("table_metrics", TABLE_METRICS_DDL, "scanned_at")
+ss.declare_log("partition_metrics", PARTITION_METRICS_DDL, "scanned_at")
+ss.declare_log("coverage", COVERAGE_DDL, "at")
+
 
 def load_previous(spark, tm_table, pm_table, namespace, window_hours=168):
     """Each table's latest successful scan row (with ages computed in SQL, so
@@ -247,7 +251,7 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
     t_pre = time.perf_counter()
     # logs (table_metrics, partition_metrics, incremental_check) are buffered and
     # written once at the end: one Iceberg commit per table instead of two per scanned table
-    log = ss.IcebergLogSink(spark, gl.OPS_NAMESPACE)
+    log = ss.make_log_sink(spark, config)
     # the run's tables we already know (new ones load on their own when first seen)
     known = sorted({p.get("table_uuid") for n, p in prev.items()
                     if p.get("table_uuid") and n.rsplit(".", 1)[-1] in set(names)})
@@ -394,7 +398,6 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
     t_w = time.perf_counter()
     led.report(housekeeping=housekeeping)   # writes the ledger's state and the buffered logs
     if coverage:
-        spark.sql(f"CREATE TABLE IF NOT EXISTS {gl.OPS_NAMESPACE}.coverage ({COVERAGE_DDL}) USING iceberg")
         log.append("coverage", coverage)
     log.flush()
     t_w = time.perf_counter() - t_w
