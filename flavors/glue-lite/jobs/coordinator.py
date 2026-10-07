@@ -138,10 +138,10 @@ class DynamoCoordinator(Coordinator):
 
     def _acquire(self, pk, sk, ttl_s, extra=None):
         """Take the claim when nobody holds it, its holder's time ran out, or we
-        already hold it. Three single-clause conditional puts, tried in turn,
-        rather than one OR condition: each clause on its own is what the Floci
-        check proved, and the OR form was let through there. Races stay safe:
-        once one run's put lands, the others' conditions are false."""
+        already hold it. Three single-clause conditional puts, tried in turn
+        (one OR condition works too, on DynamoDB and on Floci; single clauses
+        keep each step's outcome visible). Races stay safe: once one run's put
+        lands, the others' conditions are false."""
         item = {"pk": {"S": pk}, "sk": {"S": sk}, "run_id": {"S": self.run_id},
                 "expires_at": {"N": str(now_s() + ttl_s)}}
         for k, v in (extra or {}).items():

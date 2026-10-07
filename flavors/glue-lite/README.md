@@ -1444,16 +1444,19 @@ Then compare findings with the last single-run scan (`scan-...-b07d93` or newer)
 each table's latest findings should be the same. The README's comparison query
 works per group run, using each run's scan_id.
 
-**Claim fix.** On the first cluster test a second run of a running group was not
-turned away: Floci's DynamoDB let a claim through whose condition was one OR
-expression (`attribute_not_exists(pk) OR expires_at < :now OR run_id = :me`).
-Claims now use three single-clause conditional puts in turn (free, expired,
-ours), each of which Floci enforces; `spike/claim-check.sh` shows both
-behaviours and lists the coordination table's items. Real DynamoDB handles
-either form.
+**Claims checked on the cluster.** `spike/claim-check.sh` tests the claim
+conditions against Floci's DynamoDB (free, held, renewed, expired, release by a
+non-holder, and the single OR condition): all pass. Claims use three
+single-clause conditional puts in turn (free, expired, ours). A first attempt at
+the overlap test looked like a failure only because the two runs never
+overlapped (a run without `--full` reuses unchanged tables and finishes in
+seconds); with a long first run the second is turned away:
 
 ```bash
-bash flavors/glue-lite/spike/claim-check.sh      # A may FAIL on Floci (the OR form); B1-B4 and C must pass
-make gl-image
-make gl-group G=group_a > /tmp/g1.log 2>&1 & sleep 20; make gl-group G=group_a 2>&1 | grep -E "=== Group|holds it"
+make gl-group G=group_a SCAN_ARGS=--full > /tmp/g1.log 2>&1 & sleep 8; make gl-group G=group_a 2>&1 | grep -E "=== Group|holds it"
+# === Group group_a shard 0/1: another run holds it; exiting ===
 ```
+
+Gate result (homelab): two groups in parallel covered all 27 tables exactly once
+(group_a 15, group_b 12), housekeeping ran in one run only, scorecards unchanged
+(20 pass, s3 and s12 stale), and an overlapping second run of a group was refused.
