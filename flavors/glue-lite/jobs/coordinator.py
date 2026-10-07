@@ -8,7 +8,7 @@ the next one for longer than the claim's lifetime.
   group run     one run per (group, shard) at a time; a second run starting
                 while the first holds it exits quietly (overlapping schedules)
   table         one run works on a table at a time (operation: scan or act)
-  housekeeping  one run at a time does the store's retention pass
+  housekeeping  one run at a time does the store's retention pass and ops-table upkeep
 
 Backends:
 
@@ -76,9 +76,23 @@ class Coordinator:
             return False
         return self._acquire(pk, sk, ttl_s, {"last_done": last})
 
-    def housekeeping_done(self):
-        """Record when the pass finished and free the claim."""
-        self._release(f"{self.target}#housekeeping", "claim", {"last_done": now_s()})
+    def renew_housekeeping(self, ttl_s=3600):
+        """Extend the housekeeping claim this run holds (long passes renew
+        before each step). False when another run has taken it over."""
+        pk, sk = f"{self.target}#housekeeping", "claim"
+        item = self._get(pk, sk) or {}
+        if item.get("run_id") not in (None, self.run_id):
+            return False
+        return self._acquire(pk, sk, ttl_s, {"last_done": int(item.get("last_done") or 0)})
+
+    def housekeeping_done(self, record=True):
+        """Free the claim; record=True stamps last_done (the pass finished),
+        False keeps the previous stamp (a standalone maintenance run)."""
+        pk, sk = f"{self.target}#housekeeping", "claim"
+        if record:
+            self._release(pk, sk, {"last_done": now_s()})
+        else:
+            self._release(pk, sk, {"last_done": int((self._get(pk, sk) or {}).get("last_done") or 0)})
 
 
 class LocalCoordinator(Coordinator):

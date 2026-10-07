@@ -112,6 +112,19 @@
     "_previous_comment": "previous_scan_window_hours: the last scan's row per table (carried values, probe clocks, reuse) and recent actions are read from the logs only this far back, so the read does not grow with history; a table not scanned within it is measured in full.",
     "previous_scan_window_hours": 168
   },
+  "ops_maintenance": {
+    "_comment": "Upkeep of the advisor's own glue.ops tables (ops_maintenance.py), in the housekeeping pass only (one run at a time). Checks from metadata; acts only past a threshold: rewrite_data_files when it would remove >= min_excess_files files (partitions with >= min_input_files), rewrite_manifests above max_manifests, expire_snapshots when >= min_expire snapshots are older than safe_age_hours beyond the newest retain_last (safe_age_hours longer than any run, so readers in other runs keep their files), and the write.metadata.* properties. No orphan-file removal (other runs' uncommitted files look like orphans). Log: glue.ops.ops_maintenance, log_keep_days.",
+    "enabled": true,
+    "min_input_files": 5,
+    "min_excess_files": 20,
+    "target_file_bytes": 134217728,
+    "max_manifests": 50,
+    "retain_last": 20,
+    "safe_age_hours": 6,
+    "min_expire": 10,
+    "properties": {"write.metadata.delete-after-commit.enabled": "true", "write.metadata.previous-versions-max": "20"},
+    "log_keep_days": 90
+  },
   "tables": {
     "glue.demo.s0_small_appends":     { "filter_columns": ["customer_id"] },
     "glue.demo.s1_late_arrivals":     { "filter_columns": ["customer_id"] },

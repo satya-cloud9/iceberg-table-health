@@ -1420,7 +1420,7 @@ different groups of tables, or several shards of one group.
   status. `make gl-coverage` shows the latest runs and which run scanned each
   table.
 - **Concurrent commits:** two runs writing the same `ops` table can collide on
-  MERGE, DELETE or INSERT OVERWRITE. Those are retried with backoff when
+  MERGE or DELETE. Those are retried with backoff when
   Iceberg reports a conflict (`state_store.retry_on_conflict`); appends need no
   retry.
 - **Plan** now uses each table's own latest scan (within
@@ -1460,3 +1460,60 @@ make gl-group G=group_a SCAN_ARGS=--full > /tmp/g1.log 2>&1 & sleep 8; make gl-g
 Gate result (homelab): two groups in parallel covered all 27 tables exactly once
 (group_a 15, group_b 12), housekeeping ran in one run only, scorecards unchanged
 (20 pass, s3 and s12 stale), and an overlapping second run of a group was refused.
+
+## Housekeeping with parallel runs
+
+Only one run at a time does housekeeping: the run holding the housekeeping
+claim. It runs at most every `housekeeping_every_hours`. Other runs scan and
+write as usual and skip it. Housekeeping is now two parts:
+
+1. **Retention pass** (state store): expire old rows, drop superseded rows of
+   the latest-value tables (`ledger_state`, `activity_state`).
+2. **Ops-table upkeep** (`ops_maintenance.py`): checks every `glue.ops` table
+   from its metadata and acts only past a threshold (`ops_maintenance` in
+   `config/health.json`):
+
+   | Check (metadata only) | Action |
+   |---|---|
+   | `write.metadata.delete-after-commit.enabled` / `previous-versions-max` not set | `ALTER TABLE … SET TBLPROPERTIES` |
+   | a rewrite would remove ≥ `min_excess_files` files (from `<table>.partitions`, read only when the table has that many files) | `rewrite_data_files` (partial progress) |
+   | manifests in the current snapshot > `max_manifests` | `rewrite_manifests` |
+   | ≥ `min_expire` snapshots older than `safe_age_hours` beyond the newest `retain_last` | `expire_snapshots(older_than = now − safe age, retain_last)` |
+
+   One row per table goes to `glue.ops.ops_maintenance`. The claim is renewed
+   before each table, and upkeep stops if another run has taken the claim over.
+
+**What other runs do meanwhile, and why it is safe:**
+
+- **Appends** (logs, commit history) commit alongside a delete or a rewrite.
+  A rewrite conflicts only with a commit that removed the files it rewrites.
+- **Expiring rows:** `DELETE … WHERE <time column> < cutoff`. New files hold
+  only recent rows, so Iceberg's check finds no overlap. A conflict is retried.
+- **Compacting the latest-value tables** reads each table's newest version,
+  then deletes that table's rows older than it (literal bounds, in chunks). A
+  row appended meanwhile is newer, so it is never removed. This replaces a
+  whole-table `INSERT OVERWRITE` from rows read a moment earlier. That version
+  could drop a row another run appended in between, and that table would then
+  resume from an older position.
+- **Readers in other runs:** `expire_snapshots` keeps every snapshot younger
+  than `safe_age_hours` (6). That is longer than any run, so no run loses the
+  files it is reading.
+- **Orphan files** are not removed. Files another run has written but not yet
+  committed look like orphans.
+
+`make gl-scan` (one full run, no group) does the upkeep at the end itself.
+`make gl-ops-maintain [DRY=1]` runs it on its own: it takes the claim and
+leaves the retention pass's schedule alone.
+
+Gate:
+
+```bash
+make gl-image
+make gl-ops-check            # scratch namespace glue.ops_check (dropped at the end): ALL PASS
+make gl-ops-maintain DRY=1   # what upkeep would do to glue.ops now
+make gl-ops-maintain         # do it; then make gl-ops-upkeep-log
+make gl-groups-parallel      # housekeeping (with upkeep) in exactly one run; coverage as before
+```
+
+`gl-ops-check` part A also runs the old whole-table overwrite once and prints
+whether the row appended in between survived.

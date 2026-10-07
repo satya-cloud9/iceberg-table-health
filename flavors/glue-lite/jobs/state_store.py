@@ -368,6 +368,15 @@ def retry_on_conflict(fn, what, attempts=5, sleep=time.sleep):
             sleep(min(2 ** i, 15) + random.random())
 
 
+def superseded_filters(k, newest, chunk=200):
+    """DELETE conditions for compact(): per key, its rows older than the
+    newest version read (newest: rows with the key columns and newest_us).
+    Literal bounds only, so Iceberg can tell which files a DELETE touches."""
+    conds = [" AND ".join([f"{c} = {_q(r[c])}" for c in k.key]
+                          + [f"{k.version} < timestamp_micros({int(r['newest_us'])})"]) for r in newest]
+    return ["(" + ") OR (".join(conds[i:i + chunk]) + ")" for i in range(0, len(conds), chunk)]
+
+
 class IcebergStateStore(MemoryState):
     """Today's glue.ops tables behind the interface."""
 
@@ -443,22 +452,28 @@ class IcebergStateStore(MemoryState):
             self._forget(kind)               # re-read on next use
 
     def compact(self, kind):
-        """Latest kinds: keep one row per key (they append a row per change)."""
+        """Latest kinds: drop the rows a newer row for the same key supersedes.
+
+        Reads each key's newest version, then a row-level DELETE of that key's
+        rows older than it (in chunks). A row another run appends meanwhile is
+        newer than what was read, so it is never removed, and Iceberg checks
+        each DELETE against files committed since it started (a conflict is
+        retried). Rewriting the whole table from rows read a moment earlier
+        could drop such a row, and that table would resume from an older
+        position."""
         k = KINDS[kind]
         if k.mode != "latest" or not self._exists(kind):
             return 0
         t = f"{self.ops}.{k.table}"
-        n = int(self._rows(f"SELECT count(*) AS n FROM {t}")[0]["n"])
-        latest = self._load(kind)
-        if n <= len(latest):
-            return 0
-        from scan_metrics import as_row
-        sch = self.spark.table(t).schema
-        self.spark.createDataFrame([as_row(r, sch) for r in latest], sch).createOrReplaceTempView("gl_state_compact")
-        retry_on_conflict(lambda: self.spark.sql(f"INSERT OVERWRITE {t} SELECT * FROM gl_state_compact"),
-                          f"compact {k.table}")
-        self._forget(kind)
-        return n - len(latest)
+        keys = ", ".join(k.key)
+        rows = self._rows(f"SELECT {keys}, unix_micros(max({k.version})) AS newest_us, count(*) AS n "
+                          f"FROM {t} GROUP BY {keys} HAVING count(*) > 1")
+        for cond in superseded_filters(k, rows):
+            sql = f"DELETE FROM {t} WHERE {cond}"
+            retry_on_conflict(lambda: self.spark.sql(sql), f"compact {k.table}")
+        if rows:
+            self._forget(kind)
+        return sum(int(r["n"]) - 1 for r in rows)
 
     def _merge(self, kind, rows):
         """Upsert by key (one MERGE per flush)."""

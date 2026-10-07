@@ -31,7 +31,7 @@ destroy:
 # Kestra, Spark Operator, Glue, S3, Iceberg on the emulated EKS cluster --
 # no platform/tenant layers. Tear down with `make destroy` as usual.
 .PHONY: gl-spike gl-cluster gl-spark-operator gl-image gl-smoke gl-up gl-generate \
-        gl-health gl-bench gl-compact gl-report gl-demo gl-test-tables gl-metrics gl-symptoms gl-scorecard gl-scan gl-plan gl-step gl-sql gl-clean gl-status gl-group gl-groups-parallel gl-coverage
+        gl-health gl-bench gl-compact gl-report gl-demo gl-test-tables gl-metrics gl-symptoms gl-scorecard gl-scan gl-plan gl-step gl-sql gl-clean gl-status gl-group gl-groups-parallel gl-coverage gl-ops-check gl-ops-maintain gl-ops-upkeep-log
 
 gl-spike:
 	bash flavors/glue-lite/spike/run-glue-spike.sh
@@ -159,6 +159,19 @@ gl-group:
 
 gl-groups-parallel:
 	bash flavors/glue-lite/scripts/run-groups-parallel.sh group_a group_b
+
+# Housekeeping under parallel runs (ops_maintenance.py):
+#   make gl-ops-check                  compaction during concurrent appends, upkeep actions (scratch namespace)
+#   make gl-ops-maintain [DRY=1]       upkeep of the glue.ops tables now (takes the housekeeping claim)
+#   make gl-ops-upkeep-log             latest upkeep rows
+gl-ops-check:
+	JOB_TIMEOUT_MIN=20 bash flavors/glue-lite/scripts/run-job.sh py check_ops_upkeep.py
+
+gl-ops-maintain:
+	JOB_TIMEOUT_MIN=30 bash flavors/glue-lite/scripts/run-job.sh py ops_maintenance.py $(if $(filter 1,$(DRY)),--dry-run)
+
+gl-ops-upkeep-log:
+	bash flavors/glue-lite/scripts/run-job.sh py run_sql.py -e "SELECT run_id, regexp_replace(table_name, 'glue.ops.', '') AS t, data_files, excess_files, manifests, snapshots, expirable_snapshots, actions, result, seconds FROM glue.ops.ops_maintenance ORDER BY checked_at DESC, table_name LIMIT $(or $(N),40)"
 
 gl-coverage:
 	bash flavors/glue-lite/scripts/run-job.sh py run_sql.py -e "SELECT j.group_name, j.shard, j.status, j.tables_matched, j.tables_done, j.tables_skipped, j.housekeeping, j.started_at, j.ended_at FROM glue.ops.run_journal j ORDER BY j.started_at DESC LIMIT 6; WITH last AS (SELECT run_id FROM glue.ops.run_journal WHERE status = 'ok' ORDER BY started_at DESC LIMIT $(or $(RUNS),2)) SELECT c.table_name, count(DISTINCT c.run_id) AS runs, concat_ws(',', collect_set(c.group_name)) AS groups, concat_ws(',', collect_set(c.status)) AS statuses FROM glue.ops.coverage c JOIN last l ON c.run_id = l.run_id GROUP BY c.table_name ORDER BY runs DESC, c.table_name"

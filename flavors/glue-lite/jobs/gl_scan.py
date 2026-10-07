@@ -9,8 +9,8 @@ Usage (via scripts/run-job.sh py gl_scan.py ...):
 
 With --group the tables come from the profile's group selector (and shard);
 the run claims (group, shard) first and exits quietly if another run holds it,
-claims each table before measuring it, does the store's retention pass only
-when it holds the housekeeping claim, and writes a run journal row
+claims each table before measuring it, does the store's retention pass and
+the ops-table upkeep (ops_maintenance.py) only when it holds the housekeeping claim, and writes a run journal row
 (glue.ops.run_journal) and one coverage row per table (glue.ops.coverage).
 
 --trace prints every step for the named tables (lines start with "TRACE <table> |");
@@ -28,6 +28,7 @@ from pyspark.sql import SparkSession
 import coordinator as coordination
 import gl_common as gl
 import gltrace
+import ops_maintenance
 import probes
 import profiles
 from detect_symptoms import run_detect
@@ -95,6 +96,8 @@ def main():
     run_detect(spark, scan_id, config)
     if not a.no_scorecard:
         run_scorecard(spark, scan_id, config, gl.load_config(a.expectations), partial=bool(tables))
+    if not tables:                     # a single full run does the housekeeping itself
+        ops_maintenance.maintain(spark, config, scan_id)
     spark.stop()
 
 
@@ -121,9 +124,10 @@ def run_group(a):
         matched = sum(len(v) for v in by_ns.values())
         print(f"=== Group {a.group} shard {shard_s} ({profile['target']}): {matched} tables, run {run_id} ===",
               flush=True)
-        hk = coord.claim_housekeeping(float(gcfg.get("housekeeping_every_hours", 6)))
+        hk = coord.claim_housekeeping(float(gcfg.get("housekeeping_every_hours", 6)),
+                                      ttl_s=int(float(gcfg.get("housekeeping_claim_minutes", 60)) * 60))
         housekeeping = hk
-        print(f"  housekeeping (retention pass) in this run: {hk}", flush=True)
+        print(f"  housekeeping (retention pass, ops-table upkeep) in this run: {hk}", flush=True)
         done = skipped = failed = 0
         scan_ids = []
         for ns, tables in sorted(by_ns.items()):
@@ -134,7 +138,9 @@ def run_group(a):
             run_detect(spark, scan_id, config)
             if not a.no_scorecard:
                 run_scorecard(spark, scan_id, config, gl.load_config(a.expectations), partial=True)
-            if housekeeping:
+            if housekeeping:                        # still holding the claim: upkeep of the ops tables
+                ttl = int(float(gcfg.get("housekeeping_claim_minutes", 60)) * 60)
+                ops_maintenance.maintain(spark, config, run_id, renew=lambda: coord.renew_housekeeping(ttl))
                 coord.housekeeping_done()
             housekeeping = False                    # once per run, with the first namespace
             for r in spark.sql(f"SELECT status, count(*) AS n FROM {gl.OPS_NAMESPACE}.coverage "
