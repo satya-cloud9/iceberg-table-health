@@ -33,6 +33,11 @@ destroy:
 .PHONY: gl-spike gl-cluster gl-spark-operator gl-image gl-smoke gl-up gl-generate \
         gl-health gl-bench gl-compact gl-report gl-demo gl-test-tables gl-metrics gl-symptoms gl-scorecard gl-scan gl-plan gl-step gl-sql gl-clean gl-status gl-group gl-groups-parallel gl-coverage gl-ops-check gl-ops-maintain gl-ops-upkeep-log gl-deferred-check gl-freed-files gl-pg-up gl-pg-migrate gl-pg-sql gl-pg-status
 
+# Effective state / logs backends: STATE_BACKEND / LOGS_BACKEND, else the config
+# (read by the gl-freed-files, gl-coverage and gl-ops-upkeep-log queries).
+GL_STATE := $(or $(STATE_BACKEND),$(shell jq -r '.state.backend // "iceberg"' flavors/glue-lite/jobs/config/health.json 2>/dev/null))
+GL_LOGS := $(or $(LOGS_BACKEND),$(shell jq -r '.logs.backend // "iceberg"' flavors/glue-lite/jobs/config/health.json 2>/dev/null))
+
 gl-spike:
 	bash flavors/glue-lite/spike/run-glue-spike.sh
 
@@ -47,7 +52,7 @@ gl-image:
 gl-smoke:
 	bash flavors/glue-lite/scripts/run-job.sh sql smoke
 
-gl-up: gl-cluster gl-spark-operator gl-image gl-smoke
+gl-up: gl-cluster gl-spark-operator gl-pg-up gl-image gl-smoke
 
 # GL1: build glue.demo.events with healthy and fragmented day partitions.
 # Override sizes, e.g.  make gl-generate GEN_ARGS="--commits 60 --files-per-commit 20"
@@ -171,7 +176,11 @@ gl-ops-maintain:
 	JOB_TIMEOUT_MIN=30 bash flavors/glue-lite/scripts/run-job.sh py ops_maintenance.py $(if $(filter 1,$(DRY)),--dry-run)
 
 gl-ops-upkeep-log:
+ifeq ($(GL_LOGS),postgres)
+	Q="SELECT run_id, regexp_replace(table_name, 'glue.ops.', '') AS t, data_files, excess_files, manifests, snapshots, expirable_snapshots, actions, result, seconds FROM advisor.ops_maintenance ORDER BY checked_at DESC, table_name LIMIT $(or $(N),40)" bash flavors/glue-lite/scripts/pg-sql.sh
+else
 	bash flavors/glue-lite/scripts/run-job.sh py run_sql.py -e "SELECT run_id, regexp_replace(table_name, 'glue.ops.', '') AS t, data_files, excess_files, manifests, snapshots, expirable_snapshots, actions, result, seconds FROM glue.ops.ops_maintenance ORDER BY checked_at DESC, table_name LIMIT $(or $(N),40)"
+endif
 
 # Deferred deletion of files a snapshot expiry frees (freed_files.py):
 #   make gl-deferred-check             expiry that keeps files, then deletion after the grace (scratch namespace)
@@ -180,14 +189,24 @@ gl-deferred-check:
 	JOB_TIMEOUT_MIN=20 bash flavors/glue-lite/scripts/run-job.sh py check_deferred_delete.py
 
 gl-freed-files:
+ifeq ($(GL_STATE),postgres)
+	Q="SELECT item->>'table_name' AS table_name, count(*) AS files, sum(CASE WHEN (item->>'due_ms')::bigint <= extract(epoch FROM now()) * 1000 THEN 1 ELSE 0 END) AS due, to_timestamp(min((item->>'due_ms')::bigint) / 1000.0) AS first_due, to_timestamp(max((item->>'due_ms')::bigint) / 1000.0) AS last_due FROM advisor.freed_files GROUP BY 1 ORDER BY files DESC" bash flavors/glue-lite/scripts/pg-sql.sh
+else
 	bash flavors/glue-lite/scripts/run-job.sh py run_sql.py -e "SELECT table_name, count(*) AS files, sum(CASE WHEN due_ms <= unix_millis(current_timestamp()) THEN 1 ELSE 0 END) AS due, timestamp_millis(min(due_ms)) AS first_due, timestamp_millis(max(due_ms)) AS last_due FROM glue.ops.freed_files GROUP BY table_name ORDER BY files DESC"
+endif
 
 gl-coverage:
+ifeq ($(GL_LOGS),postgres)
+	Q="SELECT j.group_name, j.shard, j.status, j.tables_matched, j.tables_done, j.tables_skipped, j.housekeeping, j.started_at, j.ended_at FROM advisor.run_journal j ORDER BY j.started_at DESC LIMIT 6" bash flavors/glue-lite/scripts/pg-sql.sh
+	Q="WITH last AS (SELECT run_id FROM advisor.run_journal WHERE status = 'ok' ORDER BY started_at DESC LIMIT $(or $(RUNS),2)) SELECT c.table_name, count(DISTINCT c.run_id) AS runs, string_agg(DISTINCT c.group_name, ',') AS groups, string_agg(DISTINCT c.status, ',') AS statuses FROM advisor.coverage c JOIN last l ON c.run_id = l.run_id GROUP BY c.table_name ORDER BY runs DESC, c.table_name" bash flavors/glue-lite/scripts/pg-sql.sh
+else
 	bash flavors/glue-lite/scripts/run-job.sh py run_sql.py -e "SELECT j.group_name, j.shard, j.status, j.tables_matched, j.tables_done, j.tables_skipped, j.housekeeping, j.started_at, j.ended_at FROM glue.ops.run_journal j ORDER BY j.started_at DESC LIMIT 6; WITH last AS (SELECT run_id FROM glue.ops.run_journal WHERE status = 'ok' ORDER BY started_at DESC LIMIT $(or $(RUNS),2)) SELECT c.table_name, count(DISTINCT c.run_id) AS runs, concat_ws(',', collect_set(c.group_name)) AS groups, concat_ws(',', collect_set(c.status)) AS statuses FROM glue.ops.coverage c JOIN last l ON c.run_id = l.run_id GROUP BY c.table_name ORDER BY runs DESC, c.table_name"
+endif
 
-# Postgres for state and logs (pg_store.py; the Iceberg backends stay the default):
-#   make gl-pg-up                      Postgres pod in advisor-db + the advisor-pg Secret (safe to re-run)
-#   make gl-scan STATE_BACKEND=postgres LOGS_BACKEND=postgres   one run on Postgres (any gl-* job takes these)
+# Postgres for state and logs (pg_store.py; the default in jobs/config/health.json,
+# the Iceberg backends are kept). Keep one backend per environment and switch by copying.
+#   make gl-pg-up                      Postgres pod in advisor-db + the advisor-pg Secret (safe to re-run; part of gl-up)
+#   make gl-scan STATE_BACKEND=iceberg LOGS_BACKEND=iceberg   one run on the Iceberg ops tables (any gl-* job takes these)
 #   make gl-pg-migrate [LOGS=1] [REPLACE=1]   copy state (and logs) from the Iceberg ops tables, once
 #   make gl-pg-sql Q="SELECT ..."      psql in the pod; tables in schema advisor (logs typed, state as jsonb items)
 #   make gl-pg-status                  row counts per table

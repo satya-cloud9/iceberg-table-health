@@ -4,8 +4,8 @@
 # advisor-db and spark-jobs, applies k8s/postgres.yaml and waits until the pod
 # is ready. Safe to re-run: the data volume and the password stay.
 #
-# Jobs use it when a backend is postgres: config state.backend / logs.backend,
-# or for one run: make gl-scan STATE_BACKEND=postgres LOGS_BACKEND=postgres
+# Jobs use it by default (config state.backend / logs.backend = postgres); for one
+# run on the Iceberg ops tables: make gl-scan STATE_BACKEND=iceberg LOGS_BACKEND=iceberg
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
 
@@ -33,6 +33,6 @@ kubectl apply -f "$GL_ROOT/k8s/postgres.yaml"
 kubectl -n advisor-db rollout status deployment/advisor-pg --timeout=5m
 kubectl -n advisor-db exec deploy/advisor-pg -- psql -U advisor -d advisor -tAc "SELECT 'ready: ' || version()"
 echo ""
-echo "Use it for one run:   make gl-scan STATE_BACKEND=postgres LOGS_BACKEND=postgres"
-echo "or for every run:     state.backend / logs.backend = postgres in jobs/config/health.json (then make gl-image)"
+echo "Jobs use it by default (state.backend / logs.backend = postgres in jobs/config/health.json)."
+echo "Copy earlier state from the Iceberg ops tables once: make gl-pg-migrate [LOGS=1] [REPLACE=1]"
 echo "Query it:             make gl-pg-sql Q=\"SELECT scan_id, count(*) FROM advisor.table_metrics GROUP BY 1\""

@@ -60,7 +60,12 @@ export EXECUTOR_INSTANCES="${EXECUTOR_INSTANCES:-1}"
 export JOB_TTL_SECONDS="${JOB_TTL_SECONDS:-86400}"   # finished jobs are cleaned up after a day
 
 # Backends for this run (STATE_BACKEND / LOGS_BACKEND = iceberg | postgres; unset:
-# the config decides) and the Postgres password when make gl-pg-up has run.
+# jobs/config/health.json decides, postgres by default) and the Postgres password
+# when make gl-pg-up has run.
+CFG_STATE="$(jq -r '.state.backend // "iceberg"' "$GL_ROOT/jobs/config/health.json")"
+CFG_LOGS="$(jq -r '.logs.backend // "iceberg"' "$GL_ROOT/jobs/config/health.json")"
+EFF_STATE="${STATE_BACKEND:-$CFG_STATE}"
+EFF_LOGS="${LOGS_BACKEND:-$CFG_LOGS}"
 for b in "${STATE_BACKEND:-}" "${LOGS_BACKEND:-}"; do
   case "$b" in ""|iceberg|postgres) ;; *)
     echo "Unknown backend '$b': STATE_BACKEND / LOGS_BACKEND take iceberg or postgres." >&2; exit 1 ;;
@@ -75,9 +80,14 @@ if [ -n "${LOGS_BACKEND:-}" ]; then
 fi
 if kubectl -n spark-jobs get secret advisor-pg >/dev/null 2>&1; then
   PG_CONF+="    spark.kubernetes.driver.secretKeyRef.GL_PG_PASSWORD: advisor-pg:password"$'\n'
-elif [[ "${STATE_BACKEND:-} ${LOGS_BACKEND:-}" == *postgres* ]]; then
-  echo "A backend is postgres but there is no advisor-pg Secret: run make gl-pg-up first." >&2
+elif [[ "$EFF_STATE $EFF_LOGS" == *postgres* ]]; then
+  echo "State/logs backend is postgres (state=$EFF_STATE, logs=$EFF_LOGS) but there is no advisor-pg Secret:" >&2
+  echo "run make gl-pg-up first (or STATE_BACKEND=iceberg LOGS_BACKEND=iceberg for a run on the Iceberg ops tables)." >&2
   exit 1
+fi
+if [ "$EFF_STATE" != "$CFG_STATE" ] || [ "$EFF_LOGS" != "$CFG_LOGS" ]; then
+  echo "NOTE: this run uses state=$EFF_STATE logs=$EFF_LOGS, not the configured state=$CFG_STATE logs=$CFG_LOGS." >&2
+  echo "      The two stores do not share history (freed files, ledger, actions); see README Step 3c." >&2
 fi
 export PG_CONF="${PG_CONF%$'\n'}"
 

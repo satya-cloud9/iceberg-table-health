@@ -1,7 +1,8 @@
 """Postgres backends for the state store and the log sink (design: "Backends").
 
 Chosen with state.backend / logs.backend = "postgres" (or GL_STATE_BACKEND /
-GL_LOGS_BACKEND); the Iceberg backends stay the default. Only the Spark driver
+GL_LOGS_BACKEND); config/health.json sets postgres, the Iceberg backends stay
+available. Only the Spark driver
 talks to Postgres; executors never do.
 
 Two ways to reach the database, same SQL:

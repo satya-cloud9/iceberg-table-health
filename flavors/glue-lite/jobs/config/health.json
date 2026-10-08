@@ -138,12 +138,12 @@
     "log_keep_days": 90
   },
   "state": {
-    "_comment": "Where the advisor keeps what the next run needs: iceberg (tables in glue.ops, the default) or postgres (the postgres block). GL_STATE_BACKEND overrides it for one run (make ... STATE_BACKEND=postgres). Claims stay in DynamoDB either way.",
-    "backend": "iceberg"
+    "_comment": "Where the advisor keeps what the next run needs: postgres (the postgres block, the default) or iceberg (tables in glue.ops). Keep one backend per environment: each store only knows the runs made against it (freed files waiting for deletion, ledger watermarks, action history), so switch only by copying (make gl-pg-migrate). GL_STATE_BACKEND overrides it for one run (make ... STATE_BACKEND=iceberg). Claims stay in DynamoDB either way.",
+    "backend": "postgres"
   },
   "logs": {
-    "_comment": "Where the advisor's history goes (table_metrics, symptoms, actions, ...): iceberg (glue.ops, the default) or postgres. GL_LOGS_BACKEND overrides it for one run.",
-    "backend": "iceberg"
+    "_comment": "Where the advisor's history goes (table_metrics, symptoms, actions, ...): postgres (the default) or iceberg (glue.ops). GL_LOGS_BACKEND overrides it for one run.",
+    "backend": "postgres"
   },
   "postgres": {
     "_comment": "Used when a backend is postgres. mode driver: pg8000 over TCP (homelab pod from make gl-pg-up, or Aurora from EKS); the password comes from the env var named in password_env (the advisor-pg Secret on the homelab). mode data_api: the RDS Data API (Aurora Serverless v2 from Glue; set resource_arn and secret_arn). GL_PG_HOST / GL_PG_PORT / GL_PG_DATABASE / GL_PG_USER / GL_PG_SCHEMA / GL_PG_MODE / GL_PG_RESOURCE_ARN / GL_PG_SECRET_ARN override these.",

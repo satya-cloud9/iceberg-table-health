@@ -4,7 +4,7 @@ State is what the next run needs to continue correctly; a log only loses
 history if it's lost (design doc, "State and log stores"). Callers talk to
 these two interfaces and never write SQL against the ops tables for state, so
 the backend can change without touching them: Iceberg tables (IcebergStateStore,
-IcebergLogSink, the default) or Postgres (pg_store.py), chosen by state.backend /
+IcebergLogSink) or Postgres (pg_store.py, the configured default), chosen by state.backend /
 logs.backend through make_state_store / make_log_sink. Claims are in DynamoDB.
 
   StateStore
@@ -140,7 +140,7 @@ def backend_of(config, what):
 
 
 def make_log_sink(spark, config=None, ops=None):
-    """The configured log sink (logs.backend: iceberg, the default, or postgres)."""
+    """The configured log sink (logs.backend: postgres in config/health.json, or iceberg; iceberg when unset)."""
     import gl_common as gl
     if backend_of(config, "logs") == "postgres":
         import pg_store
@@ -149,7 +149,7 @@ def make_log_sink(spark, config=None, ops=None):
 
 
 def make_state_store(spark, config=None, ops=None):
-    """The configured state store (state.backend: iceberg, the default, or postgres)."""
+    """The configured state store (state.backend: postgres in config/health.json, or iceberg; iceberg when unset)."""
     import gl_common as gl
     if backend_of(config, "state") == "postgres":
         import pg_store

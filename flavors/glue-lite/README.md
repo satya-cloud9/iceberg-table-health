@@ -1634,7 +1634,7 @@ before state.
 ## Step 3c — Postgres backends for state and logs
 
 `state.backend` and `logs.backend` choose where state and logs go:
-`iceberg` (the default; tables in `glue.ops`) or `postgres` (`pg_store.py`).
+`postgres` (`pg_store.py`; the default since step 3d) or `iceberg` (tables in `glue.ops`).
 Claims stay in DynamoDB. Only the Spark driver talks to Postgres.
 
 | | Homelab | AWS from EKS | AWS from Glue |
@@ -1677,8 +1677,38 @@ It prints rows read from Iceberg and stored in Postgres per kind and ends with
 
 On Postgres, housekeeping deletes log rows older than
 `ops_maintenance.log_keep_days` (90) from every log kind except the run journal;
-state retention is the same as on Iceberg. `gl-ops-upkeep-log`, `gl-freed-files` and `gl-coverage` read the
-Iceberg tables; on Postgres use `gl-pg-sql` instead.
+state retention is the same as on Iceberg. `gl-ops-upkeep-log`, `gl-freed-files` and `gl-coverage` read
+whichever backend is in use.
+
+## Step 3d — Postgres by default, one backend per environment
+
+`state.backend` and `logs.backend` are `postgres` in `jobs/config/health.json`.
+The Iceberg backends stay and are chosen per run with
+`STATE_BACKEND=iceberg LOGS_BACKEND=iceberg`, or for good in the config.
+
+Each store only knows the runs made against it, so switching back and forth
+splits the advisor's memory (the tables themselves stay correct: every scan
+re-reads their metadata):
+
+| Kept in the store | After a switch to the other store |
+|---|---|
+| freed files waiting for their grace | not deleted there, and orphan removal is no longer held for them |
+| ledger watermark (last snapshot, sequence number) | catches up; commits expired meanwhile show as HISTORY_LOST |
+| action history | cool-downs and verification missing; rollback statements in the other store |
+| learned windows, partition facts | judged on less history |
+
+Keep one backend per environment and switch only by copying
+(`make gl-pg-migrate`, Iceberg to Postgres). A run whose backends differ from
+the config prints a NOTE; with Postgres configured and no `advisor-pg` Secret,
+`run-job.sh` stops and points to `make gl-pg-up`, which `make gl-up` now runs.
+
+```bash
+make gl-image                     # the image carries the config
+make gl-scan                      # Postgres, no flags needed
+make gl-freed-files               # reads advisor.freed_files
+make gl-coverage                  # reads advisor.run_journal / advisor.coverage
+```
+
 
 ## GL2.7a — Writer findings: SNAPSHOT_RATE and HISTORY_LOST (shadow)
 
