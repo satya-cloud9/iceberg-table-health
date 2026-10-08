@@ -59,7 +59,7 @@ SNAPSHOT_LOG_DDL = """
 LEDGER_STATE_DDL = """
     table_uuid STRING, table_name STRING, updated_at TIMESTAMP, last_ts_ms BIGINT,
     last_snapshot_id BIGINT, last_writer_ts_ms BIGINT, current_snapshot_id BIGINT,
-    event STRING, scan_id STRING, last_checked_ms BIGINT"""
+    event STRING, scan_id STRING, last_checked_ms BIGINT, last_seq BIGINT, history_gaps_json STRING"""
 
 GAP_HIST_DDL = """
     table_uuid STRING, day DATE, bucket_max_min DOUBLE, gaps BIGINT, scan_id STRING"""
@@ -133,6 +133,57 @@ def ancestors(snaps_by_id, start_id):
         out.append(sid)
         sid = snaps_by_id[sid]["parent_id"]
     return out, sid      # sid = first parent not in metadata (None = reached the root)
+
+
+HISTORY_KEEP_DAYS = 30
+
+
+def history_update(state, rows, event, now_ms, window_days=7):
+    """Commits expired before the ledger saw them (event ledger-gap), kept in
+    ledger_state for HISTORY_KEEP_DAYS so the finding outlasts the scan that
+    noticed it. Lost commits are counted from sequence numbers when both ends
+    have one (format v2+; None otherwise).
+    -> (gaps list for ledger_state, last_seq, tm fields)."""
+    state = state or {}
+    try:
+        gaps = json.loads(state.get("history_gaps_json") or "[]")
+    except ValueError:
+        gaps = []
+    prev_seq = state.get("last_seq")
+    if "ledger-gap" in (event or "") and rows:
+        first = rows[0].get("seq")
+        lost = (int(first) - int(prev_seq) - 1) if first and prev_seq and int(first) > int(prev_seq) else None
+        gaps.append({"ms": int(now_ms), "lost": lost, "after_ms": state.get("last_ts_ms"),
+                     "first_seen_ms": rows[0]["ts_ms"]})
+    gaps = [g for g in gaps if g["ms"] >= now_ms - HISTORY_KEEP_DAYS * 86400000]
+    seqs = [r.get("seq") for r in rows if r.get("seq")]
+    last_seq = max(seqs) if seqs else prev_seq
+    recent = [g for g in gaps if g["ms"] >= now_ms - float(window_days) * 86400000]
+    known = [g["lost"] for g in recent if g.get("lost") is not None]
+    fields = {"history_gaps_window": len(recent),
+              "history_lost_commits": sum(known) if known else None,
+              "last_history_gap_ms": max((g["ms"] for g in recent), default=None),
+              "history_unseen_minutes": (max(((g["first_seen_ms"] - g["after_ms"]) / 60000.0 for g in recent
+                                              if g.get("after_ms")), default=None))}
+    return gaps, last_seq, fields
+
+
+def writer_stats(commit_rows, now_ms, window_h=24):
+    """Writer commits in the last window_h hours as the ledger saw them (commits
+    expired since still count): count, median gap, average files and bytes per
+    commit. -> tm fields."""
+    since = now_ms - window_h * 3600000
+    w = sorted((r for r in commit_rows if r.get("is_writer") and r.get("ts_ms") is not None and r["ts_ms"] >= since),
+               key=lambda r: r["ts_ms"])
+    gaps = sorted((b["ts_ms"] - a["ts_ms"]) / 60000.0 for a, b in zip(w, w[1:]))
+    med = None
+    if gaps:
+        mid = len(gaps) // 2
+        med = gaps[mid] if len(gaps) % 2 else (gaps[mid - 1] + gaps[mid]) / 2
+    return {"writer_commits_24h_seen": len(w),
+            "writer_gap_median_min": None if med is None else round(med, 3),
+            "writer_bytes_per_commit_24h": _avg([r.get("added_files_size") for r in w], 0),
+            "writer_files_per_commit_24h": _avg([r.get("added_data_files") for r in w], 2)}
 
 
 def plan_ingest(snaps, state, current_id, in_ledger):
@@ -307,7 +358,8 @@ def read_snapshots(spark, table):
         summ = s.summary()
         row = {"snapshot_id": int(s.snapshotId()),
                "parent_id": None if s.parentId() is None else int(s.parentId()),
-               "ts_ms": int(s.timestampMillis()), "operation": str(s.operation())}
+               "ts_ms": int(s.timestampMillis()), "operation": str(s.operation()),
+               "seq": int(s.sequenceNumber())}            # 0 on format v1 tables
         for col, key in SUMMARY_KEYS.items():
             v = summ.get(key)
             row[col] = None if v is None else int(str(v))
@@ -551,6 +603,13 @@ class Ledger:
         last_checked = (state or {}).get("last_checked_ms")
         age_d = 1e9 if last_checked is None else (now_ms - int(last_checked)) / 86400000.0
         check = (self.mode == "shadow" or random.random() < self.spot_share or age_d >= self.reconcile_days)
+        window_d = float((cfg.get("thresholds") or {}).get("history_lost_window_days", 7))
+        gaps, last_seq, hist = history_update(state, rows, event, now_ms, window_d)
+        new_state = dict(new_state, last_seq=last_seq, history_gaps_json=json.dumps(gaps))
+        tm.update(hist)
+        if "ledger-gap" in event:
+            tr.log("family1.history", "commits expired before the ledger saw them",
+                   lost_commits=hist["history_lost_commits"], gaps_in_window=hist["history_gaps_window"])
         counts = {}
         for r in rows:
             if r["gap_min"] is not None:
@@ -564,10 +623,18 @@ class Ledger:
             for (d, b), n in counts.items():
                 self.store.increment("gap_hist", {"table_uuid": uuid, "day": d, "bucket_max_min": b,
                                                   "gaps": n, "scan_id": self.scan_id}, "gaps")
-            if rows or state is None or event != "unchanged" or check:
+            if rows or state is None or event != "unchanged" or check \
+                    or (state or {}).get("history_gaps_json", "[]") != new_state["history_gaps_json"]:
                 self.store.put("ledger_state", dict(new_state, table_uuid=uuid, table_name=table,
                                                     updated_at=now, event=event, scan_id=self.scan_id,
                                                     last_checked_ms=now_ms if check else last_checked))
+
+        # the writer's cadence over the last 24 h, from every commit the ledger saw
+        # (also those expired since): SNAPSHOT_RATE's input
+        tm.update(writer_stats(self.store.range("commit", (uuid,), start=now_ms - 86400000), now_ms))
+        tr.log("family1.writer", "writer commits in the last 24 h",
+               **{k: tm.get(k) for k in ("writer_commits_24h_seen", "writer_gap_median_min",
+                                         "writer_bytes_per_commit_24h", "writer_files_per_commit_24h")})
 
         # ledger rows needed for the metrics: the newest `recent` retained snapshots
         # plus every retained snapshot of the last 24 h (bounded by recent activity)

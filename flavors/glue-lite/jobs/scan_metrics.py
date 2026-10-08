@@ -78,7 +78,10 @@ TABLE_METRICS_DDL = """
     write_category STRING, writer_commits_24h BIGINT, expirable_snapshots BIGINT,
     oldest_expirable_age_h DOUBLE, refs_json STRING, stale_refs_json STRING, stale_refs BIGINT,
     retained_bytes_ledger BIGINT, retained_ledger_note STRING, metadata_json_files BIGINT,
-    policy_file_grace_h DOUBLE, policy_grace_source STRING, freed_files_waiting BIGINT"""
+    policy_file_grace_h DOUBLE, policy_grace_source STRING, freed_files_waiting BIGINT,
+    writer_commits_24h_seen BIGINT, writer_gap_median_min DOUBLE, writer_bytes_per_commit_24h DOUBLE,
+    writer_files_per_commit_24h DOUBLE, history_gaps_window BIGINT, history_lost_commits BIGINT,
+    last_history_gap_ms BIGINT, history_unseen_minutes DOUBLE, minutes_since_previous_scan DOUBLE"""
 
 
 def coerce(value, data_type):
@@ -394,6 +397,8 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
             "avg_overwrite_rewrite_share", "table_turnover_24h", "minutes_since_writer_commit", "orphan_files",
             "ledger_event", "activity_event", "hot_window_min", "settle_window_h", "load_error")})
         tr.begin(None)
+        if p and p.get("elapsed_min") is not None:     # how often this table is scanned (HISTORY_LOST)
+            tm["minutes_since_previous_scan"] = round(float(p["elapsed_min"]), 2)
         log.append("table_metrics", [tm])
         uuid = info.get("uuid")
         if tm.get("scan_mode") != "failed":

@@ -1679,3 +1679,49 @@ On Postgres, housekeeping deletes log rows older than
 `ops_maintenance.log_keep_days` (90) from every log kind except the run journal;
 state retention is the same as on Iceberg. `gl-ops-upkeep-log`, `gl-freed-files` and `gl-coverage` read the
 Iceberg tables; on Postgres use `gl-pg-sql` instead.
+
+## GL2.7a — Writer findings: SNAPSHOT_RATE and HISTORY_LOST (shadow)
+
+Two findings about the writer and the expiry job rather than the files, both
+built from the snapshot ledger (no extra metadata reads). Family
+`writer_findings`, `incremental.writer_findings: shadow` (reported in the detect
+output under `=== Writer findings (shadow)`, not acted on).
+
+New facts in `ops.table_metrics` (and `ledger_state`):
+
+| fact | meaning |
+|---|---|
+| `writer_commits_24h_seen` | writer commits (not maintenance) the ledger saw in the last 24 h |
+| `writer_gap_median_min` | median minutes between those commits |
+| `writer_bytes_per_commit_24h`, `writer_files_per_commit_24h` | average added bytes / files per commit |
+| `history_gaps_window`, `history_lost_commits` | ledger gaps (the previously seen snapshot expired before this scan) within `history_lost_window_days`, and commits lost in them (from sequence numbers) |
+| `last_history_gap_ms`, `history_unseen_minutes` | when the last gap was seen and how long history went unobserved |
+| `minutes_since_previous_scan` | the scan interval behind the gap |
+
+Rules (thresholds in `config/health.json`, test scale):
+
+- **SNAPSHOT_RATE** (approval): more than `snapshot_rate_max_commits_24h` writer
+  commits a day (test 24, **production 288** = every 5 min) and each adds less
+  than `snapshot_rate_small_share` of a target file. Remedy: a trigger interval
+  so one commit fills `snapshot_rate_fill_share` of a target file,
+  clamped between `1440 / max_commits` and `snapshot_rate_max_interval_minutes`.
+- **HISTORY_LOST** (approval): at least `history_lost_min_gaps` ledger gaps in
+  the window — snapshots were expired faster than the advisor scans, so their
+  commits were never seen. Remedy: keep at least 2 × the scan interval
+  (`history.expire.max-snapshot-age-ms`), or scan more often. Gaps are kept 30
+  days in `ledger_state.history_gaps_json`, so the finding survives later clean
+  scans for the window.
+
+Expectations: s1 allows at most one SMALL_FILES after its fix (`max_count`).
+
+Verify:
+
+```bash
+make gl-image
+make gl-step STEP=rapid-commits          # live_rapid_commits: 1 file + 40 tiny appends; +SNAPSHOT_RATE under "Writer findings (shadow)"
+make gl-step STEP=expire-gap             # expires s17 past the ledger
+make gl-scan                             # +HISTORY_LOST on s17 with the lost commit count
+make gl-scan TRACE=s17_growing           # history_gaps_window / history_lost_commits in the trace
+```
+
+Switch on with `incremental.writer_findings: on` after a clean shadow run.

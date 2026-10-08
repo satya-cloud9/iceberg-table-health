@@ -25,6 +25,11 @@ Steps:
   expire-gap (GL2.5m) 10 commits into s17, then expire all but the current
             snapshot before any scan: the next scan must report a ledger gap.
 
+  rapid-commits (GL2.7a) rebuilds the scratch table live_rapid_commits with 40
+            tiny appends, then scans and detects it: the writer findings
+            (shadow) should show +SNAPSHOT_RATE with a suggested trigger.
+            expire-gap followed by make gl-scan shows +HISTORY_LOST on s17.
+
   append-live (GL2.6b) a writer still appending: rebuilds two scratch tables,
             glue.demo.live_append_unpart (unpartitioned) and live_append_days
             (by day), each 1 healthy file + 6 small appends into 2026-09-03 (a
@@ -186,7 +191,31 @@ def append_live(spark, args):
           "2026-09-03 HOT_PARTITION:defer -> SMALL_FILES:auto", flush=True)
 
 
-STEPS = {"append-live": append_live, "s12-mor": s12_mor, "grow": grow, "rollback": rollback, "expire-gap": expire_gap}
+def rapid_commits(spark, args):
+    """GL2.7a SNAPSHOT_RATE: a writer committing far too often. Rebuilds the scratch
+    table glue.demo.live_rapid_commits (not in expectations.json) with one healthy
+    file, then 40 tiny appends of one small file each, then scans and detects it in
+    this job. At test scale (snapshot_rate_max_commits_24h 24) the writer findings
+    (shadow) show +SNAPSHOT_RATE with a suggested trigger interval."""
+    from datetime import date
+    from detect_symptoms import run_detect
+    from scan_metrics import run_scan
+    b = Builder(spark)
+    b.next_id = 80_000_000 + int(time.time()) % 1_000_000 * 100
+    d = date(2026, 9, 3)
+    t = f"{NS}.live_rapid_commits"
+    b.create(t, "days(occurred_at)", {})
+    b.day(t, d, 100_000)
+    b.fragment(t, d, commits=40, files_per_commit=1, rows_per_commit=200)
+    print(f"  {t}: rebuilt; 1 healthy file + 40 tiny appends", flush=True)
+    config = gl.load_config(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "health.json"))
+    scan_id = run_scan(spark, NS, config, tables=["live_rapid_commits"], report=False)
+    run_detect(spark, scan_id, config, report=True)
+    print("  look for '=== Writer findings (shadow)' above: live_rapid_commits +SNAPSHOT_RATE", flush=True)
+
+
+STEPS = {"append-live": append_live, "s12-mor": s12_mor, "grow": grow, "rollback": rollback, "expire-gap": expire_gap,
+         "rapid-commits": rapid_commits}
 
 
 def main():

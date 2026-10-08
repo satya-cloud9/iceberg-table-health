@@ -80,6 +80,8 @@ def _check(exp, hits, newest):
             problems.append(f"{name} on partitions older than {exp['min_value']}: {low}")
     if "count" in exp and len(hits) != exp["count"]:
         problems.append(f"{name} x{len(hits)}, expected x{exp['count']}")
+    if "max_count" in exp and len(hits) > exp["max_count"]:
+        problems.append(f"{name} x{len(hits)}, expected at most {exp['max_count']}")
     if "min_count" in exp and len(hits) < exp["min_count"]:
         problems.append(f"{name} x{len(hits)}, expected at least {exp['min_count']}")
     return problems

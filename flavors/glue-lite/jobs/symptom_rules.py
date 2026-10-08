@@ -25,7 +25,7 @@ import re
 import gltrace as tr
 import holds as hl
 
-RULE_VERSION = "2.6f-1"
+RULE_VERSION = "2.7a-1"
 
 # symptom -> (category, level, action, remedy)
 CATALOG = {
@@ -68,6 +68,13 @@ CATALOG = {
                               "a tag or branch other than main points at an old snapshot and keeps its files "
                               "alive (expire_snapshots never removes what a ref points at): drop it, or give it "
                               "a retention (ALTER TABLE ... CREATE OR REPLACE TAG ... RETAIN n DAYS)"),
+    "SNAPSHOT_RATE":         ("write_pattern", "table", "approval",
+                              "the writer commits very often and each commit is small: every commit adds a "
+                              "snapshot, a manifest list and small files; commit less often upstream "
+                              "(streaming trigger, Flink checkpoint interval, batch schedule)"),
+    "HISTORY_LOST":          ("operations", "table", "approval",
+                              "commits were expired before the advisor saw them: keep the table's history "
+                              "longer than the time between scans, or scan more often"),
     "MANIFEST_BLOAT":        ("metadata", "table", "auto",
                               "rewrite_manifests; re-enable commit.manifest-merge.enabled"),
     "REWRITE_CHURN":         ("write_config", "table", "approval",
@@ -597,6 +604,80 @@ def expiry_findings(table, tm, th):
     return out
 
 
+def _mib(b):
+    return f"{b / 1048576:.1f} MiB" if b is not None else "?"
+
+
+def writer_findings(table, tm, th, target_bytes):
+    """GL2.7a, the writer's side (ledger facts, ledger.writer_stats / history_update).
+
+    SNAPSHOT_RATE: more writer commits in 24 h than snapshot_rate_max_commits_24h,
+    each writing less than snapshot_rate_small_share of a target file. The
+    suggested trigger lets one commit carry about snapshot_rate_fill_share of a
+    target file at the current data rate, at least long enough to get under the
+    limit and at most snapshot_rate_max_interval_minutes.
+
+    HISTORY_LOST: the ledger found commits that were expired before it saw them
+    (event ledger-gap) at least history_lost_min_gaps times within
+    history_lost_window_days. Facts built from history (commit rate, gaps,
+    lateness, this rule's writer cadence) miss those commits."""
+    out = []
+    n = tm.get("writer_commits_24h_seen")
+    if n is None:
+        n = tm.get("writer_commits_24h")
+    max_n = float(th.get("snapshot_rate_max_commits_24h", 288))
+    per = tm.get("writer_bytes_per_commit_24h")
+    small_share = float(th.get("snapshot_rate_small_share", 0.25))
+    small = per is None or per < target_bytes * small_share
+    tr.log("rule.SNAPSHOT_RATE", commits_24h=f"{n} vs {max_n:g}",
+           bytes_per_commit=f"{_mib(per)} vs {_mib(target_bytes * small_share)}",
+           gap_median_min=tm.get("writer_gap_median_min"))
+    if n is not None and n > max_n and small:
+        gap = tm.get("writer_gap_median_min") or 1440.0 / n
+        floor = 1440.0 / max_n                                    # gets the count under the limit
+        fill = float(th.get("snapshot_rate_fill_share", 0.5)) * target_bytes
+        want = gap * fill / per if per else floor
+        cap = float(th.get("snapshot_rate_max_interval_minutes", 60))
+        suggested = round(min(max(want, floor), cap), 1)
+        out.append(_finding(
+            table, "SNAPSHOT_RATE", n / max_n,
+            {"writer_commits_24h": n, "gap_median_min": gap, "bytes_per_commit": per,
+             "files_per_commit": tm.get("writer_files_per_commit_24h"), "target_file_bytes": target_bytes,
+             "suggested_interval_min": suggested, "commits_per_day_after": round(1440.0 / suggested),
+             "snapshots": tm.get("snapshots"), "metadata_json_bytes": tm.get("metadata_json_bytes")},
+            evidence_level="observed",
+            remedy=(f"the writer commits every {gap:.1f} min ({int(n)} commits in 24 h, {_mib(per)} each): every "
+                    f"commit adds a snapshot, a manifest list and small files. Commit about every {suggested:g} min "
+                    f"(~{round(1440.0 / suggested)} commits a day, ~{_mib(per * suggested / gap) if per else '?'} "
+                    f"each): streaming trigger(processingTime='{suggested:g} minutes'), Flink checkpoint interval, "
+                    f"or the batch schedule. Compaction and expiry only clean up after it.")))
+    g = tm.get("history_gaps_window")
+    need = int(th.get("history_lost_min_gaps", 1))
+    window = th.get("history_lost_window_days", 7)
+    interval = tm.get("minutes_since_previous_scan")
+    kept_h = tm.get("oldest_snapshot_age_h")
+    tr.log("rule.HISTORY_LOST", gaps=f"{g} vs {need} in {window} d", lost_commits=tm.get("history_lost_commits"),
+           scan_interval_min=interval, history_kept_h=kept_h)
+    if g is not None and g >= need:
+        lost = tm.get("history_lost_commits")
+        lost_txt = f"{lost} commits were" if lost else "commits were"
+        keep_h = round(2 * interval / 60.0, 1) if interval else None
+        advice = (f"the table keeps ~{kept_h:g} h of snapshots and scans run ~{interval / 60.0:.1f} h apart: "
+                  f"keep at least {keep_h:g} h (history.expire.max-snapshot-age-ms >= {int(keep_h * 3600000)}) "
+                  f"or scan more often" if interval and kept_h is not None else
+                  "keep the history longer than the time between scans, or scan more often")
+        out.append(_finding(
+            table, "HISTORY_LOST", 1 + g,
+            {"gaps_in_window": g, "window_days": window, "lost_commits": lost,
+             "last_gap_ms": tm.get("last_history_gap_ms"), "unseen_minutes": tm.get("history_unseen_minutes"),
+             "scan_interval_min": interval, "history_kept_h": kept_h, "snapshots": tm.get("snapshots")},
+            evidence_level="observed",
+            remedy=(f"{lost_txt} expired before the advisor saw them ({g} time(s) in {window} days), so history-based "
+                    f"facts (commit rate, gaps, lateness, writer cadence) miss them; {advice}. If another job "
+                    f"expires this table, align its retention.")))
+    return out
+
+
 def apply_acks(findings, tm):
     """Table property advisor.ack = SYMPTOM[,SYMPTOM...]: the owner knows and it's
     deliberate. Those findings stay recorded (action 'acknowledged') but drop
@@ -622,6 +703,8 @@ def evaluate(table, tm, rows, cfg, history=None, actions=None):
            + table_findings(table, tm, rows, th, cfg))
     if new:
         out += storage_findings(table, tm, th)
+    if cfg.get("writer_findings"):
+        out += writer_findings(table, tm, th, float(tm.get("target_file_bytes") or cfg.get("target_file_bytes", 536870912)))
     if cfg.get("expiry_policy") and tm.get("policy_age_h") is not None:
         # GL2.6e: the policy decides; the count/age SNAPSHOT_BUILDUP gives way
         out = [f for f in out if f["symptom"] != "SNAPSHOT_BUILDUP"] + expiry_findings(table, tm, th)

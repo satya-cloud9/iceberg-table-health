@@ -236,6 +236,8 @@ def run_detect(spark, scan_id, config, report=True):
     new_changes = []
     mode6 = mode_of(config, "expiry_policy")
     exp_changes = []
+    mode7 = mode_of(config, "writer_findings")
+    writer_changes = []
     for tm in sorted(tms, key=lambda t: t["table_name"]):
         table, uuid = tm["table_name"], tm.get("table_uuid")
         cfg = gl.table_config(config, table)
@@ -243,7 +245,7 @@ def run_detect(spark, scan_id, config, report=True):
         tr.log("detect", "inputs", partitions=len(parts.get(table, [])), history_scans=len(history.get(uuid, [])),
                actions=len(actions.get(uuid, [])), hot_partition_minutes=cfg.get("hot_partition_minutes"),
                families=f"learned_windows={mode3} partition_holds={mode4} new_findings={mode5} "
-                        f"expiry_policy={mode6}")
+                        f"expiry_policy={mode6} writer_findings={mode7}")
         tr.variant("today")
         current = symptom_rules.evaluate(table, tm, parts.get(table, []), cfg,
                                          history=history.get(uuid, []), actions=actions.get(uuid, []))
@@ -313,6 +315,24 @@ def run_detect(spark, scan_id, config, report=True):
             exp_changes.append((tm, d6, note))
             if mode6 == "on":
                 mine = pol
+        if mode7 != "off":
+            # GL2.7a: SNAPSHOT_RATE and HISTORY_LOST (the writer's side, from the ledger)
+            tr.variant("writer_findings")
+            wf = symptom_rules.evaluate(table, tm, rows_used, dict(cfg, writer_findings=True,
+                                                                    expiry_policy=mode6 == "on"),
+                                        history=history.get(uuid, []), actions=actions.get(uuid, []))
+            d7 = hl.diff_actions(mine, wf)
+            tr.log("detect.diff", "writer_findings: " + ("; ".join(d7) if d7 else "no change"))
+            gap = tm.get("writer_gap_median_min")
+            note = (f"{tm.get('writer_commits_24h_seen')} writer commits in 24 h"
+                    + (f", every {gap:.1f} min" if gap is not None else "")
+                    + f"; history gaps {tm.get('history_gaps_window') or 0}"
+                    + (f" ({tm.get('history_lost_commits')} commits lost)" if tm.get("history_lost_commits") else "")
+                    + (f"; scanned every {tm['minutes_since_previous_scan'] / 60:.1f} h"
+                       if tm.get("minutes_since_previous_scan") is not None else ""))
+            writer_changes.append((tm, d7, note))
+            if mode7 == "on":
+                mine = wf
         tr.variant("")
         tr.log("detect", f"recorded: {len(mine)} finding(s) from "
                + ("today's rules" if mine is current else "the families switched on"),
@@ -326,6 +346,9 @@ def run_detect(spark, scan_id, config, report=True):
     if mode5 != "off":
         record_holds_changes(log, scan_id, detected_at, mode5, new_changes, report,
                              family="new_findings", title="New findings", baseline="today's findings")
+    if mode7 != "off":
+        record_holds_changes(log, scan_id, detected_at, mode7, writer_changes, report,
+                             family="writer_findings", title="Writer findings", baseline="today's findings")
     if mode6 != "off":
         record_holds_changes(log, scan_id, detected_at, mode6, exp_changes, report,
                              family="expiry_policy", title="Expiry by policy", baseline="count/age rule")

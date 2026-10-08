@@ -33,11 +33,12 @@
         }
       ],
       "after": {
-        "_comment": "one plan run compacts the top 10 of 11 flagged days; the 11th waits for the next run, and with 1 partition left SCATTERED clears",
+        "_comment": "one plan run compacts the top 10 of 11 flagged days; the 11th waits for the next run (at most one day left), and with 1 partition left SCATTERED clears; a second run leaves none",
         "expect": [
           {
             "symptom": "SMALL_FILES",
-            "count": 1
+            "optional": true,
+            "max_count": 1
           }
         ]
       }
