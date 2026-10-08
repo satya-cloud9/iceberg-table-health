@@ -205,14 +205,9 @@ def expire_postgres_logs(spark, config, keep_days):
     import state_store as ss
     if ss.backend_of(config, "logs") != "postgres":
         return {}
-    import importlib
-    for m in ("scan_metrics", "detect_symptoms", "ledger", "plan", "scorecard", "gl_scan"):
-        try:
-            importlib.import_module(m)          # their declare_log calls
-        except Exception:
-            pass
     out = {}
     try:
+        ss.declare_all()                        # every kind, wherever it is declared
         log = ss.make_log_sink(spark, config)
         for kind in sorted(ss.LOG_KINDS):
             if kind == "run_journal":

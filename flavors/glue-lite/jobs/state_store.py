@@ -99,6 +99,29 @@ LOG_TABLE_PROPERTIES = {"write.metadata.delete-after-commit.enabled": "true",
                         "write.metadata.previous-versions-max": "20"}
 
 
+# where each log kind is declared: a process that reads or expires a kind it did
+# not write itself (plan reads symptoms, upkeep expires every kind) loads it from here
+LOG_HOMES = {"table_metrics": "scan_metrics", "partition_metrics": "scan_metrics", "coverage": "scan_metrics",
+             "symptoms": "detect_symptoms", "incremental_check": "ledger", "actions": "plan",
+             "scorecard": "scorecard", "run_journal": "gl_scan", "ops_maintenance": "ops_maintenance"}
+
+
+def log_kind(kind):
+    """A log kind's declaration, importing the module that declares it if needed
+    (None for an unknown kind)."""
+    if kind not in LOG_KINDS and kind in LOG_HOMES:
+        import importlib
+        importlib.import_module(LOG_HOMES[kind])
+    return LOG_KINDS.get(kind)
+
+
+def declare_all():
+    """Every known log kind declared (for jobs that handle all of them)."""
+    for kind in LOG_HOMES:
+        log_kind(kind)
+    return sorted(LOG_KINDS)
+
+
 def declare_log(kind, ddl, ts, partition=""):
     """ddl: column list; ts: the record's time column; partition: Iceberg
     partition clause for the Iceberg sink ('' = unpartitioned)."""
@@ -646,7 +669,7 @@ class IcebergLogSink(LogSink):
 
     def _ensure(self, kind):
         """Create the kind's table (or add new columns) from its declaration, once per sink."""
-        if kind in self._ready or kind not in LOG_KINDS:
+        if kind in self._ready or log_kind(kind) is None:
             return
         import gl_common as gl
         d, t = LOG_KINDS[kind], f"{self.ops}.{kind}"

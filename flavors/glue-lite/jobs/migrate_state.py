@@ -25,8 +25,6 @@ import gl_common as gl
 import pg_store
 import state_store as ss
 
-# modules that declare the log kinds (state_store.declare_log at import)
-LOG_MODULES = ("scan_metrics", "detect_symptoms", "ledger", "plan", "scorecard", "gl_scan", "ops_maintenance")
 
 
 def _stored(conn, schema, table):
@@ -63,9 +61,7 @@ def copy_state(spark, config, replace=False, kinds=None):
 
 
 def copy_logs(spark, config, replace=False):
-    import importlib
-    for m in LOG_MODULES:
-        importlib.import_module(m)
+    ss.declare_all()
     sink = pg_store.PostgresLogSink(config)
     conn, schema = sink.conn, sink.schema
     out = []

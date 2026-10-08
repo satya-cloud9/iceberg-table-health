@@ -480,9 +480,10 @@ class PostgresLogSink(ss.LogSink):
         self._pending, self._ready = {}, set()
 
     def _cols(self, kind):
-        if kind not in ss.LOG_KINDS:
-            raise ValueError(f"log kind {kind!r} is not declared (state_store.declare_log)")
-        return columns(ss.LOG_KINDS[kind]["ddl"])
+        d = ss.log_kind(kind)
+        if d is None:
+            raise ValueError(f"log kind {kind!r} is not declared (state_store.declare_log / LOG_HOMES)")
+        return columns(d["ddl"])
 
     def _ensure(self, kind):
         if kind in self._ready:
@@ -548,7 +549,7 @@ class PostgresLogSink(ss.LogSink):
         self._pending = {}
 
     def expire(self, kind, older_than_days):
-        if kind not in ss.LOG_KINDS:
+        if ss.log_kind(kind) is None:
             return
         self._ensure(kind)
         ts = ss.LOG_KINDS[kind]["ts"]
