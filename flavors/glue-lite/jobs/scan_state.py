@@ -54,7 +54,8 @@ def to_ms(v):
     if isinstance(v, (int, float)):
         return int(v)
     if isinstance(v, str):
-        v = datetime.fromisoformat(v)
+        from state_store import parse_ts
+        v = parse_ts(v)
     if v.tzinfo is None:
         v = v.replace(tzinfo=timezone.utc)
     return int(v.timestamp() * 1000)

@@ -214,7 +214,7 @@ def to_ms(v):
         return int(v.timestamp() * 1000)
     if isinstance(v, date):
         return int(datetime(v.year, v.month, v.day, tzinfo=timezone.utc).timestamp() * 1000)
-    return to_ms(datetime.fromisoformat(str(v)))
+    return to_ms(ss.parse_ts(v))
 
 
 def _enc(v):
@@ -233,7 +233,7 @@ def dumps(item):
 
 def _dec(o):
     if "$iso" in o:
-        return datetime.fromisoformat(o["$iso"]).astimezone(timezone.utc).replace(tzinfo=None)
+        return ss.parse_ts(o["$iso"]).astimezone(timezone.utc).replace(tzinfo=None)
     if "$d" in o:
         return date.fromisoformat(o["$d"])
     return o
@@ -254,7 +254,7 @@ def _ts_text(v):
     if isinstance(v, (int, float)):
         v = datetime.fromtimestamp(v / 1000.0, timezone.utc)
     if isinstance(v, str):
-        v = datetime.fromisoformat(v)
+        v = ss.parse_ts(v)
     if isinstance(v, date) and not isinstance(v, datetime):
         v = datetime(v.year, v.month, v.day)
     if v.tzinfo is None:
@@ -598,7 +598,7 @@ class PostgresLogSink(ss.LogSink):
             v = d.get(c)
             if v is not None:
                 if typ == "TIMESTAMP":
-                    v = datetime.fromisoformat(v).astimezone(timezone.utc).replace(tzinfo=None)
+                    v = ss.parse_ts(v).astimezone(timezone.utc).replace(tzinfo=None)
                 elif typ == "DATE":
                     v = date.fromisoformat(v)
                 elif typ in ("DOUBLE", "FLOAT"):

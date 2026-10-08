@@ -160,6 +160,36 @@ def _newer_or_same(a, b):
     return a >= b
 
 
+_TS = re.compile(r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}(?::\d{2})?)(?:\.(\d+))?\s*(Z|[+-]\d{2}(?::?\d{2})?)?$")
+
+
+def iso_text(s):
+    """An ISO timestamp as the strict form every Python 3 fromisoformat accepts
+    (YYYY-MM-DDTHH:MM:SS.ffffff+HH:MM). Python 3.10 (the Spark image) rejects
+    fractions that are not 3 or 6 digits and a 'Z'; Postgres trims trailing zeros
+    (.91719) and may print +00."""
+    m = _TS.match(str(s).strip())
+    if not m:
+        raise ValueError(f"not an ISO timestamp: {s!r}")
+    day, hms, frac, tz = m.groups()
+    if len(hms) == 5:
+        hms += ":00"
+    frac = (frac or "0")[:6].ljust(6, "0")
+    if tz in (None, ""):
+        tz = ""
+    elif tz == "Z":
+        tz = "+00:00"
+    else:
+        tz = tz.replace(":", "")
+        tz = f"{tz[:3]}:{tz[3:5] or '00'}"
+    return f"{day}T{hms}.{frac}{tz}"
+
+
+def parse_ts(s):
+    """An ISO timestamp string -> datetime (aware when it carries an offset)."""
+    return datetime.fromisoformat(iso_text(s))
+
+
 def _utc_naive(v):
     """collect() returns timestamps as naive datetimes in the driver's local zone;
     the advisor's convention (and the Postgres sink's) is naive UTC."""

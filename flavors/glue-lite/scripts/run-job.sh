@@ -101,10 +101,14 @@ echo "State: ${STATE:-unknown}"
 echo ""
 echo "=== Driver log (job output) ==="
 # Drops Spark's INFO/WARN lines and the continuation lines of its multi-line
-# scan-pushdown messages (Pushing operators / Pushed Filters / Output: ...).
+# scan-pushdown messages (Pushing operators / Pushed Filters / Output: ...), the
+# blank lines those leave behind, and squeezes the job's own blank lines to one.
 kubectl -n spark-jobs logs "${JOB_NAME}-driver" 2>/dev/null \
-  | grep -v -E '^[0-9]{2}/[0-9]{2}/[0-9]{2} [0-9:]+ (INFO|WARN)|^(Pushing operators to |Pushed (Filters|Aggregate|Group by|Limit|Offset|Top N)|Post-Scan Filters:|Output: )' \
-  | awk 'NF { blank = 0; print; next } !blank++ { print "" }' || true   # at most one blank line in a row
+  | sed -E '/^[0-9]{2}\/[0-9]{2}\/[0-9]{2} [0-9:]+ (INFO|WARN)|^(Pushing operators to |Pushed (Filters|Aggregate|Group by|Limit|Offset|Top N)|Post-Scan Filters:|Output: )/c\
+@@gl-drop@@' \
+  | awk '$0 == "@@gl-drop@@" { skip = 1; next }
+         NF == 0 { if (skip || blank++) next; print; next }
+         { skip = 0; blank = 0; print }' || true   # at most one blank line in a row
 
 if [ "$STATE" != "COMPLETED" ]; then
   echo ""
