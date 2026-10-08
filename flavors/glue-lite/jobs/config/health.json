@@ -129,6 +129,26 @@
     "properties": {"write.metadata.delete-after-commit.enabled": "true", "write.metadata.previous-versions-max": "20"},
     "log_keep_days": 90
   },
+  "state": {
+    "_comment": "Where the advisor keeps what the next run needs: iceberg (tables in glue.ops, the default) or postgres (the postgres block). GL_STATE_BACKEND overrides it for one run (make ... STATE_BACKEND=postgres). Claims stay in DynamoDB either way.",
+    "backend": "iceberg"
+  },
+  "logs": {
+    "_comment": "Where the advisor's history goes (table_metrics, symptoms, actions, ...): iceberg (glue.ops, the default) or postgres. GL_LOGS_BACKEND overrides it for one run.",
+    "backend": "iceberg"
+  },
+  "postgres": {
+    "_comment": "Used when a backend is postgres. mode driver: pg8000 over TCP (homelab pod from make gl-pg-up, or Aurora from EKS); the password comes from the env var named in password_env (the advisor-pg Secret on the homelab). mode data_api: the RDS Data API (Aurora Serverless v2 from Glue; set resource_arn and secret_arn). GL_PG_HOST / GL_PG_PORT / GL_PG_DATABASE / GL_PG_USER / GL_PG_SCHEMA / GL_PG_MODE / GL_PG_RESOURCE_ARN / GL_PG_SECRET_ARN override these.",
+    "mode": "driver",
+    "host": "advisor-pg.advisor-db.svc.cluster.local",
+    "port": 5432,
+    "database": "advisor",
+    "user": "advisor",
+    "password_env": "GL_PG_PASSWORD",
+    "schema": "advisor",
+    "resource_arn": "",
+    "secret_arn": ""
+  },
   "tables": {
     "glue.demo.s0_small_appends":     { "filter_columns": ["customer_id"] },
     "glue.demo.s1_late_arrivals":     { "filter_columns": ["customer_id"] },

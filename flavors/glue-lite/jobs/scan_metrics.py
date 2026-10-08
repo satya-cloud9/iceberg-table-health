@@ -100,13 +100,14 @@ def coerce(value, data_type):
 _SCHEMAS = {}
 
 
-def normalize(spark, table, values):
-    """A record as it reads back from the log table: every column present, types
+def normalize(spark, kind, values):
+    """A record as it reads back from the log: every declared column present, types
     coerced, timestamps naive UTC (what Spark returns in a UTC session)."""
-    if table not in _SCHEMAS:
-        _SCHEMAS[table] = spark.table(table).schema
+    if kind not in _SCHEMAS:
+        from pyspark.sql.types import _parse_datatype_string
+        _SCHEMAS[kind] = _parse_datatype_string(ss.LOG_KINDS[kind]["ddl"])
     out = {}
-    for f, v in zip(_SCHEMAS[table], as_row(values, _SCHEMAS[table])):
+    for f, v in zip(_SCHEMAS[kind], as_row(values, _SCHEMAS[kind])):
         if hasattr(v, "tzinfo") and v.tzinfo is not None:
             v = scan_state.from_ms(scan_state.to_ms(v))
         out[f.name] = v
@@ -116,26 +117,24 @@ def normalize(spark, table, values):
     return out
 
 
-def scan_results(spark, scan_id, store=None):
+def scan_results(spark, scan_id, store=None, config=None, log=None):
     """(table rows, {table: partition rows}) of a scan: from this job's memory when
-    it ran here, else read back (the scan's logged rows; partition rows of reused
-    tables, which are not logged again, from partition_facts)."""
+    it ran here, else read back (the scan's logged rows through the log sink;
+    partition rows of reused tables, which are not logged again, from partition_facts)."""
     if scan_id in RESULTS:
         r = RESULTS[scan_id]
         return r["tms"], r["parts"]
-    ops = gl.OPS_NAMESPACE
-    tms = [r.asDict() for r in spark.sql(f"SELECT *, unix_millis(scanned_at) AS scanned_ms FROM {ops}.table_metrics "
-                                         f"WHERE scan_id = '{scan_id}'").collect()]
+    log = log or ss.make_log_sink(spark, config)
+    tms = [dict(r, scanned_ms=scan_state.to_ms(r["scanned_at"])) for r in log.rows("table_metrics", eq={"scan_id": scan_id})]
     parts = {}
-    for r in spark.sql(f"SELECT * FROM {ops}.partition_metrics WHERE scan_id = '{scan_id}'").collect():
-        parts.setdefault(r.table_name, []).append(r.asDict())
-    store = store or ss.IcebergStateStore(spark, ops)
+    for r in log.rows("partition_metrics", eq={"scan_id": scan_id}):
+        parts.setdefault(r["table_name"], []).append(r)
+    store = store or ss.make_state_store(spark, config)
     for tm in tms:
         if tm["table_name"] not in parts and str(tm.get("scan_mode") or "").startswith("reused") and tm.get("table_uuid"):
-            if spark.catalog.tableExists(f"{ops}.partition_facts"):
-                parts[tm["table_name"]] = [dict(r, scan_id=scan_id, table_name=tm["table_name"])
-                                           for r in scan_state.partition_rows(
-                                               store.range("partition_facts", (tm["table_uuid"],)), tm["scanned_ms"])]
+            parts[tm["table_name"]] = [dict(r, scan_id=scan_id, table_name=tm["table_name"])
+                                       for r in scan_state.partition_rows(
+                                           store.range("partition_facts", (tm["table_uuid"],)), tm["scanned_ms"])]
     return tms, parts
 
 
@@ -234,13 +233,7 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
     housekeeping: whether this run does the store's retention pass.
     """
     scan_id = scan_id or gl.new_run_id("scan")
-    spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {gl.OPS_NAMESPACE}")
-    pm_table = f"{gl.OPS_NAMESPACE}.partition_metrics"
-    tm_table = f"{gl.OPS_NAMESPACE}.table_metrics"
-    spark.sql(f"CREATE TABLE IF NOT EXISTS {pm_table} ({PARTITION_METRICS_DDL}) USING iceberg")
-    spark.sql(f"CREATE TABLE IF NOT EXISTS {tm_table} ({TABLE_METRICS_DDL}) USING iceberg")
-    gl.ensure_columns(spark, pm_table, PARTITION_METRICS_DDL)
-    gl.ensure_columns(spark, tm_table, TABLE_METRICS_DDL)
+    spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {gl.OPS_NAMESPACE}")   # the log sink creates its tables
 
     wanted = set(tables)
     names = sorted(r.tableName for r in spark.sql(f"SHOW TABLES IN {namespace}").collect()
@@ -254,8 +247,8 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
     inc = config.get("incremental") or {}
     # what the previous run left: each table's latest facts and partition facts and
     # the latest advisor action, from the state store (scan_state.py), not the logs
-    store = ss.IcebergStateStore(spark, gl.OPS_NAMESPACE)
-    scan_state.ensure_tables(spark, gl.OPS_NAMESPACE)
+    store = ss.make_state_store(spark, config)
+    scan_state.ensure_tables(spark, gl.OPS_NAMESPACE, store)
     now_ms = int(time.time() * 1000)
     prev = scan_state.load_previous(store, namespace, now_ms, window_h)
     # the run's tables we already know (new ones load on their own when first seen)
@@ -438,9 +431,9 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
                 store.compact(kind)
         except Exception as e:
             print(f"  (scan state cleanup skipped: {type(e).__name__})", flush=True)
-    RESULTS[scan_id] = {"tms": [normalize(spark, tm_table, dict(tm, scanned_ms=scan_state.to_ms(tm["scanned_at"])))
+    RESULTS[scan_id] = {"tms": [normalize(spark, "table_metrics", dict(tm, scanned_ms=scan_state.to_ms(tm["scanned_at"])))
                                 for tm in summary],
-                        "parts": {t: [normalize(spark, pm_table, r) for r in rows] for t, rows in parts_out.items()}}
+                        "parts": {t: [normalize(spark, "partition_metrics", r) for r in rows] for t, rows in parts_out.items()}}
     t_w = time.perf_counter() - t_w
     st = led.store.stats
     print(f"=== Timing: previous scan {t_prev:.1f}s, state preload {t_pre:.1f}s, tables {t_tables:.1f}s, writes + report {t_w:.1f}s; "
@@ -455,7 +448,9 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
                 "undersized_partition_share", "delete_files", "snapshots", "data_manifests",
                 "avg_changed_partitions_per_commit", "min_pruning_efficiency",
                 "sort_order_defined", "distribution_mode"]
-        sub = spark.table(tm_table).select(*cols).schema
+        from pyspark.sql.types import StructType, _parse_datatype_string
+        full = _parse_datatype_string(TABLE_METRICS_DDL)
+        sub = StructType([full[c] for c in cols])
         spark.createDataFrame([as_row(s, sub) for s in summary], sub).show(100, truncate=False)
 
         print("=== Partitions with excess files (top 15) ===", flush=True)

@@ -3,7 +3,9 @@
 State is what the next run needs to continue correctly; a log only loses
 history if it's lost (design doc, "State and log stores"). Callers talk to
 these two interfaces and never write SQL against the ops tables for state, so
-the backend can change (DynamoDB first, Postgres later) without touching them.
+the backend can change without touching them: Iceberg tables (IcebergStateStore,
+IcebergLogSink, the default) or Postgres (pg_store.py), chosen by state.backend /
+logs.backend through make_state_store / make_log_sink. Claims are in DynamoDB.
 
   StateStore
     get(kind, key)                        one current item, or None
@@ -49,6 +51,7 @@ DELETE for partition_state). The DynamoDB backend will range per table instead.
 """
 import contextlib
 import random
+import re
 import time
 from datetime import datetime, timezone
 
@@ -103,13 +106,32 @@ def declare_log(kind, ddl, ts, partition=""):
     LOG_AGE.setdefault(kind, ts)
 
 
+def backend_of(config, what):
+    """state.backend / logs.backend from the config, GL_STATE_BACKEND / GL_LOGS_BACKEND winning."""
+    import os
+    env = os.environ.get(f"GL_{what.upper()}_BACKEND")
+    b = env or str(((config or {}).get(what) or {}).get("backend", "iceberg"))
+    if b not in ("iceberg", "postgres"):
+        raise ValueError(f"unknown {what}.backend {b!r} (iceberg or postgres)")
+    return b
+
+
 def make_log_sink(spark, config=None, ops=None):
-    """The configured log sink (config logs.backend; iceberg until step 3c)."""
+    """The configured log sink (logs.backend: iceberg, the default, or postgres)."""
     import gl_common as gl
-    backend = str(((config or {}).get("logs") or {}).get("backend", "iceberg"))
-    if backend != "iceberg":
-        raise ValueError(f"unknown logs.backend {backend!r}")
+    if backend_of(config, "logs") == "postgres":
+        import pg_store
+        return pg_store.PostgresLogSink(config)
     return IcebergLogSink(spark, ops or gl.OPS_NAMESPACE)
+
+
+def make_state_store(spark, config=None, ops=None):
+    """The configured state store (state.backend: iceberg, the default, or postgres)."""
+    import gl_common as gl
+    if backend_of(config, "state") == "postgres":
+        import pg_store
+        return pg_store.PostgresStateStore(config)
+    return IcebergStateStore(spark, ops or gl.OPS_NAMESPACE)
 
 
 def _age_sql(col, how, days):
@@ -136,6 +158,14 @@ def _newer_or_same(a, b):
     if a is None:
         return False
     return a >= b
+
+
+def _utc_naive(v):
+    """collect() returns timestamps as naive datetimes in the driver's local zone;
+    the advisor's convention (and the Postgres sink's) is naive UTC."""
+    if isinstance(v, datetime):
+        return v.astimezone(timezone.utc).replace(tzinfo=None)
+    return v
 
 
 def day_of(ts_ms):
@@ -420,6 +450,8 @@ def superseded_filters(k, newest, chunk=200):
 
 
 class IcebergStateStore(MemoryState):
+    iceberg = True        # Iceberg tables in the ops namespace (created by each module's ensure_*)
+
     """Today's glue.ops tables behind the interface."""
 
     def __init__(self, spark, ops):
@@ -538,7 +570,7 @@ class IcebergStateStore(MemoryState):
 
 class LogSink:
     """Append-only records (L1-L8 in the design). Buffered; one append per kind
-    at flush. Iceberg today (glue.ops.<kind>), JSON lines on S3 in step 3."""
+    at flush. Iceberg (glue.ops.<kind>) or Postgres (pg_store.PostgresLogSink)."""
 
     def append(self, kind, rows):
         raise NotImplementedError
@@ -549,8 +581,34 @@ class LogSink:
     def expire(self, kind, older_than_days):
         raise NotImplementedError
 
+    def rows(self, kind, eq=None, order_desc=None, limit=None):
+        """Logged rows of a kind (dicts): eq = {column: value or [values]} (equality /
+        IN only), newest first by the order_desc column, at most limit. For the
+        few readers that need a log back (a standalone detect or scorecard, plan
+        --scan-id); [] when nothing was logged yet."""
+        raise NotImplementedError
+
 
 class IcebergLogSink(LogSink):
+    iceberg = True
+
+    def rows(self, kind, eq=None, order_desc=None, limit=None):
+        t = f"{self.ops}.{kind}"
+        if not self.spark.catalog.tableExists(t):
+            return []
+        where = []
+        for c, v in (eq or {}).items():
+            vals = list(v) if isinstance(v, (list, tuple, set)) else [v]
+            if not vals:
+                return []
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", c):
+                raise ValueError(f"bad column {c!r}")
+            where.append(f"{c} IN ({', '.join(_q(x) for x in vals)})")
+        sql = (f"SELECT * FROM {t}" + (" WHERE " + " AND ".join(where) if where else "")
+               + (f" ORDER BY {order_desc} DESC NULLS LAST" if order_desc else "")
+               + (f" LIMIT {int(limit)}" if limit else ""))
+        return [{k: _utc_naive(v) for k, v in r.asDict().items()} for r in self.spark.sql(sql).collect()]
+
     def __init__(self, spark, ops):
         self.spark, self.ops = spark, ops
         self._pending = {}

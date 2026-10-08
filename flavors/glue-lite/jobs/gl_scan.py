@@ -147,11 +147,10 @@ def run_group(a):
                 ops_maintenance.maintain(spark, config, run_id, renew=lambda: coord.renew_housekeeping(ttl))
                 coord.housekeeping_done()
             housekeeping = False                    # once per run, with the first namespace
-            for r in spark.sql(f"SELECT status, count(*) AS n FROM {gl.OPS_NAMESPACE}.coverage "
-                               f"WHERE scan_id = '{scan_id}' GROUP BY status").collect():
-                done += r.n if r.status == "done" else 0
-                skipped += r.n if r.status == "claimed_elsewhere" else 0
-                failed += r.n if r.status == "failed" else 0
+            for r in ss.make_log_sink(spark, config).rows("coverage", eq={"scan_id": scan_id}):
+                done += r["status"] == "done"
+                skipped += r["status"] == "claimed_elsewhere"
+                failed += r["status"] == "failed"
         journal(log, dict(base, scan_id=",".join(scan_ids), ended_at=probes.now_utc(), status="ok",
                             tables_matched=matched, tables_done=done, tables_skipped=skipped,
                             tables_failed=failed, housekeeping=hk and bool(scan_ids)))

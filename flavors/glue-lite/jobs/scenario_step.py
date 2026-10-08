@@ -53,27 +53,26 @@ from pyspark.sql import SparkSession
 import gl_common as gl
 import probes
 from build_test_tables import NS, S17_DAY, Builder, merge_random_rows
-from plan import ACTIONS_DDL, action_row, current_snapshot, rollback_hint, run_sql
+from plan import current_snapshot, rollback_hint, run_sql
 
 
 def record(spark, run_id, table, uuid, kind, symptom, stmt, status, dur, result, before=None, after=None):
-    ns = gl.OPS_NAMESPACE
-    spark.sql(f"CREATE TABLE IF NOT EXISTS {ns}.actions ({ACTIONS_DDL}) USING iceberg")
-    gl.ensure_columns(spark, f"{ns}.actions", ACTIONS_DDL)
-    schema = spark.table(f"{ns}.actions").schema
-    row = action_row(schema, run_id=run_id, started_at=datetime.now(timezone.utc), table_name=table,
-                     table_uuid=uuid, kind=kind, symptoms=symptom, statement=stmt, status=status,
-                     duration_s=float(dur), result_json=result, snapshot_before=before, snapshot_after=after,
-                     rollback_hint=rollback_hint(table.split(".", 1)[1], before, after))
-    spark.createDataFrame([row], schema).writeTo(f"{ns}.actions").append()
-    # and the state the next scan and detect read (scan_state.action_state)
+    """An action this step took, in the actions log and in action_state (what the
+    next scan and detect read), through the configured backends."""
     import scan_state
     import state_store as ss
-    scan_state.ensure_tables(spark, ns)
-    store = ss.IcebergStateStore(spark, ns)
-    scan_state.record_actions(store, [{"table_uuid": uuid, "table_name": table, "kind": kind, "status": status,
-                                       "started_at": row[schema.fieldNames().index("started_at")],
-                                       "result_json": result}], datetime.now(timezone.utc))
+    ns = gl.OPS_NAMESPACE
+    config = gl.load_config(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "health.json"))
+    rec = dict(run_id=run_id, started_at=datetime.now(timezone.utc), table_name=table,
+               table_uuid=uuid, kind=kind, symptoms=symptom, statement=stmt, status=status,
+               duration_s=float(dur), result_json=result, snapshot_before=before, snapshot_after=after,
+               rollback_hint=rollback_hint(table.split(".", 1)[1], before, after))
+    log = ss.make_log_sink(spark, config, ns)
+    log.append("actions", [rec])
+    log.flush()
+    store = ss.make_state_store(spark, config, ns)
+    scan_state.ensure_tables(spark, ns, store)
+    scan_state.record_actions(store, [rec], datetime.now(timezone.utc))
     store.flush()
 
 

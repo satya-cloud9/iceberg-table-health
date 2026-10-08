@@ -17,6 +17,8 @@
 #                 use the overhead, so too little gets the pod OOM-killed even
 #                 when the Java heap is fine.
 #   AWS_REGION
+#   PG_CONF    sparkConf lines for GL_STATE_BACKEND / GL_LOGS_BACKEND and the
+#              advisor-pg password (pre-indented; may be empty)
 apiVersion: sparkoperator.k8s.io/v1beta2
 kind: SparkApplication
 metadata:
@@ -62,6 +64,9 @@ ${JOB_ARGS}
     # where the driver's boto3 calls (the coordinator's DynamoDB claims) go;
     # the eks overlay drops it so real AWS endpoints are used
     spark.kubernetes.driverEnv.GL_AWS_ENDPOINT: ${AWS_ENDPOINT}
+    # backends chosen for this run and the Postgres password (run-job.sh; empty
+    # when neither is set and make gl-pg-up has not run)
+${PG_CONF}
     spark.executorEnv.AWS_REGION: ${AWS_REGION}
   driver:
     cores: 1

@@ -36,8 +36,11 @@ RECENT_ACTIONS = 20
 PART_SKIP = {"scan_id", "scanned_at", "table_name"}      # carried by the row itself
 
 
-def ensure_tables(spark, ops):
+def ensure_tables(spark, ops, store=None):
+    """The Iceberg tables of these kinds (nothing to do for another backend)."""
     import gl_common as gl
+    if store is not None and not getattr(store, "iceberg", True):
+        return
     spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {ops}")
     for name, ddl in (("table_state", TABLE_STATE_DDL), ("partition_facts", PARTITION_FACTS_DDL),
                       ("action_state", ACTION_STATE_DDL)):

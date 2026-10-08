@@ -16,10 +16,11 @@ RUN set -eux; \
     curl -fsSLO "${MAVEN}/iceberg-spark-runtime-3.5_2.12/${ICEBERG_VERSION}/iceberg-spark-runtime-3.5_2.12-${ICEBERG_VERSION}.jar"; \
     curl -fsSLO "${MAVEN}/iceberg-aws-bundle/${ICEBERG_VERSION}/iceberg-aws-bundle-${ICEBERG_VERSION}.jar"
 
-# boto3 for the run coordinator's claims in DynamoDB (coordinator.py)
+# boto3 for the run coordinator's claims in DynamoDB (coordinator.py) and the
+# RDS Data API; pg8000 (pure Python) for the Postgres backends (pg_store.py)
 RUN set -eux; \
     (python3 -m pip --version >/dev/null 2>&1 || (apt-get update && apt-get install -y --no-install-recommends python3-pip && rm -rf /var/lib/apt/lists/*)); \
-    python3 -m pip install --no-cache-dir "boto3>=1.34"
+    python3 -m pip install --no-cache-dir "boto3>=1.34" "pg8000>=1.31"
 
 COPY flavors/glue-lite/jobs/ /opt/jobs/
 

@@ -26,7 +26,7 @@ import scan_state
 import state_store as ss
 import symptom_rules
 import windows as win
-from ledger import CHECK_DDL, mode_of
+from ledger import mode_of
 
 SYMPTOMS_DDL = """
     scan_id STRING, detected_at TIMESTAMP, table_name STRING, partition_key STRING,
@@ -57,9 +57,10 @@ def coerce(value, data_type):
     return value
 
 
-def latest_scan_id(spark):
-    r = spark.sql(f"SELECT max_by(scan_id, scanned_at) AS s FROM {gl.OPS_NAMESPACE}.table_metrics").collect()
-    return r[0].s if r else None
+def latest_scan_id(spark, config=None):
+    """The newest scan in the table_metrics log (a run without --scan-id)."""
+    r = ss.make_log_sink(spark, config).rows("table_metrics", order_desc="scanned_at", limit=1)
+    return r[0]["scan_id"] if r else None
 
 
 def load_history(store, tms, window_hours=168):
@@ -187,14 +188,13 @@ def record_window_changes(log, scan_id, at, mode, changes, report=True):
 
 def run_detect(spark, scan_id, config, report=True):
     """Apply the rules to one scan, append to glue.ops.symptoms, return the findings."""
-    sy_table = f"{gl.OPS_NAMESPACE}.symptoms"
-    spark.sql(f"CREATE TABLE IF NOT EXISTS {sy_table} ({SYMPTOMS_DDL}) USING iceberg")
+    sy_table = f"{gl.OPS_NAMESPACE}.symptoms"             # the log sink creates its tables
 
     import scan_metrics as sm
-    store = ss.IcebergStateStore(spark, gl.OPS_NAMESPACE)
-    scan_state.ensure_tables(spark, gl.OPS_NAMESPACE)
+    store = ss.make_state_store(spark, config)
+    scan_state.ensure_tables(spark, gl.OPS_NAMESPACE, store)
     # the scan's rows: from memory when the scan ran in this job, else read back
-    tms, parts = sm.scan_results(spark, scan_id, store)
+    tms, parts = sm.scan_results(spark, scan_id, store, config)
     tms = [dict(t) for t in tms]
     uu = _uuids(tms)
     if uu:
@@ -329,8 +329,6 @@ def run_detect(spark, scan_id, config, report=True):
     if mode6 != "off":
         record_holds_changes(log, scan_id, detected_at, mode6, exp_changes, report,
                              family="expiry_policy", title="Expiry by policy", baseline="count/age rule")
-    if log.pending("incremental_check"):
-        spark.sql(f"CREATE TABLE IF NOT EXISTS {gl.OPS_NAMESPACE}.incremental_check ({CHECK_DDL}) USING iceberg")
 
     print(f"=== Symptoms for scan {scan_id}: {len(findings)} findings over {len(tms)} tables ===",
           flush=True)
@@ -361,7 +359,8 @@ def run_detect(spark, scan_id, config, report=True):
             brief = ", ".join(f"{k}={v}" for k, v in list(ev.items())[:4])
             print(f"  {f['action']:14} {f['severity']:6} {f['score']:7.2f}  {f['symptom']:22} "
                   f"{f['table_name']}{where}\n      {brief}\n      -> {f['remedy']}")
-    print(f"Symptoms recorded in {sy_table} under scan_id {scan_id}", flush=True)
+    where = sy_table if getattr(log, "iceberg", True) else "the symptoms log (postgres)"
+    print(f"Symptoms recorded in {where} under scan_id {scan_id}", flush=True)
     return findings
 
 
@@ -373,10 +372,11 @@ def main():
     a = p.parse_args()
 
     spark = SparkSession.builder.appName("gl25-detect-symptoms").getOrCreate()
-    scan_id = a.scan_id or latest_scan_id(spark)
+    config = gl.load_config(a.config)
+    scan_id = a.scan_id or latest_scan_id(spark, config)
     if not scan_id:
         sys.exit("No scan found: run make gl-metrics first.")
-    run_detect(spark, scan_id, gl.load_config(a.config))
+    run_detect(spark, scan_id, config)
     spark.stop()
 
 

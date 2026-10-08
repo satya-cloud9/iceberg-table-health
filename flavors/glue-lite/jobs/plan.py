@@ -588,24 +588,25 @@ def main():
     spark = SparkSession.builder.appName("gl25-plan").getOrCreate()
     ns = gl.OPS_NAMESPACE
     window_h = int(float((config.get("incremental") or {}).get("previous_scan_window_hours", 168)))
+    import freed_files as ff
+    import scan_state
+    import state_store as ss
+    log = ss.make_log_sink(spark, config, ns)
+    store = ss.make_state_store(spark, config, ns)
     if a.scan_id:
-        tms = {r.table_name: r.asDict() for r in
-               spark.sql(f"SELECT * FROM {ns}.table_metrics WHERE scan_id = '{a.scan_id}'").collect()}
+        tms = {r["table_name"]: r for r in log.rows("table_metrics", eq={"scan_id": a.scan_id})}
     else:
         # each table's own latest scan (group runs scan only their tables, so the newest
         # scan of the whole catalog does not cover every table): its facts in table_state
-        import scan_state
-        import state_store as ss
-        scan_state.ensure_tables(spark, ns)
-        tms = scan_state.latest_facts(ss.IcebergStateStore(spark, ns), int(time.time() * 1000), window_h)
+        scan_state.ensure_tables(spark, ns, store)
+        tms = scan_state.latest_facts(store, int(time.time() * 1000), window_h)
     if not tms:
         sys.exit("No scan found: run make gl-scan first.")
     pairs = {(t, m["scan_id"]) for t, m in tms.items()}
-    scan_list = ", ".join(sorted({f"'{sid}'" for _, sid in pairs}))
     findings = {}
-    for r in spark.sql(f"SELECT * FROM {ns}.symptoms WHERE scan_id IN ({scan_list})").collect():
-        if (r.table_name, r.scan_id) in pairs:
-            findings.setdefault(r.table_name, []).append(r.asDict())
+    for r in log.rows("symptoms", eq={"scan_id": sorted({sid for _, sid in pairs})}):
+        if (r["table_name"], r["scan_id"]) in pairs:
+            findings.setdefault(r["table_name"], []).append(r)
     scan_id = a.scan_id or (next(iter(pairs))[1] if len({s for _, s in pairs}) == 1 else "per-table latest")
 
     tables = match_tables(sorted(tms), [t.strip() for t in a.tables.split(",") if t.strip()])
@@ -615,11 +616,8 @@ def main():
                       if m) or "dry run"
     print(f"=== Plan {run_id} from scan {scan_id} ({mode}) ===", flush=True)
 
-    import freed_files as ff
-    import state_store as ss
-    log = ss.make_log_sink(spark, config, ns)
-    store = ss.IcebergStateStore(spark, ns)
-    ff.ensure_table(spark, ns)
+    if getattr(store, "iceberg", True):
+        ff.ensure_table(spark, ns)
     store.preload(ff.KIND)
     records = []
     for t in tables:
@@ -711,13 +709,12 @@ def main():
                                           rollback_hint=rollback_hint(ident_t, before, after)
                                           if status == "ok" else None))
     if (a.apply or approve) and records:
-        import scan_state
         log.append("actions", records)
         log.flush()                      # the log first, then the state the next scan reads
-        scan_state.ensure_tables(spark, ns)
+        scan_state.ensure_tables(spark, ns, store)
         scan_state.record_actions(store, records, datetime.now(timezone.utc))
         store.flush()
-        print(f"\nRecorded {len(records)} actions in {ns}.actions under {run_id} (with snapshot "
+        print(f"\nRecorded {len(records)} actions in the actions log under {run_id} (with snapshot "
               f"before/after and a rollback statement each). Run make gl-scan to check the result.",
               flush=True)
     elif not (a.apply or approve):

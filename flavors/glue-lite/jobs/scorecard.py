@@ -243,17 +243,16 @@ def run_scorecard(spark, scan_id, config, expectations, partial=False):
     import scan_state
     import state_store as ss
     from detect_symptoms import FINDINGS
-    sy = f"{gl.OPS_NAMESPACE}.symptoms"
-
     # the scan and its findings: from this job's memory when they ran here, else read back
-    store = ss.IcebergStateStore(spark, gl.OPS_NAMESPACE)
-    tms, scan_parts = sm.scan_results(spark, scan_id, store)
+    store = ss.make_state_store(spark, config)
+    log = ss.make_log_sink(spark, config)
+    tms, scan_parts = sm.scan_results(spark, scan_id, store, config, log)
     tmrows = {t["table_name"]: t for t in tms}
     tables = sorted(tmrows)
     last_fix = {}   # table UUID -> latest successful action ("kind ok HH:MM UTC"), from action_state
     uu = sorted({t.get("table_uuid") for t in tms if t.get("table_uuid")})
     if uu:
-        scan_state.ensure_tables(spark, gl.OPS_NAMESPACE)
+        scan_state.ensure_tables(spark, gl.OPS_NAMESPACE, store)
         store.preload("action_state", uuids=uu)
         for u in uu:
             ok = scan_state.last_ok(store.get("action_state", (u,)))
@@ -263,7 +262,7 @@ def run_scorecard(spark, scan_id, config, expectations, partial=False):
     findings = {}
     rows = FINDINGS.get(scan_id)
     if rows is None:
-        rows = [r.asDict() for r in spark.sql(f"SELECT * FROM {sy} WHERE scan_id = '{scan_id}'").collect()]
+        rows = log.rows("symptoms", eq={"scan_id": scan_id})
     for r in rows:
         findings.setdefault(r["table_name"], []).append(r)
     parts = {t: [{"table_name": t, "partition_key": r.get("partition_key"),
@@ -298,7 +297,6 @@ def run_scorecard(spark, scan_id, config, expectations, partial=False):
         print(line)
 
     scored_at = probes.now_utc()
-    log = ss.make_log_sink(spark, config)
     log.append("scorecard", [{"scan_id": scan_id, "scored_at": scored_at, "table_name": r["table_name"],
                               "status": r["status"], "found": ", ".join(r["found"]),
                               "missing": "; ".join(r["missing"]), "unexpected": ", ".join(r["unexpected"]),
@@ -319,10 +317,11 @@ def main():
     p.add_argument("--expectations", default=os.path.join(HERE, "config", "expectations.json"))
     a = p.parse_args()
     spark = SparkSession.builder.appName("gl25-scorecard").getOrCreate()
-    scan_id = a.scan_id or latest_scan_id(spark)
+    config = gl.load_config(a.config)
+    scan_id = a.scan_id or latest_scan_id(spark, config)
     if not scan_id:
         sys.exit("No scan found: run make gl-scan first.")
-    run_scorecard(spark, scan_id, gl.load_config(a.config), gl.load_config(a.expectations))
+    run_scorecard(spark, scan_id, config, gl.load_config(a.expectations))
     spark.stop()
 
 

@@ -372,8 +372,9 @@ class Ledger:
         import gl_common as gl
         self.spark, self.config, self.scan_id = spark, config, scan_id
         self.ops = gl.OPS_NAMESPACE
-        self.store = store or ss.IcebergStateStore(spark, self.ops)
-        self.log = log or ss.IcebergLogSink(spark, self.ops)
+        self.store = store or ss.make_state_store(spark, config, self.ops)
+        self.log = log or ss.make_log_sink(spark, config, self.ops)
+        iceberg = getattr(self.store, "iceberg", True)     # Iceberg tables to create, or another backend
         self.mode = mode_of(config)
         inc = config.get("incremental") or {}
         self.spot_share = float(inc.get("spot_check_share", 0.05))
@@ -406,12 +407,14 @@ class Ledger:
         self.pstate_keep_days = float(inc.get("partition_state_keep_days", 7))
         uu = sorted(uuids) if uuids else None
         if self.mode2 != "off":
-            ensure_activity_tables(spark, self.ops)
+            if iceberg:
+                ensure_activity_tables(spark, self.ops)
             for kind, start in (("activity_state", None), ("partition_state", None),
                                 ("commit_partition", commits_from), ("late_hist", hist_from)):
                 self.store.preload(kind, start=start, uuids=uu, max_rows=cap)
         if self.mode != "off":
-            ensure_tables(spark, self.ops)
+            if iceberg:
+                ensure_tables(spark, self.ops)
             for kind, start in (("ledger_state", None), ("commit", commits_from), ("gap_hist", hist_from)):
                 self.store.preload(kind, start=start, uuids=uu, max_rows=cap)
             # files earlier expiries freed and still waiting out their grace (freed_files.py):

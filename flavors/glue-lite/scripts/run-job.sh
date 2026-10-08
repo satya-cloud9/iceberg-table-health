@@ -59,8 +59,25 @@ export EXECUTOR_OVERHEAD="${EXECUTOR_OVERHEAD:-1g}"
 export EXECUTOR_INSTANCES="${EXECUTOR_INSTANCES:-1}"
 export JOB_TTL_SECONDS="${JOB_TTL_SECONDS:-86400}"   # finished jobs are cleaned up after a day
 
+# Backends for this run (STATE_BACKEND / LOGS_BACKEND = iceberg | postgres; unset:
+# the config decides) and the Postgres password when make gl-pg-up has run.
+PG_CONF=""
+if [ -n "${STATE_BACKEND:-}" ]; then
+  PG_CONF+="    spark.kubernetes.driverEnv.GL_STATE_BACKEND: \"${STATE_BACKEND}\""$'\n'
+fi
+if [ -n "${LOGS_BACKEND:-}" ]; then
+  PG_CONF+="    spark.kubernetes.driverEnv.GL_LOGS_BACKEND: \"${LOGS_BACKEND}\""$'\n'
+fi
+if kubectl -n spark-jobs get secret advisor-pg >/dev/null 2>&1; then
+  PG_CONF+="    spark.kubernetes.driver.secretKeyRef.GL_PG_PASSWORD: advisor-pg:password"$'\n'
+elif [[ "${STATE_BACKEND:-} ${LOGS_BACKEND:-}" == *postgres* ]]; then
+  echo "A backend is postgres but there is no advisor-pg Secret: run make gl-pg-up first." >&2
+  exit 1
+fi
+export PG_CONF="${PG_CONF%$'\n'}"
+
 echo "=== Submitting $JOB_NAME ($MAIN_FILE ${ARGS[*]:-}) [executor ${EXECUTOR_INSTANCES} x ${EXECUTOR_MEMORY}+${EXECUTOR_OVERHEAD}] ==="
-envsubst '${JOB_NAME} ${MAIN_FILE} ${JOB_ARGS} ${IMAGE} ${AWS_ENDPOINT} ${WAREHOUSE} ${AWS_REGION} ${DRIVER_MEMORY} ${EXECUTOR_MEMORY} ${EXECUTOR_OVERHEAD} ${EXECUTOR_INSTANCES} ${JOB_TTL_SECONDS}' \
+envsubst '${JOB_NAME} ${MAIN_FILE} ${JOB_ARGS} ${IMAGE} ${AWS_ENDPOINT} ${WAREHOUSE} ${AWS_REGION} ${DRIVER_MEMORY} ${EXECUTOR_MEMORY} ${EXECUTOR_OVERHEAD} ${EXECUTOR_INSTANCES} ${JOB_TTL_SECONDS} ${PG_CONF}' \
   < "$GL_ROOT/k8s/sparkapp.tmpl.yaml" | kubectl apply -f -
 
 TIMEOUT_MIN="${JOB_TIMEOUT_MIN:-30}"

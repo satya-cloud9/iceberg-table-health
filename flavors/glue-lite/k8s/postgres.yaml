@@ -1,0 +1,78 @@
+# Postgres for the advisor's state and logs on the homelab (state.backend /
+# logs.backend = postgres). One small pod in its own namespace, outside the
+# spark-jobs quota, data on a local-path volume so it survives pod restarts.
+# The password lives in the advisor-pg Secret, created by
+# scripts/04-postgres.sh (here and in spark-jobs, where the Spark driver reads it).
+# On AWS this is Aurora Serverless v2 instead (postgres.mode data_api from Glue).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: advisor-db
+  labels:
+    lakehouse.io/purpose: advisor-db
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: advisor-pg-data
+  namespace: advisor-db
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: advisor-pg
+  namespace: advisor-db
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate            # one pod owns the volume at a time
+  selector:
+    matchLabels: {app: advisor-pg}
+  template:
+    metadata:
+      labels: {app: advisor-pg}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - {name: POSTGRES_DB, value: advisor}
+            - {name: POSTGRES_USER, value: advisor}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: advisor-pg, key: password}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+            - {name: TZ, value: UTC}
+          args: ["-c", "timezone=UTC", "-c", "max_connections=50", "-c", "shared_buffers=64MB"]
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "advisor", "-d", "advisor"]
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {memory: 512Mi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: advisor-pg-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: advisor-pg
+  namespace: advisor-db
+spec:
+  selector: {app: advisor-pg}
+  ports:
+    - port: 5432
+      targetPort: 5432

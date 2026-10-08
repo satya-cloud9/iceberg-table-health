@@ -1620,3 +1620,49 @@ the upkeep log.
 
 Test jobs (`scenario_step.py`, `compact.py`, `read_benchmark.py`,
 `table_health.py`) keep their own direct writes.
+
+## Step 3b — Scan state instead of log reads
+
+What the next run needs is kept as state (`scan_state.py`): `table_state`
+(each table's latest facts and a short trend), `partition_facts` (each
+partition's facts, rewritten only when it changes) and `action_state` (the
+latest advisor actions, written by the plan). A reused table's partitions are
+not logged again. Scan, detect and the scorecard hand results over in memory
+when they run in one job, and read them back when run alone. Logs are flushed
+before state.
+
+## Step 3c — Postgres backends for state and logs
+
+`state.backend` and `logs.backend` choose where state and logs go:
+`iceberg` (the default; tables in `glue.ops`) or `postgres` (`pg_store.py`).
+Claims stay in DynamoDB. Only the Spark driver talks to Postgres.
+
+| | Homelab | AWS from EKS | AWS from Glue |
+|---|---|---|---|
+| Database | Postgres pod (`make gl-pg-up`) | Aurora Serverless v2 | Aurora Serverless v2 |
+| `postgres.mode` | `driver` (pg8000) | `driver` | `data_api` (RDS Data API, IAM) |
+| Password | `advisor-pg` Secret | Secrets Manager / env | not needed (`secret_arn`) |
+
+Layout in schema `advisor`:
+
+- **Logs:** one typed table per declared log kind (same columns as the Iceberg
+  table), indexed on its time column and `scan_id`.
+- **State:** one table per kind, named like the Iceberg table: key columns,
+  typed columns for ranges and retention, and the item as `jsonb`. Writes are
+  upserts (latest kinds keep the newest version, counters add), so no compaction
+  is needed. Each flush is one transaction.
+
+```bash
+make gl-pg-up                                              # pod, volume, Secret (safe to re-run)
+make gl-image                                              # image now includes pg8000
+make gl-scan STATE_BACKEND=postgres LOGS_BACKEND=postgres  # one run on Postgres
+make gl-pg-status                                          # rows per table
+make gl-pg-sql Q="SELECT scan_id, scan_mode, count(*) FROM advisor.table_metrics GROUP BY 1, 2 ORDER BY 1 DESC"
+make gl-pg-sql Q="SELECT item->>'table_name' AS t, item->>'scan_id' AS scan FROM advisor.table_state"
+```
+
+Switching a backend starts from empty state there: the first scan measures
+every table in full, as after any upgrade. To stay on Postgres, set
+`state.backend` / `logs.backend` in `jobs/config/health.json` and rebuild the
+image. `gl-ops-upkeep-log`, `gl-freed-files` and `gl-coverage` read the
+Iceberg tables; on Postgres use `gl-pg-sql` instead.
