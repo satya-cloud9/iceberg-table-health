@@ -104,7 +104,7 @@ echo "=== Driver log (job output) ==="
 # scan-pushdown messages (Pushing operators / Pushed Filters / Output: ...).
 kubectl -n spark-jobs logs "${JOB_NAME}-driver" 2>/dev/null \
   | grep -v -E '^[0-9]{2}/[0-9]{2}/[0-9]{2} [0-9:]+ (INFO|WARN)|^(Pushing operators to |Pushed (Filters|Aggregate|Group by|Limit|Offset|Top N)|Post-Scan Filters:|Output: )' \
-  | cat -s || true
+  | awk 'NF { blank = 0; print; next } !blank++ { print "" }' || true   # at most one blank line in a row
 
 if [ "$STATE" != "COMPLETED" ]; then
   echo ""

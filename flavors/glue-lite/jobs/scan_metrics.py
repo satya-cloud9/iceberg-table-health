@@ -256,6 +256,7 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
                     if p.get("table_uuid") and n.rsplit(".", 1)[-1] in set(names)})
     if known:
         store.preload("partition_facts", uuids=known, max_rows=int(inc.get("store_preload_max_rows", 2000000)))
+    scan_state.seed_actions(store, ss.make_log_sink(spark, config))   # once, when action_state is empty
     ages = scan_state.action_ages(store, now_ms)
     t_prev = time.perf_counter() - t_prev
     t_pre = time.perf_counter()

@@ -251,6 +251,28 @@ def recent_actions(state_row):
             for a in json.loads((state_row or {}).get("actions_json") or "[]")]
 
 
+def seed_actions(store, log, now=None):
+    """Fill an empty action_state from the actions log, once: actions taken before
+    action_state existed (or before a backend switch) would otherwise be missing,
+    so the scorecard would score fixed tables as freshly built. -> tables seeded."""
+    if store.items("action_state"):
+        return 0
+    try:
+        import plan          # noqa: F401  declares the actions log kind
+        rows = log.rows("actions")
+    except Exception as e:
+        print(f"  (action history not seeded: {type(e).__name__}: {str(e)[:120]})", flush=True)
+        return 0
+    rows = [r for r in rows if r.get("table_uuid") and r.get("started_at")]
+    if not rows:
+        return 0
+    rows.sort(key=lambda r: to_ms(r["started_at"]))
+    n = record_actions(store, rows, now or datetime.now(timezone.utc))
+    store.flush()
+    print(f"  action_state seeded from the actions log: {len(rows)} actions on {n} tables", flush=True)
+    return n
+
+
 def action_ages(store, now_ms):
     """{table uuid: minutes since the latest advisor action}."""
     return {k[0]: (now_ms - int(r["last_action_ms"])) / 60000.0

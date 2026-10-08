@@ -247,6 +247,7 @@ def run_scorecard(spark, scan_id, config, expectations, partial=False):
     store = ss.make_state_store(spark, config)
     log = ss.make_log_sink(spark, config)
     tms, scan_parts = sm.scan_results(spark, scan_id, store, config, log)
+    scan_state.seed_actions(store, log)          # once, when action_state is empty
     tmrows = {t["table_name"]: t for t in tms}
     tables = sorted(tmrows)
     last_fix = {}   # table UUID -> latest successful action ("kind ok HH:MM UTC"), from action_state
