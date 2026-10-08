@@ -31,7 +31,7 @@ destroy:
 # Kestra, Spark Operator, Glue, S3, Iceberg on the emulated EKS cluster --
 # no platform/tenant layers. Tear down with `make destroy` as usual.
 .PHONY: gl-spike gl-cluster gl-spark-operator gl-image gl-smoke gl-up gl-generate \
-        gl-health gl-bench gl-compact gl-report gl-demo gl-test-tables gl-metrics gl-symptoms gl-scorecard gl-scan gl-plan gl-step gl-sql gl-clean gl-status gl-group gl-groups-parallel gl-coverage gl-ops-check gl-ops-maintain gl-ops-upkeep-log gl-deferred-check gl-freed-files gl-pg-up gl-pg-sql gl-pg-status
+        gl-health gl-bench gl-compact gl-report gl-demo gl-test-tables gl-metrics gl-symptoms gl-scorecard gl-scan gl-plan gl-step gl-sql gl-clean gl-status gl-group gl-groups-parallel gl-coverage gl-ops-check gl-ops-maintain gl-ops-upkeep-log gl-deferred-check gl-freed-files gl-pg-up gl-pg-migrate gl-pg-sql gl-pg-status
 
 gl-spike:
 	bash flavors/glue-lite/spike/run-glue-spike.sh
@@ -188,11 +188,15 @@ gl-coverage:
 # Postgres for state and logs (pg_store.py; the Iceberg backends stay the default):
 #   make gl-pg-up                      Postgres pod in advisor-db + the advisor-pg Secret (safe to re-run)
 #   make gl-scan STATE_BACKEND=postgres LOGS_BACKEND=postgres   one run on Postgres (any gl-* job takes these)
+#   make gl-pg-migrate [LOGS=1] [REPLACE=1]   copy state (and logs) from the Iceberg ops tables, once
 #   make gl-pg-sql Q="SELECT ..."      psql in the pod; tables in schema advisor (logs typed, state as jsonb items)
 #   make gl-pg-status                  row counts per table
 export STATE_BACKEND LOGS_BACKEND Q
 gl-pg-up:
 	bash flavors/glue-lite/scripts/04-postgres.sh
+
+gl-pg-migrate:
+	JOB_TIMEOUT_MIN=45 bash flavors/glue-lite/scripts/run-job.sh py migrate_state.py $(if $(filter 1,$(LOGS)),--logs) $(if $(filter 1,$(REPLACE)),--replace)
 
 gl-pg-sql:
 	Q="$$Q" bash flavors/glue-lite/scripts/pg-sql.sh

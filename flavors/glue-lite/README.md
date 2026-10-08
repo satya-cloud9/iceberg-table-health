@@ -1661,8 +1661,21 @@ make gl-pg-sql Q="SELECT scan_id, scan_mode, count(*) FROM advisor.table_metrics
 make gl-pg-sql Q="SELECT item->>'table_name' AS t, item->>'scan_id' AS scan FROM advisor.table_state"
 ```
 
-Switching a backend starts from empty state there: the first scan measures
-every table in full, as after any upgrade. To stay on Postgres, set
-`state.backend` / `logs.backend` in `jobs/config/health.json` and rebuild the
-image. `gl-ops-upkeep-log`, `gl-freed-files` and `gl-coverage` read the
+Switching a backend without copying starts from empty state: the first scan
+measures every table in full, and the action history is missing, so the
+scorecard treats every table as freshly built. Copy the state first:
+
+```bash
+make gl-pg-migrate            # every state kind from glue.ops into Postgres (Iceberg unchanged)
+make gl-pg-migrate LOGS=1     # the log history too
+make gl-pg-migrate REPLACE=1  # empty the Postgres tables first (a kind with rows is otherwise skipped)
+```
+
+It prints rows read from Iceberg and stored in Postgres per kind and ends with
+`MIGRATION OK`. To stay on Postgres, set `state.backend` / `logs.backend` in
+`jobs/config/health.json` and rebuild the image.
+
+On Postgres, housekeeping deletes log rows older than
+`ops_maintenance.log_keep_days` (90) from every log kind except the run journal;
+state retention is the same as on Iceberg. `gl-ops-upkeep-log`, `gl-freed-files` and `gl-coverage` read the
 Iceberg tables; on Postgres use `gl-pg-sql` instead.

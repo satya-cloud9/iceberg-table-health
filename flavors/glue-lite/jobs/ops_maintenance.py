@@ -199,6 +199,32 @@ def ops_tables(spark, ops):
     return sorted(f"{ops}.{r.tableName}" for r in spark.sql(f"SHOW TABLES IN {ops}").collect())
 
 
+def expire_postgres_logs(spark, config, keep_days):
+    """Logs on Postgres: delete rows older than keep_days from every declared log
+    kind (the Iceberg logs keep their history; their tables get the upkeep above)."""
+    import state_store as ss
+    if ss.backend_of(config, "logs") != "postgres":
+        return {}
+    import importlib
+    for m in ("scan_metrics", "detect_symptoms", "ledger", "plan", "scorecard", "gl_scan"):
+        try:
+            importlib.import_module(m)          # their declare_log calls
+        except Exception:
+            pass
+    out = {}
+    try:
+        log = ss.make_log_sink(spark, config)
+        for kind in sorted(ss.LOG_KINDS):
+            if kind == "run_journal":
+                continue                            # a run's own journal row may still be open
+            log.expire(kind, keep_days)
+            out[kind] = keep_days
+        print(f"  postgres logs: rows older than {keep_days} days removed from {len(out)} kinds", flush=True)
+    except Exception as e:
+        print(f"  (postgres log retention skipped: {type(e).__name__}: {str(e)[:160]})", flush=True)
+    return out
+
+
 def maintain(spark, config, run_id, renew=lambda: True, dry_run=False, ops=None, now=None):
     """Upkeep that never fails the run calling it (see _maintain)."""
     try:
@@ -261,6 +287,8 @@ def _maintain(spark, config, run_id, renew=lambda: True, dry_run=False, ops=None
             log.expire("ops_maintenance", int(cfg["log_keep_days"]))
         except Exception as e:
             print(f"  (upkeep log not written: {type(e).__name__})", flush=True)
+    if not dry_run:
+        expire_postgres_logs(spark, config, int(cfg["log_keep_days"]))
     return rows
 
 

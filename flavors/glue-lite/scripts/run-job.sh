@@ -61,6 +61,11 @@ export JOB_TTL_SECONDS="${JOB_TTL_SECONDS:-86400}"   # finished jobs are cleaned
 
 # Backends for this run (STATE_BACKEND / LOGS_BACKEND = iceberg | postgres; unset:
 # the config decides) and the Postgres password when make gl-pg-up has run.
+for b in "${STATE_BACKEND:-}" "${LOGS_BACKEND:-}"; do
+  case "$b" in ""|iceberg|postgres) ;; *)
+    echo "Unknown backend '$b': STATE_BACKEND / LOGS_BACKEND take iceberg or postgres." >&2; exit 1 ;;
+  esac
+done
 PG_CONF=""
 if [ -n "${STATE_BACKEND:-}" ]; then
   PG_CONF+="    spark.kubernetes.driverEnv.GL_STATE_BACKEND: \"${STATE_BACKEND}\""$'\n'
@@ -95,8 +100,11 @@ echo "State: ${STATE:-unknown}"
 
 echo ""
 echo "=== Driver log (job output) ==="
+# Drops Spark's INFO/WARN lines and the continuation lines of its multi-line
+# scan-pushdown messages (Pushing operators / Pushed Filters / Output: ...).
 kubectl -n spark-jobs logs "${JOB_NAME}-driver" 2>/dev/null \
-  | grep -v -E '^[0-9]{2}/[0-9]{2}/[0-9]{2} [0-9:]+ (INFO|WARN)' || true
+  | grep -v -E '^[0-9]{2}/[0-9]{2}/[0-9]{2} [0-9:]+ (INFO|WARN)|^(Pushing operators to |Pushed (Filters|Aggregate|Group by|Limit|Offset|Top N)|Post-Scan Filters:|Output: )' \
+  | cat -s || true
 
 if [ "$STATE" != "COMPLETED" ]; then
   echo ""
