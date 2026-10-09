@@ -1755,3 +1755,20 @@ make gl-scan TRACE=s17_growing           # history_gaps_window / history_lost_co
 ```
 
 Switch on with `incremental.writer_findings: on` after a clean shadow run.
+
+### Scorecard: what counts as a fix
+
+A table is scored in its "fixed" phase only when a successful advisor action
+addressed one of the symptoms it was built with (its expectation's `expect` and
+`allow` lists). Housekeeping on the side, such as an expiry for SNAPSHOT_BUILDUP
+on a churn table or `delete_freed_files`, no longer moves it there; such a table
+stays in "detect" with a note naming the actions that ran. `action_state` keeps
+the latest fix per symptom for good (inside `last_ok_json`), and the first
+scorecard on this version fills that history for older rows from the actions
+log (`action_state: fix history filled ...`). The "last fix" line now names
+the fix and its symptom, not the latest action.
+
+s2 allows RETAINED_STORAGE after its fix: expiry keeps the last 10 snapshots,
+so the pre-compaction copy stays referenced (about 1.1x live) until the policy
+expires it. The writer-findings note shows the commit gap in seconds below a
+minute.

@@ -12,9 +12,10 @@ partition has legitimately cooled, so the result is STALE with a hint to
 rebuild, not FAIL.
 
 Output (GL2.5l): grouped by phase. "detect" = no fix yet, PASS means the
-problem the table was built with was found; "fixed" = a fix ran, PASS means
-the table is now healthy. Fixed rows show the last successful action, detect
-rows the next step.
+problem the table was built with was found; "fixed" = an action that addressed
+one of those problems ran (fix_phase: housekeeping such as deleting freed files
+does not count), PASS means the table is now healthy. Fixed rows show that fix,
+detect rows the next step.
 
 Pure scoring lives in score_table() and printing in render(), so both are
 unit-tested without Spark.
@@ -25,6 +26,7 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -145,6 +147,33 @@ def score_table(table, expectation, findings, partition_rows, hot_minutes, phase
 PHASE_LABEL = {"before": "detect", "after": "fixed"}
 
 
+def _when(ms):
+    return datetime.fromtimestamp(ms / 1000.0, timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+
+def fix_phase(expectation, fixed, complete, last_ok):
+    """Is the table in its "fixed" phase? (pure, unit-tested)
+
+    A fix is a successful advisor action that addressed one of the symptoms the
+    table was built with (its expectation's expect and allow lists). Housekeeping
+    on the side (an expiry for SNAPSHOT_BUILDUP on a churn table, deleting freed
+    files) does not move it to "fixed". Without a complete fix history, or for a
+    table expected healthy, any successful action counts (the earlier rule).
+    fixed: {symptom: (ms, kind)}; last_ok: (kind, ms) or None.
+    -> (phase, last fix text or None, note)."""
+    if not last_ok:
+        return "before", None, ""
+    built = {e["symptom"] for e in (expectation or {}).get("expect", [])} | set((expectation or {}).get("allow", []))
+    if not complete or not built:
+        return "after", f"{last_ok[0]} ok {_when(last_ok[1])} UTC", ""
+    hits = [(fixed[s][0], fixed[s][1], s) for s in built if s in fixed]
+    if hits:
+        ms, kind, sym = max(hits)
+        return "after", f"{kind} ok {_when(ms)} UTC ({sym})", ""
+    return "before", None, (f"advisor actions ran (latest {last_ok[0]} {_when(last_ok[1])} UTC) but none "
+                            f"addressed what the table was built with ({', '.join(sorted(built))})")
+
+
 def next_step(table, findings, mode="auto"):
     """What fixing a detect-phase table would take, from its findings' action types."""
     short = table.rsplit(".", 1)[-1].split("_", 1)[0]
@@ -217,7 +246,7 @@ def render(scan_id, results):
             out.append(f"{pad}note: {r['notes']}")
 
     groups = [
-        ("Fixed: a fix ran; the scan must now find the table healthy",
+        ("Fixed: a fix for its built problem ran; the scan must now find the table healthy",
          [r for r in scored if r["phase"] == "after" and r["status"] in ("PASS", "FAIL")]),
         ("Detect: no fix yet; the scan must find the problem the table was built with",
          [r for r in scored if r["phase"] == "before" and r["status"] in ("PASS", "FAIL")]),
@@ -250,18 +279,19 @@ def run_scorecard(spark, scan_id, config, expectations, partial=False):
     log = ss.make_log_sink(spark, config)
     tms, scan_parts = sm.scan_results(spark, scan_id, store, config, log)
     scan_state.seed_actions(store, log)          # once, when action_state is empty
+    scan_state.backfill_fixed(store, log)        # once per row written before the fix history
     tmrows = {t["table_name"]: t for t in tms}
     tables = sorted(tmrows)
-    last_fix = {}   # table UUID -> latest successful action ("kind ok HH:MM UTC"), from action_state
+    acted = {}      # table UUID -> (per-symptom fixes, complete, last successful action)
     uu = sorted({t.get("table_uuid") for t in tms if t.get("table_uuid")})
     if uu:
         scan_state.ensure_tables(spark, gl.OPS_NAMESPACE, store)
         store.preload("action_state", uuids=uu)
         for u in uu:
-            ok = scan_state.last_ok(store.get("action_state", (u,)))
+            row = store.get("action_state", (u,))
+            ok = scan_state.last_ok(row)
             if ok:
-                last_fix[u] = f"{ok[0]} ok {scan_state.from_ms(ok[1]).strftime('%Y-%m-%d %H:%M')} UTC"
-    fixed = set(last_fix)
+                acted[u] = scan_state.fixes(row) + (ok,)
     findings = {}
     rows = FINDINGS.get(scan_id)
     if rows is None:
@@ -276,7 +306,8 @@ def run_scorecard(spark, scan_id, config, expectations, partial=False):
     results = []
     for t in tables:
         cfg = gl.table_config(config, t)
-        phase = "after" if tmrows[t].get("table_uuid") in fixed else "before"
+        fx, complete, ok = acted.get(tmrows[t].get("table_uuid"), ({}, True, None))
+        phase, fix_text, fix_note = fix_phase(exp_tables.get(t), fx, complete, ok)
         res = score_table(t, exp_tables.get(t), findings.get(t, []), parts.get(t, []),
                           float(cfg.get("hot_partition_minutes", 15)), phase,
                           writer_age_min=tmrows[t].get("minutes_since_writer_commit"))
@@ -285,7 +316,9 @@ def run_scorecard(spark, scan_id, config, expectations, partial=False):
         tr.log("score", f"{res['status']} ({phase})", found=res.get("found"), missing=res.get("missing"),
                unexpected=res.get("unexpected"), notes=res.get("notes"))
         tr.begin(None)
-        res["last_fix"] = last_fix.get(tmrows[t].get("table_uuid")) if phase == "after" else None
+        res["last_fix"] = fix_text
+        if fix_note and exp_tables.get(t) is not None:
+            res["notes"] = (res["notes"] + "; " if res["notes"] else "") + fix_note
         props = json.loads(tmrows[t].get("properties_json") or "{}")
         mode = props.get("advisor.mode") or cfg.get("advisor_mode", "auto")
         res["next"] = next_step(t, [f for f in findings.get(t, [])

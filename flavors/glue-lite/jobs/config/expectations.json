@@ -51,8 +51,13 @@
         }
       ],
       "after": {
-        "_comment": "deletes applied to rewritten files and the old delete files removed",
-        "expect": []
+        "_comment": "deletes applied to rewritten files and the old delete files removed. RETAINED_STORAGE is allowed: expiry keeps the last 10 snapshots, so the pre-compaction copy stays referenced (about 1.1x live) until the policy expires it",
+        "expect": [
+          {
+            "symptom": "RETAINED_STORAGE",
+            "optional": true
+          }
+        ]
       }
     },
     "glue.demo.s3_hot_partition": {

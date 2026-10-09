@@ -325,7 +325,8 @@ def run_detect(spark, scan_id, config, report=True):
             tr.log("detect.diff", "writer_findings: " + ("; ".join(d7) if d7 else "no change"))
             gap = tm.get("writer_gap_median_min")
             note = (f"{tm.get('writer_commits_24h_seen')} writer commits in 24 h"
-                    + (f", every {gap:.1f} min" if gap is not None else "")
+                    + ((f", every {gap * 60:.0f} s" if gap < 1 else f", every {gap:.1f} min")
+                       if gap is not None else "")
                     + f"; history gaps {tm.get('history_gaps_window') or 0}"
                     + (f" ({tm.get('history_lost_commits')} commits lost)" if tm.get("history_lost_commits") else "")
                     + (f"; scanned every {tm['minutes_since_previous_scan'] / 60:.1f} h"

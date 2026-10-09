@@ -219,11 +219,75 @@ def action_row(prev_state, uuid, table, actions, now, window_hours=168):
     recent = [a for a in recent if a["ms"] >= since][-RECENT_ACTIONS:]
     last = max([a["ms"] for a in recent] + [int((prev_state or {}).get("last_action_ms") or 0)])
     last_ok = json.loads((prev_state or {}).get("last_ok_json") or "null")
+    # "fixed": per symptom, the latest successful action that addressed it, kept
+    # for good (not only the recent window), so the scorecard can tell a fix for a
+    # table's own problem from housekeeping. "complete" = built from the whole
+    # history (a row written before this field has only what came after it, until
+    # backfill_fixed fills it from the actions log).
+    fixed = dict((last_ok or {}).get("fixed") or {})
+    complete = bool((last_ok or {}).get("complete")) if last_ok else True
     for a in actions:
-        if a.get("status") == "ok" and (last_ok is None or to_ms(a["started_at"]) >= last_ok["ms"]):
-            last_ok = {"ms": to_ms(a["started_at"]), "kind": a.get("kind")}
+        if a.get("status") != "ok":
+            continue
+        ms = to_ms(a["started_at"])
+        if last_ok is None or ms >= last_ok["ms"]:
+            last_ok = {"ms": ms, "kind": a.get("kind")}
+        for sym in addressed(a):
+            if sym not in fixed or ms >= fixed[sym][0]:
+                fixed[sym] = [ms, a.get("kind")]
+    if last_ok is not None:
+        last_ok = dict(last_ok, fixed=fixed, complete=complete)
     return {"table_uuid": uuid, "table_name": table, "updated_at": now, "last_action_ms": last or None,
             "actions_json": json.dumps(recent), "last_ok_json": json.dumps(last_ok) if last_ok else None}
+
+
+NOT_A_FIX = {"FREED_FILES"}      # housekeeping steps: they fix nothing a table was built with
+
+
+def addressed(action):
+    """The symptoms an action addressed (its symptoms column), housekeeping left out."""
+    raw = action.get("symptoms") or ""
+    syms = raw if isinstance(raw, (list, tuple)) else str(raw).split(",")
+    return sorted({x.strip() for x in syms if x and x.strip() and x.strip() not in NOT_A_FIX})
+
+
+def fixes(state_row):
+    """(per-symptom {symptom: (ms, kind)}, complete) from action_state; ({}, True) when no action."""
+    v = json.loads((state_row or {}).get("last_ok_json") or "null")
+    if not v:
+        return {}, True
+    return {k: (int(x[0]), x[1]) for k, x in (v.get("fixed") or {}).items()}, bool(v.get("complete"))
+
+
+def backfill_fixed(store, log):
+    """Fill the per-symptom fix history of action_state rows written before it
+    existed, from the actions log, once per row. -> rows filled."""
+    todo = {k[0]: r for k, r in store.items("action_state") if r.get("last_ok_json") and not fixes(r)[1]}
+    if not todo:
+        return 0
+    try:
+        import plan          # noqa: F401  declares the actions log kind
+        rows = log.rows("actions")
+    except Exception as e:
+        print(f"  (fix history not filled: {type(e).__name__}: {str(e)[:120]})", flush=True)
+        return 0
+    hist = {}
+    for a in sorted((a for a in rows if a.get("table_uuid") in todo and a.get("started_at")),
+                    key=lambda a: to_ms(a["started_at"])):
+        if a.get("status") != "ok":
+            continue
+        for sym in addressed(a):
+            hist.setdefault(a["table_uuid"], {})[sym] = [to_ms(a["started_at"]), a.get("kind")]
+    for uuid, r in todo.items():
+        v = json.loads(r["last_ok_json"])
+        fixed = dict(hist.get(uuid, {}))
+        for sym, x in (v.get("fixed") or {}).items():       # anything recorded since is newer
+            if sym not in fixed or x[0] >= fixed[sym][0]:
+                fixed[sym] = x
+        store.put("action_state", dict(r, last_ok_json=json.dumps(dict(v, fixed=fixed, complete=True))))
+    store.flush()
+    print(f"  action_state: fix history filled from the actions log for {len(todo)} tables", flush=True)
+    return len(todo)
 
 
 def record_actions(store, records, now):
