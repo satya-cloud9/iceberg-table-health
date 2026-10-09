@@ -7,7 +7,9 @@ the next one for longer than the claim's lifetime.
 
   group run     one run per (group, shard) at a time; a second run starting
                 while the first holds it exits quietly (overlapping schedules)
-  table         one run works on a table at a time (operation: scan or act)
+  table         one run works on a table at a time: one lease per table for a
+                whole run (scan through freed-file deletion, plan.py's D1 order),
+                also taken by scan-only runs, which write the table's ledger state
   housekeeping  one run at a time does the store's retention pass and ops-table upkeep
 
 Backends:
@@ -20,7 +22,7 @@ Backends:
 Items (pk / sk):
 
   <target>#group#<group>    run#<i>/<n>         run_id, expires_at, started_at
-  <target>#table#<table>    claim#<operation>   run_id, expires_at, claimed_at
+  <target>#table#<table>    claim#run           run_id, expires_at, claimed_at
   <target>#housekeeping     claim               run_id, expires_at, last_done
 """
 import os
@@ -57,13 +59,14 @@ class Coordinator:
     def release_group(self, group, shard):
         self._release(f"{self.target}#group#{group}", f"run#{shard}")
 
-    def claim_table(self, table, operation="scan", ttl_s=1800):
+    def claim_table(self, table, operation="run", ttl_s=1800):
+        """Take or renew (same run id) the table's lease; False when another run holds it."""
         ok = self._acquire(f"{self.target}#table#{table}", f"claim#{operation}", ttl_s,
                            {"claimed_at": now_s()})
         self.stats["tables_claimed" if ok else "tables_refused"] += 1
         return ok
 
-    def release_table(self, table, operation="scan"):
+    def release_table(self, table, operation="run"):
         self._release(f"{self.target}#table#{table}", f"claim#{operation}")
 
     def claim_housekeeping(self, every_hours=6, ttl_s=3600):

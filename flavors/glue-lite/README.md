@@ -1566,9 +1566,8 @@ timeout. Production values: 12 h, 1 h, 10 min. The homelab config uses test
 scale: 0.1 h, 0.05 h, 1 min.
 
 **Window:** the policy age as before. More than `max_snapshots` (3,600)
-snapshots inside it shorten it, and it is never shorter than
-`window_floor_hours` (production about 2 × the scan interval; this replaces
-`inflight_floor_hours`, which is still read if set).
+snapshots inside it shorten it. (It used to be raised to `window_floor_hours`;
+the floor was retired with the run order D1, below.)
 
 **Other changes:**
 - The scan reports `freed_files_waiting` per table. The orphan listing counts
@@ -1772,3 +1771,65 @@ s2 allows RETAINED_STORAGE after its fix: expiry keeps the last 10 snapshots,
 so the pre-compaction copy stays referenced (about 1.1x live) until the policy
 expires it. The writer-findings note shows the commit gap in seconds below a
 minute.
+
+## D1 — One run per table: scan, act, catch up, then expire
+
+`make gl-plan APPLY=1` (and `APPROVE=...`) no longer acts on the latest scan.
+For each table it takes the table's lease, scans it, and runs the steps in
+the order of design decision D1 (Retention discussion in the design doc):
+
+| Step | What | Trigger |
+| --- | --- | --- |
+| scan | incremental scan and detection of the table | always |
+| 1 | approved property changes and tag drops | `APPROVE=` |
+| 2 | `rewrite_position_delete_files` | DELETE_FILE_SPRAWL |
+| 3 | `rewrite_data_files` (then the delete files it left behind); approved spec or sort rewrites | SMALL_FILES and co. |
+| 4 | `rewrite_manifests` | MANIFEST_BLOAT |
+| 5 | ledger catch-up: a second incremental scan | always |
+| 7 | expiry, files kept | SNAPSHOT_BUILDUP from the catch-up's findings |
+| 8 | freed-file deletion | records past their due time |
+| 9 | approved orphan removal | `APPROVE=ORPHAN_FILES`, held while freed files wait |
+| 10 | estimate: files before and after, files freed, GET requests saved a month | something ran |
+
+(6, checkpoint tags, comes with D5.) Every step checks its own trigger on every
+run, whether or not anything else ran.
+
+**Expiry never outruns the ledger.** The cutoff is the policy cutoff, capped
+at the time of the newest snapshot the ledger ingested in the catch-up
+(`older_than` is exclusive, so that snapshot stays). The run prints
+`catch-up (scan ...): ledger at <time>`, and an expiry that the cap moved says
+`capped at the newest snapshot the ledger ingested`. With the ledger off
+(`incremental.snapshot_ledger` not `on`) the cutoff is not capped and the run
+says so. The window floor (`expiry.window_floor_hours`) is gone: the order
+protects the ledger, and the floor kept busy tables above the snapshot cap.
+
+**One lease per table.** `make gl-plan APPLY=1` and the group scans
+(`make gl-group`) take the same lease (`<target>#table#<table>`, `claim#run`
+in the coordination table): a scan and an optimize run never work on one
+table at once. The lease is renewed before each step (`lease_minutes`, 30); a
+run that finds it taken stops that table after the step in progress and
+skips the rest. A failed step also skips the rest of that table; the next run
+starts again from its own scan.
+
+**Estimate (step 10).** One `estimate` row per table that changed, in the
+actions log (not in action_state, so the scorecard ignores it): files before
+and after (the scan vs the catch-up), files the expiry freed (deleted after
+the grace), and with `cost.full_reads_per_day` and `cost.get_usd_per_1000`
+set (defaults 24 and 0.0004 USD, ASSUMPTIONS to set per environment, per table
+under `tables.<name>.cost`) the GET requests saved a month. Storage comes back
+only after the grace and is reported as files freed until freed-file sizes
+are recorded.
+
+To check on the cluster:
+
+```
+make gl-scan                       # a baseline
+make gl-plan T=s0                  # dry run: the plan from the latest scan, nothing changes
+make gl-plan T=s0 APPLY=1          # scan, steps 1-4, catch-up, expiry capped, estimate
+make gl-plan T=s2 APPLY=1
+make gl-scan                       # scorecard as before
+```
+
+In the APPLY output look for, per table: `steps 1-4 (scan ...)`, the `->`
+lines, `catch-up (scan ...): ledger at ...`, `steps 7-9 after the catch-up`
+(with `capped at ...` when the cap moved the cutoff) and `estimate: ...`.

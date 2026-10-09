@@ -230,8 +230,9 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
     Tables whose metadata.json location is the same as at their last scan are
     reused (see reuse()); `full=True` measures everything from scratch.
 
-    coord (coordinator.py): each table is claimed before it is measured and
-    released after; a table another run holds is skipped and recorded so in
+    coord (coordinator.py): each table's lease is taken before it is measured and
+    released after (the same lease plan.py holds for a whole run, so a scan and
+    an optimize run never work on one table at once); a table another run holds is skipped and recorded so in
     coverage. run: {run_id, target, group, shard} for the coverage log.
     housekeeping: whether this run does the store's retention pass.
     """
@@ -281,7 +282,7 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
 
     for name in names:
         table = f"{namespace}.{name}"
-        if coord is not None and not coord.claim_table(table, "scan"):
+        if coord is not None and not coord.claim_table(table, "run"):
             print(f"  skip   {table}  (claimed by another run)", flush=True)
             covered(table, "claimed_elsewhere")
             modes["skipped"] = modes.get("skipped", 0) + 1
@@ -420,7 +421,7 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
         modes[tm.get("scan_mode", "full")] = modes.get(tm.get("scan_mode", "full"), 0) + 1
         covered(table, "failed" if tm.get("scan_mode") == "failed" else "done", tm.get("scan_mode"))
         if coord is not None:
-            coord.release_table(table, "scan")
+            coord.release_table(table, "run")
         print(f"  {tm.get('scan_mode', 'full'):6} {table}  {tm['scan_seconds']:.1f}s", flush=True)
     t_tables = time.perf_counter() - t_start
     print(f"=== {len(names)} tables in {t_tables:.1f}s: "

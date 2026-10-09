@@ -11,16 +11,16 @@ snapshots cost (Traceability A4). The policy, first match wins:
                                   expiry.streaming_min_commits_24h writer commits in the
                                   last 24 h, else batch (defaults: batch 120 h / 10,
                                   streaming 72 h / 10)
-  then two bounds on that window:
+  then one bound on that window:
     max snapshots   advisor.expire.max-snapshots / expiry.max_snapshots (3,600):
                     more snapshots inside the window shorten it, since each one
                     is an entry in metadata.json that every commit rewrites
-    window floor    expiry.window_floor_hours (2 x the scan interval): never
-                    shorter, so every commit is in the advisor's commit log
-                    before Iceberg drops it
+  There is no window floor: the advisor's own expiry runs after the ledger
+  has caught up in the same run and its cutoff never passes the newest
+  snapshot the ledger ingested (plan.py, run order D1), so the commit log
+  cannot miss a commit the advisor expires.
 
-The window protects time travel, incremental consumers and the advisor's own
-history, not readers already running: on user tables the expiry deletes no
+The window protects time travel and undo, not readers already running: on user tables the expiry deletes no
 files (freed_files.py), and the freed files wait out the FILE GRACE, first match:
 
   1. advisor.expire.file-grace-hours           the owner's word for this table
@@ -63,7 +63,7 @@ def category(snaps, now_ms, cfg):
 
 
 def resolve_policy(props, cfg, snaps, now_ms):
-    """-> {age_h, min_keep, source, category, writer_commits_24h, floor_h,
+    """-> {age_h, min_keep, source, category, writer_commits_24h,
     max_snapshots, file_grace_h, grace_source}."""
     exp = cfg.get("expiry") or {}
     cat, n24 = category(snaps, now_ms, cfg)
@@ -91,12 +91,9 @@ def resolve_policy(props, cfg, snaps, now_ms):
         capped_h = (now_ms - newest[max_snaps - 1]) / H
         if capped_h < age_h:
             age_h, source = capped_h, source + f" (shortened to keep {max_snaps} snapshots)"
-    floor_h = float(exp.get("window_floor_hours", exp.get("inflight_floor_hours", 12)))
-    if age_h < floor_h:
-        age_h, source = floor_h, source + f" (raised to the {floor_h:g} h window floor)"
     grace_h, grace_source = file_grace(props, exp)
     return {"age_h": age_h, "min_keep": keep, "source": source, "category": cat,
-            "writer_commits_24h": n24, "floor_h": floor_h, "max_snapshots": max_snaps,
+            "writer_commits_24h": n24, "max_snapshots": max_snaps,
             "file_grace_h": grace_h, "grace_source": grace_source}
 
 

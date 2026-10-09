@@ -1,30 +1,45 @@
 """GL2.5e: turn a scan's findings into maintenance statements, and optionally run them.
 
-Reads one scan (default: the latest) from glue.ops.symptoms and
-glue.ops.table_metrics. For each table it builds, in order:
+Dry run (no --apply / --approve): reads each table's latest scan from the state
+store and prints the plan; nothing is read again, nothing changes.
 
-  1. rewrite_data_files (binpack) over the flagged partitions
-       SMALL_FILES / SCATTERED_SMALL_FILES / OVERSIZED_FILES / DELETE_BUILDUP;
-       top max_partitions_per_run by score; hot partitions are never included
-  2. rewrite_manifests                       MANIFEST_BLOAT
-  3. expire_keep_files                       SNAPSHOT_BUILDUP
-       expire snapshots to the retention policy WITHOUT deleting files; the
-       files that freed are recorded (freed_files.py) with their due time
-  4. delete_freed_files                      files earlier expiries freed whose
-       grace (the longest a reader can run) has passed
+With --apply or --approve, one run per table in the order of design decision
+D1 (Retention discussion), under one lease per table (coordinator.py):
+
+  scan        an incremental scan and detection of the table, so decisions are
+              as fresh as the run
+  1 config    approved property changes and tag drops
+  2 deletes   rewrite_position_delete_files for DELETE_FILE_SPRAWL
+  3 rewrites  rewrite_data_files over the flagged partitions (then the delete
+              files it left pointing at nothing), approved spec or sort rewrites
+  4 manifests rewrite_manifests                  MANIFEST_BLOAT
+  5 catch-up  a second incremental scan: the ledger ingests every commit up to
+              now, the writer's and the advisor's own (labelled maintenance)
+  7 expiry    expire_keep_files                  SNAPSHOT_BUILDUP, from the
+              catch-up's findings; the cutoff is capped at the newest snapshot
+              the ledger ingested, so no commit the advisor expires is unseen;
+              files are kept and recorded with their due time (freed_files.py)
+  8 freed     delete_freed_files: recorded files past their grace
+  9 orphans   approved remove_orphan_files, held while freed files wait
+  (6, checkpoint tags, comes later: D5)
+
+Every step checks its own trigger on every run, whether or not anything else
+ran. A failed step skips the rest of that table's steps; the next run starts
+again from its own scan. The lease is renewed before each step; a run that
+loses it stops after the step in progress.
 
 Options come from the same config the scan used, so a flagged partition is
 always one the rewrite will change: target size = the target the scan judged
 by; min-input-files = min_excess_files + 1; delete-file-threshold = 1 when
 deletes are the problem.
 
-Approval and needs-evidence findings are printed as suggested statements but
-never run. Without --apply nothing runs. With --apply the auto statements run
-and each one is recorded in glue.ops.actions (with the table's UUID, so the
-scorecard knows the table has been fixed until it is rebuilt).
+Approval and needs-evidence findings are printed as suggested statements and
+run only when approved (--approve SYMPTOM,...). Each executed step is recorded
+in the actions log (with the table's UUID, so the scorecard knows the table has
+been fixed until it is rebuilt).
 
 Usage (via scripts/run-job.sh py plan.py ...):
-  plan.py [--tables s0,s2_mor_deletes] [--scan-id scan-...] [--apply]
+  plan.py [--tables s0,s2_mor_deletes] [--scan-id scan-...] [--apply] [--approve X,Y]
 """
 import argparse
 import json
@@ -478,6 +493,100 @@ def plan_table(table, findings, tm, cfg, now=None, freed=None):
     return steps
 
 
+# ---------- run order (design decision D1) ----------
+
+# approved suggestions by what they change: configuration first, rewrites with
+# the data passes, expiry and orphans at the end
+APPROVED_PHASE = {"MIXED_SPEC": 3, "POOR_CLUSTERING": 3, "OVER_PARTITIONED": 3,
+                  "RETAINED_STORAGE": 7, "ORPHAN_FILES": 9}
+
+
+def phase_of(step):
+    """The D1 step a planned step belongs to (1-4 before the ledger catch-up,
+    7-9 after it); 0 for holds, which never run."""
+    kind = step["kind"]
+    if kind == "hold":
+        return 0
+    if kind == "rewrite_position_delete_files":
+        return 2 if "DELETE_FILE_SPRAWL" in step["symptoms"] else 3   # else: cleanup after the rewrite
+    if kind == "rewrite_data_files":
+        return 3
+    if kind == "rewrite_manifests":
+        return 4
+    if kind == "expire_keep_files":
+        return 7
+    if kind == "delete_freed_files":
+        return 8
+    if kind == "suggest":
+        planned = step.get("planned_kind")       # advisor.mode turned an auto step into a suggestion
+        if planned:
+            return phase_of(dict(step, kind=planned))
+        return max([APPROVED_PHASE.get(x, 1) for x in step["symptoms"]] or [1])
+    return 1
+
+
+def in_order(steps, phases):
+    """The steps of the given phases, in run order (stable within a phase)."""
+    return sorted((s for s in steps if phase_of(s) in phases), key=phase_of)
+
+
+def cap_expiry(step, ledger_ms):
+    """Expiry never passes what the ledger ingested: older_than is capped at
+    the newest ingested snapshot's time (exclusive, so that snapshot stays).
+    -> the step (a copy when changed). ledger_ms None: ledger unknown, no cap."""
+    if step.get("op") != "expire_keep_files" or ledger_ms is None:
+        return step
+    p = dict(step.get("params") or {})
+    if int(p["older_than_ms"]) <= int(ledger_ms):
+        return step
+    p["older_than_ms"] = int(ledger_ms)
+    return dict(step, params=p,
+                statement=step["statement"].split(", retain_last")[0].rsplit("older than", 1)[0]
+                + f"older than {ts_text(int(ledger_ms))}, retain_last" + step["statement"].split(", retain_last", 1)[1],
+                note=step["note"] + f"; capped at the newest snapshot the ledger ingested ({ts_text(int(ledger_ms))})")
+
+
+def savings_estimate(before, after, results, cost):
+    """Step 10: what this run changed, from the table's metrics at its scan and
+    at the catch-up, with a request-cost estimate when config cost.* is set.
+    before / after: table_metrics rows; results: [(kind, status, result_json)].
+    Fewer files means fewer object reads (GET requests) for every full read of
+    the table; storage comes back only after expiry and the file grace, so it
+    is reported as files freed, not as money (sizes are not recorded yet)."""
+    def files(tm):
+        return int((tm or {}).get("data_files") or 0) + int((tm or {}).get("delete_files") or 0)
+    freed = 0
+    for kind, status, result in results:
+        if kind == "expire_keep_files" and status == "ok":
+            try:
+                freed += int(json.loads(result).get("freed") or 0)
+            except (ValueError, AttributeError):
+                pass
+    out = {"files_before": files(before), "files_after": files(after),
+           "files_removed": max(0, files(before) - files(after)),
+           "metadata_json_bytes_before": (before or {}).get("metadata_json_bytes"),
+           "metadata_json_bytes_after": (after or {}).get("metadata_json_bytes"),
+           "files_freed_for_deletion": freed}
+    cost = cost or {}
+    scans = float(cost.get("full_reads_per_day") or 0)
+    get_usd = float(cost.get("get_usd_per_1000") or 0)
+    if scans and get_usd:
+        req = out["files_removed"] * scans * 30
+        out["requests_saved_per_month"] = int(req)
+        out["usd_saved_per_month_requests"] = round(req / 1000.0 * get_usd, 4)
+        out["assumption"] = f"{scans:g} full reads a day at {get_usd:g} USD per 1,000 GET requests"
+    return out
+
+
+def savings_text(e):
+    t = (f"files {e['files_before']} -> {e['files_after']} ({e['files_removed']} fewer)"
+         f"; {e['files_freed_for_deletion']} files freed, deleted after the grace")
+    if e.get("usd_saved_per_month_requests") is not None:
+        t += (f"; ~{e['requests_saved_per_month']:,} fewer GET requests a month"
+              f" (~{e['usd_saved_per_month_requests']:g} USD; {e['assumption']})")
+    return t
+
+
 DANGLING = "'remove-dangling-deletes', 'true'"
 
 
@@ -571,7 +680,6 @@ def match_tables(all_tables, wanted):
 
 def main():
     import gl_common as gl
-    import probes
     from pyspark.sql import SparkSession
 
     p = argparse.ArgumentParser()
@@ -582,6 +690,8 @@ def main():
                    help="comma-separated symptoms whose suggested (approval) statements to run, "
                         "e.g. MIXED_SPEC,ORPHAN_FILES; recorded in glue.ops.actions as approved")
     p.add_argument("--config", default=os.path.join(HERE, "config", "health.json"))
+    p.add_argument("--profile", default="", help="profile JSON whose coordination backend holds the "
+                                                "table leases (default config/profile.json)")
     a = p.parse_args()
 
     config = gl.load_config(a.config)
@@ -619,109 +729,189 @@ def main():
     if getattr(store, "iceberg", True):
         ff.ensure_table(spark, ns)
     store.preload(ff.KIND)
-    records = []
-    for t in tables:
-        t_uuid = tms[t].get("table_uuid")
-        freed = ff.summary(store.range(ff.KIND, (t_uuid,)), ff.now_ms()) if t_uuid else None
-        steps = plan_table(t, findings.get(t, []), tms[t], gl.table_config(config, t), freed=freed)
-        print(f"\n--- {t}: {'nothing to do' if not steps else ''}", flush=True)
-        for s in steps:
-            tag = "RUN " if s["auto"] else ("HOLD" if s["kind"] == "hold" else "ASK ")
-            print(f"  [{tag}] {s['kind']:18} {', '.join(s['symptoms'])}\n         {s['note']}", flush=True)
-            if s["statement"]:
-                print(f"         {s['statement']}", flush=True)
-        if not (a.apply or approve):
-            continue
-        uuid = probes.table_info(spark, t).get("uuid")
-        cfg_t = gl.table_config(config, t)
-        if advisor_mode(json.loads(tms[t].get("properties_json") or "{}"), cfg_t) == "off":
-            print(f"  advisor.mode=off: skipped", flush=True)
-            continue
-        ident_t = _ident(t)
-        for s in steps:
-            approved = (not s["auto"] and s["kind"] == "suggest" and s["statement"]
-                        and approve & set(s["symptoms"]))
-            if not ((s["auto"] and a.apply) or approved):
-                continue
-            now = datetime.now(timezone.utc)
-            cutoff = now.timestamp() - float(cfg_t.get("orphan_min_age_minutes", 4320)) * 60
-            cutoff_txt = datetime.fromtimestamp(cutoff, timezone.utc).strftime('%Y-%m-%d %H:%M:%S') + "+00:00"
-            text = (s["statement"]
-                    .replace("{now}", f"TIMESTAMP '{now.strftime('%Y-%m-%d %H:%M:%S')}+00:00'")
-                    .replace("{orphan_cutoff}", "TIMESTAMP '"
-                             + datetime.fromtimestamp(cutoff, timezone.utc).strftime('%Y-%m-%d %H:%M:%S') + "+00:00'"))
-            # The +00:00 matters: a bare TIMESTAMP literal is read in the Spark session's
-            # time zone; off UTC, the orphan cutoff would move (later = younger files deleted).
-            kind = s["kind"] if s["auto"] else "approved:" + ",".join(s["symptoms"])
-            if s.get("op"):
-                # Python actions (freed_files.py): expiry that keeps files, deferred deletion
-                before = current_snapshot(spark, t)
-                status, result, dur = run_op(spark, s, t, uuid or t_uuid, store, run_id)
-                after = current_snapshot(spark, t)
-                print(f"  -> {kind}: {status} in {dur}s  snapshot {before} -> {after}  {result[:300]}", flush=True)
-                records.append(dict(run_id=run_id, scan_id=tms[t]["scan_id"], started_at=now,
-                                          table_name=t, table_uuid=uuid, kind=kind,
-                                          symptoms=",".join(s["symptoms"]), statement=s["statement"],
-                                          status=status, duration_s=float(dur), result_json=result,
-                                          snapshot_before=before, snapshot_after=after, rollback_hint=None))
-                if status != "ok":
-                    break
-                continue
-            for stmt in [x.strip() for x in text.split("; ") if x.strip()]:   # suggestions may hold several
-                before = current_snapshot(spark, t)
-                age_min = float(cfg_t.get("orphan_min_age_minutes", 4320))
-                if "remove_orphan_files" in stmt and age_min < PROCEDURE_MIN_ORPHAN_MINUTES:
-                    # Test scale: the procedure refuses a cutoff under 24 h, the action API doesn't.
-                    stmt = (f"SparkActions.deleteOrphanFiles({ident_t}).olderThan({cutoff_txt})"
-                            f".usePrefixListing(true)  -- action API: orphan_min_age_minutes={age_min:g} "
-                            f"is under the procedure's 24 h floor")
-                    status, result, dur = remove_orphans_action(spark, t, cutoff * 1000)
-                else:
-                    status, result, dur = run_sql(spark, stmt)
-                if status == "failed" and "prefix_listing" in stmt and "prefix_listing" in result:
-                    stmt = stmt.replace(", prefix_listing => true", "")       # older Iceberg: no such arg
-                    status, result, dur = run_sql(spark, stmt)
-                after = current_snapshot(spark, t)
-                hint = rollback_hint(ident_t, before, after) if status == "ok" else None
-                print(f"  -> {kind}: {status} in {dur}s  snapshot {before} -> {after}  {result[:300]}",
-                      flush=True)
-                records.append(dict(run_id=run_id, scan_id=tms[t]["scan_id"], started_at=now,
-                                          table_name=t, table_uuid=uuid, kind=kind,
-                                          symptoms=",".join(s["symptoms"]), statement=stmt, status=status,
-                                          duration_s=float(dur), result_json=result,
-                                          snapshot_before=before, snapshot_after=after, rollback_hint=hint))
-                if status != "ok":
-                    break
-            if status == "failed" and DANGLING in stmt and _unsupported_option(result):
-                # Older Iceberg: retry without the option (the next step,
-                # rewrite_position_delete_files, still cleans up the deletes).
-                retry = strip_dangling_option(stmt)
-                before = current_snapshot(spark, t)
-                status, result, dur = run_sql(spark, retry)
-                after = current_snapshot(spark, t)
-                print(f"  -> {s['kind']} (retry without remove-dangling-deletes): {status} in {dur}s  "
-                      f"{result[:300]}", flush=True)
-                records.append(dict(run_id=run_id, scan_id=tms[t]["scan_id"],
-                                          started_at=datetime.now(timezone.utc), table_name=t,
-                                          table_uuid=uuid, kind=s["kind"], symptoms=",".join(s["symptoms"]),
-                                          statement=retry, status=status, duration_s=float(dur),
-                                          result_json=result, snapshot_before=before, snapshot_after=after,
-                                          rollback_hint=rollback_hint(ident_t, before, after)
-                                          if status == "ok" else None))
-    if (a.apply or approve) and records:
-        log.append("actions", records)
-        log.flush()                      # the log first, then the state the next scan reads
-        scan_state.ensure_tables(spark, ns, store)
-        scan_state.record_actions(store, records, datetime.now(timezone.utc))
-        store.flush()
-        print(f"\nRecorded {len(records)} actions in the actions log under {run_id} (with snapshot "
-              f"before/after and a rollback statement each). Run make gl-scan to check the result.",
-              flush=True)
-    elif not (a.apply or approve):
+    if not (a.apply or approve):
+        for t in tables:
+            t_uuid = tms[t].get("table_uuid")
+            freed = ff.summary(store.range(ff.KIND, (t_uuid,)), ff.now_ms()) if t_uuid else None
+            print_steps(t, plan_table(t, findings.get(t, []), tms[t], gl.table_config(config, t), freed=freed))
         print("\nDry run: nothing changed. APPLY=1 runs the RUN steps; APPROVE=<SYMPTOM,...> runs "
-              "the ASK steps for those symptoms.", flush=True)
+              "the ASK steps for those symptoms. Either one scans each table again first and runs "
+              "the steps in the D1 order (see plan.py).", flush=True)
+        spark.stop()
+        return
+
+    import coordinator as coordination
+    import profiles
+    path = a.profile or os.path.join(HERE, "config", "profile.json")
+    profile = profiles.load_profile(path) if os.path.exists(path) else None
+    coord = coordination.make(profile, run_id)
+    ttl = int(float((config.get("defaults") or {}).get("lease_minutes", 30)) * 60)
+    total = 0
+    for t in tables:
+        recs = run_table(spark, t, config, coord, ttl, run_id, a.apply, approve, store, log)
+        if recs:
+            log.append("actions", recs)
+            log.flush()                  # the log first, then the state the next scan reads
+            scan_state.ensure_tables(spark, ns, store)
+            scan_state.record_actions(store, [r for r in recs if r["kind"] != "estimate"],
+                                      datetime.now(timezone.utc))
+            store.flush()
+            total += len(recs)
+    print(f"\nRecorded {total} actions in the actions log under {run_id} (with snapshot before/after, "
+          f"a rollback statement each, and one estimate per table that changed).", flush=True)
     spark.stop()
 
+
+def print_steps(t, steps, title=None):
+    print(f"\n--- {t}{(': ' + title) if title else ''}: {'nothing to do' if not steps else ''}", flush=True)
+    for s in steps:
+        tag = "RUN " if s["auto"] else ("HOLD" if s["kind"] == "hold" else "ASK ")
+        print(f"  [{tag}] {s['kind']:18} {', '.join(s['symptoms'])}\n         {s['note']}", flush=True)
+        if s["statement"]:
+            print(f"         {s['statement']}", flush=True)
+
+
+def _scanned(spark, scan_id, table, config, findings):
+    """(the table's metrics row, its findings) from a scan and detection in this job."""
+    import scan_metrics as sm
+    tms, _ = sm.scan_results(spark, scan_id, None, config)
+    tm = next((dict(r) for r in tms if r["table_name"] == table), None)
+    return tm, [f for f in findings if f["table_name"] == table]
+
+
+def run_table(spark, t, config, coord, ttl, run_id, apply, approve, store, log):
+    """One table through the D1 run order under its lease. -> action records."""
+    import freed_files as ff
+    import gl_common as gl
+    import ledger as ledger_mod
+    import state_store as ss
+    from detect_symptoms import run_detect
+    from scan_metrics import run_scan
+
+    cfg_t = gl.table_config(config, t)
+    ns, short = t.rsplit(".", 1)
+    recs, results = [], []
+    if not coord.claim_table(t, "run", ttl):
+        print(f"\n--- {t}: another run holds its lease; skipped", flush=True)
+        return recs
+
+    def renew():
+        if coord.claim_table(t, "run", ttl):
+            return True
+        print(f"  lease lost (another run took the table over): the rest of {t} is skipped", flush=True)
+        return False
+
+    try:
+        # scan: the decisions are as fresh as the run
+        sid = run_scan(spark, ns, config, tables=[short], report=False, housekeeping=False)
+        before, found = _scanned(spark, sid, t, config, run_detect(spark, sid, config, report=False))
+        if not before or before.get("scan_mode") == "failed":
+            print(f"\n--- {t}: scan failed; nothing runs", flush=True)
+            return recs
+        if advisor_mode(json.loads(before.get("properties_json") or "{}"), cfg_t) == "off":
+            print(f"\n--- {t}: advisor.mode=off: skipped", flush=True)
+            return recs
+        uuid = before.get("table_uuid")
+        freed = ff.summary(store.range(ff.KIND, (uuid,)), ff.now_ms()) if uuid else None
+        steps = plan_table(t, found, before, cfg_t, freed=freed)
+        print_steps(t, in_order(steps, (0, 1, 2, 3, 4)), "steps 1-4 (scan " + sid + ")")
+        kw = dict(apply=apply, approve=approve, cfg_t=cfg_t, uuid=uuid, store=store, run_id=run_id,
+                  renew=renew, recs=recs, results=results)
+        if not exec_steps(spark, t, in_order(steps, (1, 2, 3, 4)), scan_id=sid, **kw):
+            return recs
+        if not renew():
+            return recs
+        # 5: ledger catch-up, the writer's commits and the advisor's own
+        sid2 = run_scan(spark, ns, config, tables=[short], report=False, housekeeping=False)
+        after, found2 = _scanned(spark, sid2, t, config, run_detect(spark, sid2, config, report=False))
+        ledger_ms = None
+        if uuid and ledger_mod.mode_of(config) == "on":
+            st = ss.make_state_store(spark, config).get("ledger_state", (uuid,))
+            ledger_ms = int(st["last_ts_ms"]) if st and st.get("last_ts_ms") is not None else None
+        print(f"  catch-up (scan {sid2}): ledger at "
+              f"{ts_text(ledger_ms) if ledger_ms is not None else 'unknown (ledger off): expiry not capped'}",
+              flush=True)
+        freed2 = ff.summary(store.range(ff.KIND, (uuid,)), ff.now_ms()) if uuid else None
+        late = [cap_expiry(s, ledger_ms) for s in
+                in_order(plan_table(t, found2, after or before, cfg_t, freed=freed2), (7, 8, 9))]
+        print_steps(t, late, "steps 7-9 after the catch-up")
+        exec_steps(spark, t, late, scan_id=sid2, **kw)
+        # 10: what the run changed
+        if results:
+            est = savings_estimate(before, after, results, cfg_t.get("cost"))
+            print(f"  estimate: {savings_text(est)}", flush=True)
+            recs.append(dict(run_id=run_id, scan_id=sid2, started_at=datetime.now(timezone.utc), table_name=t,
+                             table_uuid=uuid, kind="estimate", symptoms="", statement="savings estimate (step 10)",
+                             status="ok", duration_s=0.0, result_json=json.dumps(est), snapshot_before=None,
+                             snapshot_after=None, rollback_hint=None))
+    finally:
+        coord.release_table(t, "run")
+    return recs
+
+
+def exec_steps(spark, t, steps, *, apply, approve, cfg_t, uuid, scan_id, store, run_id, renew, recs, results):
+    """Run the steps in order; record each. False when one failed or the lease
+    was lost (the rest of the table's steps are skipped)."""
+    ident_t = _ident(t)
+    for s in steps:
+        approved = (not s["auto"] and s["kind"] == "suggest" and s["statement"]
+                    and approve & set(s["symptoms"]))
+        if not ((s["auto"] and apply) or approved):
+            continue
+        if not renew():
+            return False
+        now = datetime.now(timezone.utc)
+        cutoff = now.timestamp() - float(cfg_t.get("orphan_min_age_minutes", 4320)) * 60
+        cutoff_txt = datetime.fromtimestamp(cutoff, timezone.utc).strftime('%Y-%m-%d %H:%M:%S') + "+00:00"
+        text = (s["statement"]
+                .replace("{now}", f"TIMESTAMP '{now.strftime('%Y-%m-%d %H:%M:%S')}+00:00'")
+                .replace("{orphan_cutoff}", f"TIMESTAMP '{cutoff_txt}'"))
+        # The +00:00 matters: a bare TIMESTAMP literal is read in the Spark session's
+        # time zone; off UTC, the orphan cutoff would move (later = younger files deleted).
+        kind = s["kind"] if s["auto"] else "approved:" + ",".join(s["symptoms"])
+
+        def record(stmt, status, result, dur, before, after, hint):
+            print(f"  -> {kind}: {status} in {dur}s  snapshot {before} -> {after}  {result[:300]}", flush=True)
+            recs.append(dict(run_id=run_id, scan_id=scan_id, started_at=now, table_name=t, table_uuid=uuid,
+                             kind=kind, symptoms=",".join(s["symptoms"]), statement=stmt, status=status,
+                             duration_s=float(dur), result_json=result, snapshot_before=before,
+                             snapshot_after=after, rollback_hint=hint))
+            results.append((s.get("op") or s["kind"], status, result))
+
+        if s.get("op"):
+            # Python actions (freed_files.py): expiry that keeps files, deferred deletion
+            before = current_snapshot(spark, t)
+            status, result, dur = run_op(spark, s, t, uuid, store, run_id)
+            record(s["statement"], status, result, dur, before, current_snapshot(spark, t), None)
+            if status != "ok":
+                return False
+            continue
+        status = "ok"
+        for stmt in [x.strip() for x in text.split("; ") if x.strip()]:   # suggestions may hold several
+            before = current_snapshot(spark, t)
+            age_min = float(cfg_t.get("orphan_min_age_minutes", 4320))
+            if "remove_orphan_files" in stmt and age_min < PROCEDURE_MIN_ORPHAN_MINUTES:
+                # Test scale: the procedure refuses a cutoff under 24 h, the action API doesn't.
+                stmt = (f"SparkActions.deleteOrphanFiles({ident_t}).olderThan({cutoff_txt})"
+                        f".usePrefixListing(true)  -- action API: orphan_min_age_minutes={age_min:g} "
+                        f"is under the procedure's 24 h floor")
+                status, result, dur = remove_orphans_action(spark, t, cutoff * 1000)
+            else:
+                status, result, dur = run_sql(spark, stmt)
+            if status == "failed" and "prefix_listing" in stmt and "prefix_listing" in result:
+                stmt = stmt.replace(", prefix_listing => true", "")       # older Iceberg: no such arg
+                status, result, dur = run_sql(spark, stmt)
+            if status == "failed" and DANGLING in stmt and _unsupported_option(result):
+                # Older Iceberg: retry without the option (the delete-file cleanup
+                # that follows still removes the deletes).
+                stmt = strip_dangling_option(stmt)
+                status, result, dur = run_sql(spark, stmt)
+            after = current_snapshot(spark, t)
+            record(stmt, status, result, dur, before, after,
+                   rollback_hint(ident_t, before, after) if status == "ok" else None)
+            if status != "ok":
+                return False
+    return True
 
 if __name__ == "__main__":
     main()

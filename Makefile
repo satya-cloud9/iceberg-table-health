@@ -102,7 +102,8 @@ gl-demo:
 #                                    TRACE=a,b for several; add SCAN_ARGS=--full to force the full-measure path
 #   make gl-scan SCAN_ARGS="--tables s19_partition_churn"   scan only some tables (no trace)
 #   make gl-plan T=s0                print the fix plan for s0 from the latest scan (dry run)
-#   make gl-plan T=s0 APPLY=1        run the plan's auto steps -> glue.ops.actions
+#   make gl-plan T=s0 APPLY=1        one run per table (D1): scan, auto steps, ledger catch-up, expiry
+#                                    capped at the ledger, freed files, estimate -> the actions log
 #   make gl-step STEP=s12-mor        scripted approval step for a scenario (see scenario_step.py)
 #   make gl-plan T=s14 APPROVE=MIXED_SPEC   run the plan's ASK statements for those symptoms
 #   make gl-sql Q="SELECT ... ; ALTER ..."  run ad-hoc Spark SQL against the catalog

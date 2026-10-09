@@ -272,7 +272,8 @@ def backfill_fixed(store, log):
         print(f"  (fix history not filled: {type(e).__name__}: {str(e)[:120]})", flush=True)
         return 0
     hist = {}
-    for a in sorted((a for a in rows if a.get("table_uuid") in todo and a.get("started_at")),
+    for a in sorted((a for a in rows if a.get("table_uuid") in todo and a.get("started_at")
+                     and a.get("kind") not in REPORT_KINDS),
                     key=lambda a: to_ms(a["started_at"])):
         if a.get("status") != "ok":
             continue
@@ -290,12 +291,15 @@ def backfill_fixed(store, log):
     return len(todo)
 
 
+REPORT_KINDS = {"estimate"}      # logged with the actions, but not actions (plan.py step 10)
+
+
 def record_actions(store, records, now):
     """Fold action records (the rows logged to actions) into action_state, one
-    row per table. Records without a table UUID are skipped."""
+    row per table. Records without a table UUID, and report rows, are skipped."""
     by_uuid = {}
     for r in records:
-        if r.get("table_uuid"):
+        if r.get("table_uuid") and r.get("kind") not in REPORT_KINDS:
             by_uuid.setdefault(r["table_uuid"], []).append(r)
     for uuid, acts in by_uuid.items():
         store.put("action_state", action_row(store.get("action_state", (uuid,)), uuid,
