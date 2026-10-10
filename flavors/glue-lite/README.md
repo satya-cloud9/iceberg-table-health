@@ -1864,7 +1864,18 @@ shorter window would still keep (`expiry.retained_what_if_hours`, 72 / 24 /
 |---|---|---|
 | some, and SNAPSHOT_BUILDUP's expiry is planned | approval | a NOTE: covered by that expiry (same policy); the next scan reports what is still kept |
 | some, no expiry planned | approval | ASK: expire to the policy (APPROVE=RETAINED_STORAGE) |
-| none | advisory | a NOTE with the numbers: shorten the policy (what each shorter window would keep), and, when writers' overwrites keep more than rewrites, switch them to merge-on-read |
+| none | advisory | a NOTE with the numbers: shorten the policy (what each shorter window would keep), lower the minimum kept (what 5, 3 or 1 would keep), and, when writers' overwrites keep more than rewrites, switch them to merge-on-read |
+
+**The minimum kept can be what holds them.** First cluster run (2026-10-10):
+s12, s14, s19 and s2 each had exactly 10 snapshots, older than the 120 h
+policy but kept as the newest 10 (`min_snapshots` 10), so no shorter window
+would free anything and the first advice priced 72 / 24 / 6 h at the full
+amount. The advice now says when snapshots past the age limit stay only
+because of the minimum (on a table that stops committing they stay until it
+is lowered), prices lower minimums (`expiry.retained_what_if_keep`, 5 / 3 /
+1) and leaves out windows that would change nothing. When compaction's copy
+is most of it (s2, s14), it says so: that copy goes once its snapshots leave
+the window and the minimum.
 
 An advisory finding is never run or approved, and the scorecard ignores it
 (as other advisory findings), so a table whose old snapshots are all inside
@@ -1879,6 +1890,6 @@ To check on the cluster:
 ```
 make gl-image
 make gl-scan                       # s12, s14, s19, s2: RETAINED_STORAGE:advisory with the numbers
-make gl-plan T=s12                 # [NOTE] advice: ... Options: shorten the policy ...; or switch the writers to merge-on-read
+make gl-plan T=s12                 # [NOTE] advice: ... Options: lower the minimum kept: 5 would keep ...; or switch the writers to merge-on-read
 make gl-plan T=s19
 ```

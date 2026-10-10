@@ -27,7 +27,7 @@ import re
 import gltrace as tr
 import holds as hl
 
-RULE_VERSION = "d3-1"
+RULE_VERSION = "d3-2"
 
 # symptom -> (category, level, action, remedy)
 CATALOG = {
@@ -553,19 +553,35 @@ def retained_remedy(ev):
     if n is None:
         return (f"{head}: expire to the retention policy now; if it stays high inside the policy, "
                 f"shorten the policy (history.expire.max-snapshot-age-ms)")
-    parts = [f"{head}, all inside {pol_txt}: no expiry would free it"]
+    parts = [f"{head}, none of it expirable under {pol_txt}: no expiry would free it"]
     by_op = ev.get("retained_by_operation") or {}
     writers = sum(v for k, v in by_op.items() if k != "replace")
     rewrites = by_op.get("replace", 0)
     if by_op:
         parts.append(f"writers' overwrites and deletes keep {_mib(writers)}, rewrites (compaction) {_mib(rewrites)}")
     options = []
-    shorter = [w for w in (ev.get("what_if") or []) if w.get("retained_bytes") is not None]
+    total = ev["retained_bytes"]
+    keep = ev.get("policy_min_keep")
+    shorter = [w for w in (ev.get("what_if") or []) if w.get("retained_bytes") is not None
+               and w["retained_bytes"] < total]
+    fewer = [w for w in (ev.get("what_if_keep") or []) if w.get("retained_bytes") is not None
+             and w["retained_bytes"] < total]
+    if ev.get("held_by_min_keep"):
+        parts.append(f"snapshots past the age limit stay because they are among the last {keep} kept whatever "
+                     f"their age (min-snapshots), so on a table that stops committing they stay until the "
+                     f"minimum is lowered")
     if shorter:
         options.append("shorten the policy (history.expire.max-snapshot-age-ms): " + ", ".join(
             f"{w['hours']:g} h would keep {_mib(w['retained_bytes'])}" for w in shorter))
-    else:
-        options.append("shorten the policy (history.expire.max-snapshot-age-ms)")
+    if fewer:
+        options.append("lower the minimum kept (history.expire.min-snapshots-to-keep): " + ", ".join(
+            f"{w['keep']} would keep {_mib(w['retained_bytes'])}" for w in fewer))
+    if not shorter and not fewer:
+        options.append("shorten the policy (history.expire.max-snapshot-age-ms) or lower the minimum kept "
+                       "(history.expire.min-snapshots-to-keep)")
+    if rewrites > writers:
+        parts.append("most of it is the copy compaction left behind, which goes once those snapshots leave "
+                     "the window and the minimum kept")
     if writers and writers >= rewrites:
         w24 = ev.get("writer_removed_24h")
         options.append("switch the writers to merge-on-read (write.merge.mode, write.update.mode, "
@@ -607,6 +623,8 @@ def storage_findings(table, tm, th):
                 ev["retained_by_operation"] = detail.get("by_operation")
                 ev["writer_removed_24h"] = detail.get("writer_removed_24h")
                 ev["what_if"] = detail.get("what_if")
+                ev["what_if_keep"] = detail.get("what_if_keep")
+                ev["held_by_min_keep"] = detail.get("held_by_min_keep")
             f = _finding(table, "RETAINED_STORAGE", share / th.get("retained_storage_min_share", 1.0), ev,
                          remedy=retained_remedy(ev))
             if tm.get("expirable_snapshots") == 0:

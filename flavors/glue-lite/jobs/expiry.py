@@ -182,7 +182,7 @@ def retained_from_summaries(snaps, refs, current):
     return total, f"summary formula over {len(chain)} snapshots"
 
 
-def retained_detail(snaps, refs, current, now_ms, policy, what_if_hours=(72, 24, 6)):
+def retained_detail(snaps, refs, current, now_ms, policy, what_if_hours=(72, 24, 6), what_if_keep=(5, 3, 1)):
     """Where the retained bytes come from and what a shorter policy would keep,
     from the same summary formula (RETAINED_STORAGE advice). -> dict or None
     when the formula doesn't hold (see retained_from_summaries).
@@ -193,6 +193,11 @@ def retained_detail(snaps, refs, current, now_ms, policy, what_if_hours=(72, 24,
                      copy-on-write MERGE, UPDATE or DELETE copies whole files)
       writer_removed_24h   bytes writers removed in the last 24 h: what each day
                      of retention costs while they keep writing like this
+      held_by_min_keep   some retained snapshots are past the age limit and kept
+                     only because they are among the newest min_keep: no
+                     shorter window frees them, only a lower minimum does
+      what_if_keep   [{keep, retained_bytes}] for minimums lower than the
+                     policy's, at the policy's age
       what_if        [{hours, retained_bytes}] for windows shorter than the
                      policy: what would still be retained right after an
                      expiry to that window (min_keep still kept)."""
@@ -212,13 +217,21 @@ def retained_detail(snaps, refs, current, now_ms, policy, what_if_hours=(72, 24,
             by_op[s["operation"]] = by_op.get(s["operation"], 0) + removed(s)
     w24 = sum(removed(by_id[sid]) for sid in chain
               if by_id[sid]["operation"] != "replace" and by_id[sid]["ts_ms"] >= now_ms - 24 * H)
-    def kept_after(h):
-        kept = [sid for i, sid in enumerate(chain)
-                if i < max(int(policy["min_keep"]), 1) or by_id[sid]["ts_ms"] >= now_ms - h * H]
+    def kept_after(h, keep=None):
+        k = max(int(policy["min_keep"] if keep is None else keep), 1)
+        kept = [sid for i, sid in enumerate(chain) if i < k or by_id[sid]["ts_ms"] >= now_ms - h * H]
         return sum(removed(by_id[sid]) for sid in kept[:-1])
 
-    inside = kept_after(float(policy["age_h"]))
+    age_h = float(policy["age_h"])
+    inside = kept_after(age_h)
     what_if = [{"hours": h, "retained_bytes": kept_after(h)}
-               for h in sorted({float(x) for x in what_if_hours}, reverse=True) if h < float(policy["age_h"])]
+               for h in sorted({float(x) for x in what_if_hours}, reverse=True) if h < age_h]
+    # the minimum kept holds snapshots whatever their age: on a table that stops
+    # committing, the last min_keep snapshots (and what they pin) stay forever
+    what_if_keep = [{"keep": k, "retained_bytes": kept_after(age_h, k)}
+                    for k in sorted({int(x) for x in what_if_keep}, reverse=True) if k < int(policy["min_keep"])]
+    held_by_min_keep = any(by_id[sid]["ts_ms"] < now_ms - age_h * H for sid in chain[1:])
     return {"retained_bytes": total, "expirable_bytes": total - inside, "inside_policy_bytes": inside,
+            "held_by_min_keep": held_by_min_keep, "min_keep": int(policy["min_keep"]),
+            "what_if_keep": what_if_keep,
             "by_operation": by_op, "writer_removed_24h": w24, "what_if": what_if}
