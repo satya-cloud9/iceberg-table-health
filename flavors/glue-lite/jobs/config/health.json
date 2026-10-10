@@ -7,6 +7,7 @@
     "undersized_partition_ratio": 0.10,
     "hot_partition_minutes": 3,
     "keep_full_copies": 1,
+    "compaction": {"_comment": "Tier rule (plan item 12, family incremental.tiering). Fragment: a data file under target_file_bytes / fragment_ratio; undersized segment: from there up to small_file_ratio x target. Per partition not held by a conflict: cold (no writer commit for cold_hours) -> one major pass (fragments and undersized segments into right-sized files); warm -> a minor pass over the fragments only once there are minor_min_fragments of them or the oldest has waited minor_max_wait_hours (and there are at least 2); else wait (SMALL_FILES defer). A table's advisor.compact.cold-hours / advisor.compact.minor-max-wait-hours win for the two times. Tiered passes run with partial progress (rewrite.tier_partial_progress_max_commits) and rewrite-job-order bytes-desc. TEST SCALE times 0.1 h; production 6 h cold, 8 h minor wait (agreed 2026-10-09).", "fragment_ratio": 8, "minor_min_fragments": 8, "minor_max_wait_hours": 0.1, "cold_hours": 0.1},
     "recent_commits": 50,
     "filter_columns": [],
     "filter_columns_evidence": "declared",
@@ -92,7 +93,7 @@
       "min_input_files": null,
       "max_partitions_per_run": 10,
       "partial_progress_min_files": 500,
-      "partial_progress_max_commits": 10,
+      "partial_progress_max_commits": 10, "tier_partial_progress_max_commits": 3,
       "max_concurrent_file_group_rewrites": 2,
       "expire_retain_last": 5
     }
@@ -105,6 +106,7 @@
     "new_findings": "on",
     "expiry_policy": "on",
     "writer_findings": "shadow",
+    "tiering": "shadow",
     "churn_window_h": 24,
     "hot_gap_factor": 2.0,
     "hot_cap_minutes": 1440,

@@ -219,6 +219,99 @@ def ts_text(ms):
     return datetime.fromtimestamp(ms / 1000.0, timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + "+00:00"
 
 
+def _rewrite_step(chosen, kind, skipped, active, names, tm, cfg, th, rw, ident, fields, target, now):
+    """One rewrite_data_files step over the chosen partitions. kind: None (no tier
+    rule: today's options), "major" (fragments and undersized segments, deletes,
+    oversized files) or "minor" (fragments only); tiered passes run with partial
+    progress (max-commits 3) and the largest groups first."""
+    preds, unsupported, widened = [], [], set()
+    for key, _ in chosen:
+        pr = partition_predicate(key, fields, widened)
+        if pr is None:
+            unsupported.append(key)
+        elif f"({pr})" not in preds:              # widened keys can collapse to one
+            preds.append(f"({pr})")
+    syms = sorted(set().union(*(v["symptoms"] for _, v in chosen)))
+    if "SCATTERED_SMALL_FILES" in names and kind != "minor":
+        syms.append("SCATTERED_SMALL_FILES")
+    keys = dict(chosen)
+    evs = [json.loads(f.get("evidence_json") or "{}") for f in active if f.get("partition_key") in keys]
+    if kind == "minor":
+        # fragments only: files under target / fragment_ratio are the candidates,
+        # nothing is too big, groups need as many fragments as made the pass worth it
+        ratio = float((cfg.get("compaction") or {}).get("fragment_ratio", 8))
+        frags = [int(e.get("fragments") or 0) for e in evs if e.get("tier_pass") == "minor"]
+        min_frags = int((cfg.get("compaction") or {}).get("minor_min_fragments", 8))
+        opts = {"target-file-size-bytes": str(target),
+                "min-file-size-bytes": str(int(target / ratio)),
+                "max-file-size-bytes": str(1 << 62),
+                "min-input-files": str(max(2, min([min_frags] + frags))),
+                "max-concurrent-file-group-rewrites": str(rw.get("max_concurrent_file_group_rewrites", 2))}
+    else:
+        min_input = rw.get("min_input_files") or int(th["min_excess_files"]) + 1
+        # the band detection judged by (small / oversized ratios), passed explicitly so
+        # the rewrite picks exactly the files the scan flagged even if the ratios change
+        opts = {"target-file-size-bytes": str(target),
+                "min-file-size-bytes": str(int(target * float(cfg.get("small_file_ratio", 0.75)))),
+                "max-file-size-bytes": str(int(target * float(cfg.get("oversized_file_ratio", 1.8)))),
+                "min-input-files": str(min_input),
+                "max-concurrent-file-group-rewrites": str(rw.get("max_concurrent_file_group_rewrites", 2))}
+    per_part = {}
+    for f in active:
+        if f.get("partition_key") in keys:
+            n = int(json.loads(f.get("evidence_json") or "{}").get("data_files", 0))
+            per_part[f["partition_key"]] = max(per_part.get(f["partition_key"], 0), n)
+    files_in_scope = sum(per_part.values())
+    if kind:
+        opts["partial-progress.enabled"] = "true"
+        opts["partial-progress.max-commits"] = str(rw.get("tier_partial_progress_max_commits", 3))
+        opts["rewrite-job-order"] = "bytes-desc"
+    elif files_in_scope >= int(rw.get("partial_progress_min_files", 500)):
+        opts["partial-progress.enabled"] = "true"
+        opts["partial-progress.max-commits"] = str(rw.get("partial_progress_max_commits", 10))
+    if any("DELETE_BUILDUP" in v["symptoms"] for _, v in chosen):
+        opts["delete-file-threshold"] = "1"        # pick up files with any delete
+        opts["remove-dangling-deletes"] = "true"   # drop delete files left pointing at nothing
+    note = []
+    if kind:
+        note.append(f"{kind} pass")
+    if skipped:
+        note.append(f"{len(skipped)} more flagged partitions left for the next run "
+                    f"(budget {int(rw.get('max_partitions_per_run', 10))})")
+    if unsupported:
+        note.append(f"{len(unsupported)} partitions skipped: transform can't be scoped by a range")
+    if widened:
+        note.append(f"scope widened over {', '.join(sorted(widened))} (bucket/truncate can't be a range)")
+    appending = [e for e in evs if e.get("appends_continue")]
+    if preds == ["(TRUE)"] and cfg.get("time_column") and appending:
+        # an unpartitioned table still being appended to: appends don't
+        # conflict with the rewrite, but files written in the hot window are
+        # likely to have neighbours soon; rewrite only rows older than it
+        mins = float(appending[0].get("compact_older_than_min") or cfg.get("hot_partition_minutes", 15))
+        older = (now or datetime.now(timezone.utc)) - timedelta(minutes=mins)
+        preds = [f"({cfg['time_column']} < TIMESTAMP '{older.strftime('%Y-%m-%d %H:%M:%S')}')"]
+        note.append(f"appends continue: only rows older than {mins:g} min ({cfg['time_column']})")
+    if not preds:
+        return None
+    where = "" if "(TRUE)" in preds else \
+        f"where => \"{_sql_str(' OR '.join(preds))}\", "   # TRUE: whole table, no where
+    opt_sql = ", ".join(f"'{k}', '{v}'" for k, v in opts.items())
+    # honor the table's sort order: binpack would concatenate sorted files
+    # unsorted and widen every output file's value range (a minor sorts only the fragments)
+    strategy = "sort" if tm.get("sort_order_defined") else "binpack"
+    if strategy == "sort":
+        note.append("sort strategy: the table has a sort order")
+    step = {"kind": "rewrite_data_files", "auto": True, "symptoms": syms, "where": where,
+            "statement": (f"CALL glue.system.rewrite_data_files(table => '{ident}', "
+                          f"strategy => '{strategy}', {where}"
+                          f"options => map({opt_sql}))"),
+            "note": "; ".join(note[:1] + [f"{len(chosen)} partitions, ~{files_in_scope} files"] + note[1:])
+            if kind else ("; ".join(note) or f"{len(chosen)} partitions, ~{files_in_scope} files")}
+    if kind:
+        step["tier_pass"] = kind
+    return step
+
+
 def plan_table(table, findings, tm, cfg, now=None, freed=None):
     """-> list of steps: dict(kind, auto, symptoms, statement, note[, op, params]).
     freed: freed_files.summary() of this table's recorded files, or None.
@@ -232,80 +325,32 @@ def plan_table(table, findings, tm, cfg, now=None, freed=None):
     names = {f["symptom"] for f in active}
     steps = []
 
-    # 1. binpack over flagged partitions
+    # 1. binpack over flagged partitions. With the tier rule (item 12) each
+    # partition's SMALL_FILES says its pass: partitions on a minor pass get one
+    # CALL over their fragments only, the rest (major passes, deletes, oversized
+    # files, and findings from before the tier rule) one CALL as before.
     parts = {}
     for f in active:
         if f["action"] == "auto" and f["symptom"] in BINPACK_SYMPTOMS and f.get("partition_key"):
-            p = parts.setdefault(f["partition_key"], {"score": 0.0, "symptoms": set()})
+            p = parts.setdefault(f["partition_key"], {"score": 0.0, "symptoms": set(), "passes": set()})
             p["score"] = max(p["score"], float(f["score"]))
             p["symptoms"].add(f["symptom"])
+            p["passes"].add(json.loads(f.get("evidence_json") or "{}").get("tier_pass")
+                            if f["symptom"] == "SMALL_FILES" else "other")
+    chosen = []
     if parts:
         budget = int(rw.get("max_partitions_per_run", 10))
         ranked = sorted(parts.items(), key=lambda kv: -kv[1]["score"])
         chosen, skipped = ranked[:budget], ranked[budget:]
-        preds, unsupported, widened = [], [], set()
-        for key, _ in chosen:
-            pr = partition_predicate(key, fields, widened)
-            if pr is None:
-                unsupported.append(key)
-            elif f"({pr})" not in preds:              # widened keys can collapse to one
-                preds.append(f"({pr})")
-        syms = sorted(set().union(*(v["symptoms"] for _, v in chosen)))
-        if "SCATTERED_SMALL_FILES" in names:
-            syms.append("SCATTERED_SMALL_FILES")
-        min_input = rw.get("min_input_files") or int(th["min_excess_files"]) + 1
-        # the band detection judged by (small / oversized ratios), passed explicitly so
-        # the rewrite picks exactly the files the scan flagged even if the ratios change
-        opts = {"target-file-size-bytes": str(target),
-                "min-file-size-bytes": str(int(target * float(cfg.get("small_file_ratio", 0.75)))),
-                "max-file-size-bytes": str(int(target * float(cfg.get("oversized_file_ratio", 1.8)))),
-                "min-input-files": str(min_input),
-                "max-concurrent-file-group-rewrites": str(rw.get("max_concurrent_file_group_rewrites", 2))}
-        per_part = {}
-        for f in active:
-            if f.get("partition_key") in dict(chosen):
-                n = int(json.loads(f.get("evidence_json") or "{}").get("data_files", 0))
-                per_part[f["partition_key"]] = max(per_part.get(f["partition_key"], 0), n)
-        files_in_scope = sum(per_part.values())
-        if files_in_scope >= int(rw.get("partial_progress_min_files", 500)):
-            opts["partial-progress.enabled"] = "true"
-            opts["partial-progress.max-commits"] = str(rw.get("partial_progress_max_commits", 10))
-        if any("DELETE_BUILDUP" in v["symptoms"] for _, v in chosen):
-            opts["delete-file-threshold"] = "1"        # pick up files with any delete
-            opts["remove-dangling-deletes"] = "true"   # drop delete files left pointing at nothing
-        note = []
-        if skipped:
-            note.append(f"{len(skipped)} more flagged partitions left for the next run (budget {budget})")
-        if unsupported:
-            note.append(f"{len(unsupported)} partitions skipped: transform can't be scoped by a range")
-        if widened:
-            note.append(f"scope widened over {', '.join(sorted(widened))} (bucket/truncate can't be a range)")
-        appending = [json.loads(f.get("evidence_json") or "{}") for f in active
-                     if f.get("partition_key") in dict(chosen)
-                     and json.loads(f.get("evidence_json") or "{}").get("appends_continue")]
-        if preds == ["(TRUE)"] and cfg.get("time_column") and appending:
-            # an unpartitioned table still being appended to: appends don't
-            # conflict with the rewrite, but files written in the hot window are
-            # likely to have neighbours soon; rewrite only rows older than it
-            mins = float(appending[0].get("compact_older_than_min") or cfg.get("hot_partition_minutes", 15))
-            older = (now or datetime.now(timezone.utc)) - timedelta(minutes=mins)
-            preds = [f"({cfg['time_column']} < TIMESTAMP '{older.strftime('%Y-%m-%d %H:%M:%S')}')"]
-            note.append(f"appends continue: only rows older than {mins:g} min ({cfg['time_column']})")
-        if preds:
-            where = "" if "(TRUE)" in preds else \
-                f"where => \"{_sql_str(' OR '.join(preds))}\", "   # TRUE: whole table, no where
-            opt_sql = ", ".join(f"'{k}', '{v}'" for k, v in opts.items())
-            # honor the table's sort order: binpack would concatenate sorted files
-            # unsorted and widen every output file's value range
-            strategy = "sort" if tm.get("sort_order_defined") else "binpack"
-            if strategy == "sort":
-                note.append("sort strategy: the table has a sort order")
-            steps.append({
-                "kind": "rewrite_data_files", "auto": True, "symptoms": syms, "where": where,
-                "statement": (f"CALL glue.system.rewrite_data_files(table => '{ident}', "
-                              f"strategy => '{strategy}', {where}"
-                              f"options => map({opt_sql}))"),
-                "note": "; ".join(note) or f"{len(chosen)} partitions, ~{files_in_scope} files"})
+        minor = [(k, v) for k, v in chosen if v["passes"] == {"minor"}]
+        rest = [(k, v) for k, v in chosen if v["passes"] != {"minor"}]
+        tiered = any(v["passes"] & {"minor", "major"} for _, v in chosen)
+        groups = [(g, kind) for g, kind in ((rest, "major" if tiered else None), (minor, "minor")) if g]
+        for i, (group, kind) in enumerate(groups):
+            step = _rewrite_step(group, kind, skipped if i == 0 else [], active, names, tm, cfg, th, rw, ident,
+                                 fields, target, now)
+            if step:
+                steps.append(step)
 
     # 1b. deletes: the rewrite applies them, but the delete files can stay
     # attached. rewrite_data_files gives new files the starting sequence
@@ -324,7 +369,7 @@ def plan_table(table, findings, tm, cfg, now=None, freed=None):
     # 1c. GL2.6c DELETE_FILE_SPRAWL: merge many small position delete files in
     # the flagged partitions; no data file is rewritten. Partitions the data
     # rewrite already covers are left to step 1b.
-    covered = {k for k, _ in chosen} if parts else set()
+    covered = {k for k, _ in chosen}
     sprawl = [f for f in active if f["symptom"] == "DELETE_FILE_SPRAWL" and f["action"] == "auto"
               and f.get("partition_key") not in covered]
     if sprawl:

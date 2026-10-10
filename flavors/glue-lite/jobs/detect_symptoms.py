@@ -81,6 +81,19 @@ def _uuids(tms):
     return sorted({t["table_uuid"] for t in tms if t.get("table_uuid")})
 
 
+def tier_labels(findings):
+    """Findings with SMALL_FILES named by its tier pass (SMALL_FILES[minor]), so a
+    diff shows minor, major and wait apart."""
+    out = []
+    for f in findings:
+        if f["symptom"] == "SMALL_FILES":
+            p = json.loads(f.get("evidence_json") or "{}").get("tier_pass")
+            if p:
+                f = dict(f, symptom=f"SMALL_FILES[{p}]")
+        out.append(f)
+    return out
+
+
 def load_partition_state(store, tms):
     """Family 2's per-partition state, by table UUID (empty when family 2 never ran)."""
     out = {}
@@ -219,13 +232,15 @@ def run_detect(spark, scan_id, config, report=True):
     exp_changes = []
     mode7 = mode_of(config, "writer_findings")
     writer_changes = []
+    mode8 = mode_of(config, "tiering")
+    tier_changes = []
     for tm in sorted(tms, key=lambda t: t["table_name"]):
         table, uuid = tm["table_name"], tm.get("table_uuid")
         cfg = gl.table_config(config, table)
         tr.begin(table)
         tr.log("detect", "inputs", partitions=len(parts.get(table, [])), history_scans=len(history.get(uuid, [])),
                actions=len(actions.get(uuid, [])), hot_partition_minutes=cfg.get("hot_partition_minutes"),
-               families=f"learned_windows={mode3} new_findings={mode5} "
+               families=f"learned_windows={mode3} new_findings={mode5} tiering={mode8} "
                         f"expiry_policy={mode6} writer_findings={mode7}")
         tr.variant("today")
         # the conflict hold's and the churn advice's facts, per partition (holds.py)
@@ -281,7 +296,7 @@ def run_detect(spark, scan_id, config, report=True):
                     f"{tm.get('expirable_snapshots')} expirable; refs {tm.get('refs_json')}")
             exp_changes.append((tm, d6, note))
             if mode6 == "on":
-                mine = pol
+                mine, cfg = pol, dict(cfg, expiry_policy=True)
         if mode7 != "off":
             # GL2.7a: SNAPSHOT_RATE and HISTORY_LOST (the writer's side, from the ledger)
             tr.variant("writer_findings")
@@ -300,7 +315,26 @@ def run_detect(spark, scan_id, config, report=True):
                        if tm.get("minutes_since_previous_scan") is not None else ""))
             writer_changes.append((tm, d7, note))
             if mode7 == "on":
-                mine = wf
+                mine, cfg = wf, dict(cfg, writer_findings=True)
+        if mode8 != "off":
+            # item 12: SMALL_FILES decided by the size tiers (major when cold, minor when worth it, else wait)
+            tr.variant("tiering")
+            tiered = symptom_rules.evaluate(table, tm, rows_used, dict(cfg, tiering=True),
+                                            history=history.get(uuid, []), actions=actions.get(uuid, []))
+            d8 = hl.diff_actions(tier_labels(mine), tier_labels(tiered))
+            tr.log("detect.diff", "tiering: " + ("; ".join(d8) if d8 else "no change"))
+            passes = {}
+            for f_ in tiered:
+                if f_["symptom"] == "SMALL_FILES":
+                    p_ = json.loads(f_.get("evidence_json") or "{}").get("tier_pass") or "?"
+                    passes[p_] = passes.get(p_, 0) + 1
+            tiers = symptom_rules.tiers_of(cfg, tm)
+            note = (", ".join(f"{n} {p_}" for p_, n in sorted(passes.items())) or "no small files") + \
+                   (f"; cold after {tiers['cold_hours']:g} h, minor at {tiers['minor_min_fragments']} fragments "
+                    f"or {tiers['minor_max_wait_hours']:g} h")
+            tier_changes.append((tm, d8, note))
+            if mode8 == "on":
+                mine, cfg = tiered, dict(cfg, tiering=True)
         tr.variant("")
         tr.log("detect", f"recorded: {len(mine)} finding(s) from "
                + ("today's rules" if mine is current else "the families switched on"),
@@ -318,6 +352,10 @@ def run_detect(spark, scan_id, config, report=True):
     if mode6 != "off":
         record_holds_changes(log, scan_id, detected_at, mode6, exp_changes, report,
                              family="expiry_policy", title="Expiry by policy", baseline="count/age rule")
+    if mode8 != "off":
+        record_holds_changes(log, scan_id, detected_at, mode8, tier_changes, report,
+                             family="tiering", title="Tiering (minor / major / wait)",
+                             baseline="excess-count compaction")
 
     print(f"=== Symptoms for scan {scan_id}: {len(findings)} findings over {len(tms)} tables ===",
           flush=True)

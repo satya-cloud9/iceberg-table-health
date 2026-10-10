@@ -99,6 +99,9 @@ def partition_metrics(spark, table, info, cfg, table_writer_minutes="compute"):
     target = int(cfg["target_file_bytes"])
     small = int(target * float(cfg["small_file_ratio"]))
     oversized = int(target * float(cfg["oversized_file_ratio"]))
+    # size tiers (item 12): a fragment is under target / fragment_ratio, an
+    # undersized segment from there up to the small-file limit
+    frag = int(target / float((cfg.get("compaction") or {}).get("fragment_ratio", 8)))
     pk = "to_json(partition)" if info["partitioned"] else "'{}'"
     spec_id = info["spec_id"] if info["spec_id"] is not None else -1
     sort_id = info["sort_order_id"] if info["sort_order_id"] is not None else -1
@@ -125,6 +128,15 @@ def partition_metrics(spark, table, info, cfg, table_writer_minutes="compute"):
         w_join = ""
         age_sql = ("CAST(NULL AS DOUBLE)" if table_writer_minutes is None
                    else f"CAST({table_writer_minutes} AS DOUBLE)")
+    # when the oldest live fragment was added: the entries of the current manifests
+    # keep the adding snapshot's id; a snapshot already expired stands for "older
+    # than every retained snapshot", so the oldest retained commit is the bound
+    g_join = (f"LEFT JOIN (SELECT {epk} AS partition_key, "
+              f"min(unix_millis(coalesce(s.committed_at, o.oldest))) AS oldest_fragment_ms "
+              f"FROM {table}.entries e LEFT JOIN {table}.snapshots s ON e.snapshot_id = s.snapshot_id "
+              f"CROSS JOIN (SELECT min(committed_at) AS oldest FROM {table}.snapshots) o "
+              f"WHERE e.status <> 2 AND e.data_file.content = 0 AND e.data_file.file_size_in_bytes < {frag} "
+              f"GROUP BY 1) g ON a.partition_key = g.partition_key")
     tr.log("partition_metrics", "age per partition from all_entries" if per_partition_age else
            "every partition gets the table's writer age (last writer commit outside the hot window)",
            writer_minutes=table_writer_minutes, hot_window_min=hot, small_below=small, oversized_above=oversized)
@@ -146,6 +158,11 @@ def partition_metrics(spark, table, info, cfg, table_writer_minutes="compute"):
                 percentile_approx(CASE WHEN content = 0 THEN file_size_in_bytes END,
                                   array(0.1, 0.5, 0.9))                         AS pct,
                 sum(CASE WHEN content = 0 AND file_size_in_bytes < {small} THEN 1 ELSE 0 END)     AS small_files,
+                sum(CASE WHEN content = 0 AND file_size_in_bytes < {frag} THEN 1 ELSE 0 END)      AS fragments,
+                sum(CASE WHEN content = 0 AND file_size_in_bytes >= {frag}
+                         AND file_size_in_bytes < {small} THEN 1 ELSE 0 END)                       AS undersized_segments,
+                sum(CASE WHEN content = 0 AND file_size_in_bytes < {frag}
+                         THEN file_size_in_bytes ELSE 0 END)                                       AS fragment_bytes,
                 sum(CASE WHEN content = 0 AND file_size_in_bytes > {oversized} THEN 1 ELSE 0 END) AS oversized_files,
                 sum(CASE WHEN content = 0 AND (file_size_in_bytes < {small} OR file_size_in_bytes > {oversized})
                          THEN file_size_in_bytes ELSE 0 END)                                AS rewrite_bytes,
@@ -165,6 +182,10 @@ def partition_metrics(spark, table, info, cfg, table_writer_minutes="compute"):
                CAST(pct[1] AS BIGINT) AS p50_file_bytes,
                CAST(pct[2] AS BIGINT) AS p90_file_bytes,
                CAST(small_files AS BIGINT)       AS small_files,
+               CAST(fragments AS BIGINT)         AS fragments,
+               CAST(undersized_segments AS BIGINT) AS undersized_segments,
+               CAST(fragment_bytes AS BIGINT)    AS fragment_bytes,
+               CAST(g.oldest_fragment_ms AS BIGINT) AS oldest_fragment_ms,
                CAST(oversized_files AS BIGINT)   AS oversized_files,
                CAST(rewrite_bytes AS BIGINT)     AS rewrite_bytes,
                CAST(greatest(1, ceil(data_bytes / {target})) AS BIGINT)               AS ideal_files,
@@ -174,7 +195,7 @@ def partition_metrics(spark, table, info, cfg, table_writer_minutes="compute"):
                p.last_updated_at,
                {age_sql} AS minutes_since_update,
                CAST({target} AS BIGINT) AS target_file_bytes
-        FROM a {p_join} {w_join}
+        FROM a {p_join} {w_join} {g_join}
         ORDER BY a.partition_key
     """
     tr.sql(q)

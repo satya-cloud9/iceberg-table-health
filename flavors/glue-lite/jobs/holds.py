@@ -65,7 +65,8 @@ def holds_rows(rows, pstate, activity, fields, scan_ms):
     """Copies of the partition rows with what the conflict hold and the churn
     advice need: minutes_since_update from the ledger's last writer write (when
     known), hours_since_end (time partitions, for the evidence),
-    minutes_since_conflict, and the M32 rewrite rate. activity: {partition_key: {last_conflict_ms, removed_bytes,
+    minutes_since_conflict, the M32 rewrite rate, and the oldest fragment's
+    age (the tier rule's minor wait). activity: {partition_key: {last_conflict_ms, removed_bytes,
     rewrite_commits}}."""
     out = []
     for r in rows:
@@ -84,6 +85,8 @@ def holds_rows(rows, pstate, activity, fields, scan_ms):
         r["removed_bytes_window"] = removed
         r["rewrite_commits_window"] = int(a.get("rewrite_commits") or 0)
         r["rewrite_rate"] = round(removed / live, 3) if live else (0.0 if not removed else None)
+        of = r.get("oldest_fragment_ms")
+        r["oldest_fragment_age_h"] = None if of is None else max(0.0, (scan_ms - int(of)) / 3600000.0)
         out.append(r)
     return out
 

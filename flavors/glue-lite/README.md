@@ -1978,3 +1978,49 @@ make gl-scan                 # no "Partition holds" block; learned windows show 
 make gl-test-tables TT_ARGS="--only s3" && make gl-scan    # s3: SMALL_FILES x2, no HOT_PARTITION
 make gl-plan T=s3            # the rewrite covers both days
 ```
+
+## Tiering (plan item 12, second part, shadow)
+
+Each data file sits in a size tier against the target file size: a
+**fragment** is under target ÷ `compaction.fragment_ratio` (8), an
+**undersized segment** runs from there up to `small_file_ratio` × target, and
+right-sized files are never rewritten. The scan adds `fragments`,
+`undersized_segments`, `fragment_bytes` and `oldest_fragment_ms` (when the
+oldest live fragment was added, from the current manifests' entries; a fragment
+whose snapshot already expired counts as old as the oldest retained one) to
+every partition row.
+
+For a partition the conflict hold does not stop, the tier rule decides:
+
+| Partition | Pass | What the rewrite takes |
+|---|---|---|
+| cold: no writer commit for `compaction.cold_hours` (6 h; test 0.1 h), with excess files | **major** | fragments and undersized segments into right-sized files, in the table's sort order if it has one |
+| warm, with `minor_min_fragments` (8) fragments, or its oldest fragment waited `minor_max_wait_hours` (8 h; test 0.1 h) and there are at least 2 | **minor** | fragments only, into segments |
+| warm, otherwise | **wait** | nothing: SMALL_FILES `defer`, the reason in the remedy |
+
+A table's `advisor.compact.cold-hours` and `advisor.compact.minor-max-wait-hours`
+win for the two times. A byte is rewritten at most twice (once by a minor,
+once by the major); the replay in the tests (a 2 MB/h late tail for 24 h,
+hourly runs) gives 12 minors and one major.
+
+The plan builds at most two rewrite calls per table: one for the major passes
+(plus deletes and oversized files, which need whole files: a partition with
+deletes goes here even when its small files would take a minor) with today's
+size band, and one for the minor passes with `min-file-size-bytes` = target ÷ 8,
+no upper band, and `min-input-files` = the fragment count that made the pass
+worth it. Both run with `partial-progress.enabled`, `max-commits`
+`rewrite.tier_partial_progress_max_commits` (3) and `rewrite-job-order`
+`bytes-desc`. Without the tier rule the plan is unchanged.
+
+Family `incremental.tiering` starts in **shadow**: findings and plans come from
+today's rule, and the scan prints what the tier rule would do per table, e.g.
+`(table): SMALL_FILES:auto -> SMALL_FILES[minor]:auto` with a count of passes.
+Switch it `on` after a clean shadow run.
+
+To check on the cluster:
+
+```
+make gl-image
+make gl-scan            # "Tiering (minor / major / wait) (shadow)": test tables are days old, so expect major
+make gl-step STEP=append-live                   # its own scan: the two live tables are warm, so minor or wait
+```

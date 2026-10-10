@@ -25,7 +25,7 @@ import re
 import gltrace as tr
 import holds as hl
 
-RULE_VERSION = "t1-1"
+RULE_VERSION = "t2-1"
 
 # symptom -> (category, level, action, remedy)
 CATALOG = {
@@ -163,7 +163,39 @@ def coarser_spec_hint(spec):
     return "drop or coarsen the partition transform"
 
 
-def partition_findings(table, rows, th, hot_minutes, new_findings=False):
+def tier_decision(r, small, tiers):
+    """The tier rule (plan item 12) for one partition that is not held:
+    -> (pass, reason): pass "major" (cold: fragments and undersized segments
+    into right-sized files), "minor" (warm, worth it: fragments only), "wait"
+    (warm, not worth a minor yet) or None (nothing to do).
+      cold            no writer commit in the partition for cold_hours
+      worth a minor   >= minor_min_fragments fragments, or the oldest fragment
+                      has waited minor_max_wait_hours (and there are at least 2)
+    r needs fragments, undersized_segments, minutes_since_update and
+    oldest_fragment_age_h."""
+    frags = _num(r.get("fragments"))
+    minutes = r.get("minutes_since_update")
+    cold_h, wait_h = float(tiers["cold_hours"]), float(tiers["minor_max_wait_hours"])
+    min_frags = int(tiers["minor_min_fragments"])
+    cold = minutes is None or minutes >= cold_h * 60
+    age = r.get("oldest_fragment_age_h")
+    if cold:
+        if small:
+            return "major", (f"cold: no writer commit for {'a long time' if minutes is None else f'{minutes / 60:.1f} h'}"
+                             f" (>= {cold_h:g} h): one major pass")
+        return None, None
+    if frags >= min_frags:
+        return "minor", f"warm, {frags} fragments (>= {min_frags}): a minor pass over the fragments"
+    if frags >= 2 and age is not None and age >= wait_h:
+        return "minor", f"warm, oldest fragment {age:.1f} h old (>= {wait_h:g} h): a minor pass over the fragments"
+    if small or frags:
+        return "wait", (f"warm (last writer commit {minutes / 60:.1f} h ago, cold after {cold_h:g} h); "
+                        f"{frags} fragments (minor at {min_frags}, or once the oldest has waited {wait_h:g} h"
+                        + (f"; now {age:.1f} h" if age is not None else "") + ")")
+    return None, None
+
+
+def partition_findings(table, rows, th, hot_minutes, new_findings=False, tiers=None):
     """Partition symptoms. The only hold is the writer-conflict hold: a writer
     commit that removed data files or added or removed delete files in the
     partition within hot_minutes (minutes_since_conflict, from holds.holds_rows)
@@ -173,7 +205,11 @@ def partition_findings(table, rows, th, hot_minutes, new_findings=False):
     were retired 2026-10-09; the tier rule decides minor or major passes, item 12).
     A partition writers rewrite fast (rewrite_rate at or above
     churn_partition_rate) keeps its SMALL_FILES auto, with churn advice to the
-    owner added to the finding: a note, not a hold."""
+    owner added to the finding: a note, not a hold.
+
+    tiers (item 12, family tiering): SMALL_FILES is decided by tier_decision
+    instead of the excess count alone: tier_pass major or minor in the evidence
+    (the plan builds the matching CALL), or the finding waits (defer)."""
     out = []
     min_excess = th["min_excess_files"]
     for r in rows:
@@ -223,13 +259,41 @@ def partition_findings(table, rows, th, hot_minutes, new_findings=False):
             remedy = f"wait: {hot_reason}; compact once {hot_minutes:g} min have passed without another"
             out.append(_finding(table, "HOT_PARTITION", max(excess / min_excess, 1.0), ev, key, remedy=remedy))
             continue
+        tier, tier_reason = (None, None)
+        if tiers is not None and r.get("fragments") is not None:
+            tier, tier_reason = tier_decision(r, small, tiers)
+            ev = dict(ev, fragments=_num(r.get("fragments")), undersized_segments=_num(r.get("undersized_segments")),
+                      oldest_fragment_age_h=(None if r.get("oldest_fragment_age_h") is None
+                                             else round(r["oldest_fragment_age_h"], 2)),
+                      tier_pass=tier, tier_reason=tier_reason, cold_hours=tiers["cold_hours"],
+                      minor_min_fragments=tiers["minor_min_fragments"],
+                      minor_max_wait_hours=tiers["minor_max_wait_hours"])
+            tr.log("rule.tier", key, fragments=r.get("fragments"), undersized=r.get("undersized_segments"),
+                   minutes_since_update=minutes, oldest_fragment_age_h=r.get("oldest_fragment_age_h"),
+                   decision=f"{tier}: {tier_reason}")
+            if tier is None:
+                small = False
+            elif tier == "wait":
+                f = _finding(table, "SMALL_FILES", max(excess / min_excess, 0.1), ev, key,
+                             remedy=f"wait: {tier_reason}")
+                f["action"], f["automatic"] = "defer", False
+                out.append(f)
+                small = False
+            else:
+                small = True
         if small:
             remedy = None
+            if tier == "minor":
+                remedy = f"minor: {tier_reason}; rewrite_data_files over the fragments only, scoped to this partition"
+            elif tier == "major":
+                remedy = f"major: {tier_reason}; rewrite_data_files of fragments and undersized segments, scoped to this partition"
             if r.get("last_write_label") == "possible_full_refresh":
                 remedy = ("written by a possible full refresh: set the refresh job's target file size or "
                           "distribution mode, otherwise every refresh needs this compaction again; "
                           + CATALOG["SMALL_FILES"][3])
-            f = _finding(table, "SMALL_FILES", excess / min_excess, ev, key, remedy=remedy)
+            score = (_num(r.get("fragments")) / max(int(tiers["minor_min_fragments"]), 1)) if tier == "minor" \
+                else excess / min_excess
+            f = _finding(table, "SMALL_FILES", max(score, 0.1), ev, key, remedy=remedy)
             rate = r.get("rewrite_rate")
             limit = th.get("churn_partition_rate", 1.0)
             if rate is not None and rate >= limit:
@@ -767,6 +831,18 @@ def apply_acks(findings, tm):
     return findings
 
 
+def tiers_of(cfg, tm):
+    """The tier rule's settings: config compaction.*, the table's advisor.compact.*
+    properties winning for the two times."""
+    c = cfg.get("compaction") or {}
+    props = _props(tm)
+    return {"fragment_ratio": float(c.get("fragment_ratio", 8)),
+            "minor_min_fragments": int(c.get("minor_min_fragments", 8)),
+            "minor_max_wait_hours": float(props.get("advisor.compact.minor-max-wait-hours")
+                                          or c.get("minor_max_wait_hours", 8)),
+            "cold_hours": float(props.get("advisor.compact.cold-hours") or c.get("cold_hours", 6))}
+
+
 def evaluate(table, tm, rows, cfg, history=None, actions=None):
     """All findings for one table. tm = table_metrics dict, rows = partition dicts."""
     if tm.get("load_error") and not rows:
@@ -774,7 +850,7 @@ def evaluate(table, tm, rows, cfg, history=None, actions=None):
     th = cfg["thresholds"]
     hot = float(cfg.get("hot_partition_minutes", 15))
     new = bool(cfg.get("new_findings"))
-    out = (partition_findings(table, rows, th, hot, new)
+    out = (partition_findings(table, rows, th, hot, new, tiers_of(cfg, tm) if cfg.get("tiering") else None)
            + table_findings(table, tm, rows, th, cfg))
     if new:
         out += storage_findings(table, tm, th, cfg.get("cost"))

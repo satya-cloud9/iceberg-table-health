@@ -39,7 +39,8 @@ PARTITION_METRICS_DDL = """
     p10_file_bytes BIGINT, p50_file_bytes BIGINT, p90_file_bytes BIGINT,
     small_files BIGINT, oversized_files BIGINT, ideal_files BIGINT, excess_files BIGINT,
     files_old_spec BIGINT, files_current_sort BIGINT, last_updated_at TIMESTAMP,
-    minutes_since_update DOUBLE, target_file_bytes BIGINT, rewrite_bytes BIGINT"""
+    minutes_since_update DOUBLE, target_file_bytes BIGINT, rewrite_bytes BIGINT,
+    fragments BIGINT, undersized_segments BIGINT, fragment_bytes BIGINT, oldest_fragment_ms BIGINT"""
 
 TABLE_METRICS_DDL = """
     scan_id STRING, scanned_at TIMESTAMP, table_name STRING, load_error STRING,
