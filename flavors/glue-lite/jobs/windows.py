@@ -1,6 +1,6 @@
 """GL2.5o: incremental scan, family 3 - learned windows.
 
-Two waits, learned per table instead of one fixed number:
+One wait learned per table, plus the lateness facts for LATE_ARRIVALS:
 
   hot window    how long a writer may pause between commits and still be
                 "writing": 2 x the 95th-percentile commit gap (family 1's gap
@@ -8,14 +8,14 @@ Two waits, learned per table instead of one fixed number:
                 floor), at most hot_cap_minutes; needs min_gaps gaps. Idle
                 gaps (longer than idle_gap_factor x the median gap: nights,
                 weekends, a paused job) are left out first, so a writer that
-                commits every 2 minutes doesn't get a 4-hour hot window
-  settle window how long after a partition's time range ends late data keeps
-                landing: the 99th-percentile lateness (family 2's lateness
+                commits every 2 minutes doesn't get a 4-hour hot window.
+                Shadow only; plan item 13 decides its fate.
+  lateness      the 95th/99th-percentile lateness (family 2's lateness
                 histogram; only append-only batches labelled on_time or late
-                count, so rewrites, possible backfills and possible full
-                refreshes don't stretch it),
-                at most settle_cap_hours; time-based partitions only; needs
-                min_batches batches
+                count) and the chance of more late data, for LATE_ARRIVALS,
+                which advises the owner. Lateness no longer holds compaction:
+                the settle window and SETTLING were retired 2026-10-10 (the
+                tier rule decides, plan item 12).
 
 Lookback (adaptive): both histograms are read over histogram_days; a table
 with fewer than min_batches / min_gaps samples there reaches further back,
@@ -23,10 +23,7 @@ whole days at a time, until it has them or hits lookback_max_days. A table
 that writes once a day gets a learned window after 20 days instead of never;
 a busy table keeps its 30 days.
 
-Inside the settle window (interim policy, until query evidence can weigh read
-cost against rewrite cost): the first compaction is allowed and up to
-max_settle_compactions in all; after that the partition waits (SETTLING). Delete
-buildup never waits. Long lateness or frequent reopens raise LATE_ARRIVALS.
+Long lateness or frequent reopens raise LATE_ARRIVALS.
 
 Per-partition age comes from family 2's partition_state (last writer write),
 not from the full path, whose per-partition age is only computed inside the
@@ -102,15 +99,6 @@ def learned_hot(p95_edge, n_gaps, floor_min, cap_min=1440.0, min_gaps=20, factor
     return m, "learned"
 
 
-def learned_settle(p99_edge, n_batches, cap_h=168.0, min_batches=20):
-    """-> (hours or None, source)."""
-    if not n_batches or n_batches < min_batches:
-        return None, f"none (only {n_batches or 0} batches)"
-    if p99_edge is None or float(p99_edge) >= cap_h:
-        return float(cap_h), "learned (capped)"
-    return float(p99_edge), "learned"
-
-
 def partition_end_from_key(partition_key, fields):
     """End of a partition's time range (ms) from its key and the table's
     partition fields [{name, transform, source_type}], or None."""
@@ -147,10 +135,10 @@ def p_more_late(counts, age_h):
     return round(later / total, 3)
 
 
-def learned_rows(rows, pstate, fields, scan_ms, compactions=None, late_counts=None):
+def learned_rows(rows, pstate, fields, scan_ms, late_counts=None):
     """Copies of the partition rows with the ledger's per-partition age, the
-    hours since the partition's time range ended, how often it was compacted
-    since then, and the chance that more late data still comes."""
+    hours since the partition's time range ended and the chance that more late
+    data still comes (evidence)."""
     out = []
     for r in rows:
         r = dict(r)
@@ -160,8 +148,6 @@ def learned_rows(rows, pstate, fields, scan_ms, compactions=None, late_counts=No
         r["minutes_since_update"] = None if lw is None else (scan_ms - lw) / 60000.0
         end = partition_end_from_key(pk, fields)
         r["hours_since_end"] = None if end is None else (scan_ms - end) / 3600000.0
-        r["compactions_since_end"] = (sum(1 for t in (compactions or {}).get(pk, []) if t >= end)
-                                      if end is not None else 0)
         r["p_more_late"] = p_more_late(late_counts or {}, r["hours_since_end"])
         r["last_write_label"] = st.get("last_write_label")
         out.append(r)

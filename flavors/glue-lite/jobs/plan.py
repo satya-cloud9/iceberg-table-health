@@ -284,7 +284,7 @@ def plan_table(table, findings, tm, cfg, now=None, freed=None):
                      if f.get("partition_key") in dict(chosen)
                      and json.loads(f.get("evidence_json") or "{}").get("appends_continue")]
         if preds == ["(TRUE)"] and cfg.get("time_column") and appending:
-            # GL2.6b: an unpartitioned table still being appended to: appends don't
+            # an unpartitioned table still being appended to: appends don't
             # conflict with the rewrite, but files written in the hot window are
             # likely to have neighbours soon; rewrite only rows older than it
             mins = float(appending[0].get("compact_older_than_min") or cfg.get("hot_partition_minutes", 15))
@@ -341,12 +341,12 @@ def plan_table(table, findings, tm, cfg, now=None, freed=None):
                                         f"{where}options => map('rewrite-all', 'true'))"),
                           "note": f"merges position delete files in {len(sprawl)} partition(s); no data rewrite"})
 
-    hot = [f for f in active if f["symptom"] in ("HOT_PARTITION", "SETTLING")]
+    hot = [f for f in active if f["symptom"] == "HOT_PARTITION"]
     if hot:
-        steps.append({"kind": "hold", "auto": False, "symptoms": sorted({f["symptom"] for f in hot}),
+        steps.append({"kind": "hold", "auto": False, "symptoms": ["HOT_PARTITION"],
                       "statement": "",
-                      "note": f"{len(hot)} partition(s) left out (still being written, or late data "
-                              f"still expected): " + ", ".join(f["partition_key"] for f in hot)})
+                      "note": f"{len(hot)} partition(s) left out (a writer changed their files moments ago): "
+                              + ", ".join(f["partition_key"] or "(table)" for f in hot)})
 
     held = [f for f in active if f["action"] == "advisory" and f["symptom"] != "RETAINED_STORAGE"]
     for f in active:

@@ -96,7 +96,6 @@ gl-demo:
 #   make gl-symptoms                 apply the symptom rules to the latest scan -> glue.ops.symptoms
 #   make gl-scorecard                check the latest scan against config/expectations.json
 #   make gl-scan                     metrics + symptoms + scorecard in one job (s3 measured first)
-#   make gl-scan FRESH_S3=1          rebuild s3 first so its hot partition is checkable (~4 min more)
 #   make gl-scan SCAN_ARGS=--full    measure every table, even unchanged ones
 #   make gl-scan TRACE=s20_delete_sprawl   scan only that table, printing every step (TRACE lines);
 #                                    TRACE=a,b for several; add SCAN_ARGS=--full to force the full-measure path
@@ -114,7 +113,6 @@ TRACE ?=
 METRIC_ARGS ?=
 SYM_ARGS ?=
 SCAN_ARGS ?=
-FRESH_S3 ?=
 T ?=
 APPLY ?=
 APPROVE ?=
@@ -133,9 +131,6 @@ gl-scorecard:
 	bash flavors/glue-lite/scripts/run-job.sh py scorecard.py
 
 gl-scan:
-ifeq ($(FRESH_S3),1)
-	JOB_TIMEOUT_MIN=15 bash flavors/glue-lite/scripts/run-job.sh py build_test_tables.py --only s3
-endif
 	bash flavors/glue-lite/scripts/run-job.sh py gl_scan.py $(SCAN_ARGS) $(if $(TRACE),--trace $(TRACE))
 
 gl-sql:

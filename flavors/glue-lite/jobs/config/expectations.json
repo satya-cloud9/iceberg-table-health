@@ -61,16 +61,11 @@
       }
     },
     "glue.demo.s3_hot_partition": {
-      "fresh": true,
+      "_comment": "a writer still appending into today. Appends never hold a partition since 2026-10-10 (the only hold is a commit that changed existing files), so both the past day and today are SMALL_FILES; with the tier rule (item 12) today will get minors until it goes cold and the past day one major",
       "expect": [
         {
-          "symptom": "HOT_PARTITION",
-          "newest": true
-        },
-        {
           "symptom": "SMALL_FILES",
-          "count": 1,
-          "not_newest": true
+          "count": 2
         },
         {
           "symptom": "SNAPSHOT_BUILDUP",
@@ -79,19 +74,8 @@
         }
       ],
       "after": {
-        "_comment": "past day compacted, snapshots expired, today held while hot. Today may still be hot (HOT_PARTITION), cooled but not yet compacted (SMALL_FILES, next run's work), or compacted by a second run (healthy). Anything on the past day fails.",
-        "expect": [
-          {
-            "symptom": "HOT_PARTITION",
-            "newest": true,
-            "optional": true
-          },
-          {
-            "symptom": "SMALL_FILES",
-            "newest": true,
-            "optional": true
-          }
-        ]
+        "_comment": "both days compacted, snapshots expired; nothing left",
+        "expect": []
       }
     },
     "glue.demo.s4_manifest_bloat": {
@@ -199,10 +183,14 @@
       }
     },
     "glue.demo.s12_cow_merge_churn": {
-      "_comment": "copy-on-write merges: files look healthy, the table is rewritten ~12x; any SMALL_FILES would be held as advisory. GL2.6c: old snapshots keep ~12 copies alive, so RETAINED_STORAGE (new-findings shadow) is expected once that family is on.",
+      "_comment": "copy-on-write merges: files look healthy, the table is rewritten ~12x. Any SMALL_FILES is compacted as usual (churn is advice since 2026-10-10, not a hold), so it is optional. GL2.6c: old snapshots keep ~12 copies alive, so RETAINED_STORAGE is expected once that family is on.",
       "expect": [
         {
           "symptom": "REWRITE_CHURN"
+        },
+        {
+          "symptom": "SMALL_FILES",
+          "optional": true
         },
         {
           "symptom": "RETAINED_STORAGE",
@@ -319,7 +307,7 @@
       }
     },
     "glue.demo.s19_partition_churn": {
-      "_comment": "GL2.6b: all six days are SMALL_FILES; with partition_holds on, 2026-09-06 (rewritten ~6x in 24 h) is advisory and not scored, so 5 are auto. RETAINED_STORAGE is allowed: the six reloads keep more than one extra copy alive.",
+      "_comment": "all six days are SMALL_FILES (2026-09-06 rewritten ~6x in 24 h gets churn advice on its finding, still auto since 2026-10-10: churn is a note, not a hold). RETAINED_STORAGE is allowed: the six reloads keep more than one extra copy alive.",
       "expect": [
         {
           "symptom": "SMALL_FILES",
@@ -332,7 +320,7 @@
         }
       ],
       "after": {
-        "_comment": "after make gl-plan T=s19 APPLY=1: the five appended days compacted; the reloaded day is left alone (advisory, not scored)",
+        "_comment": "after make gl-plan T=s19 APPLY=1: all six days compacted",
         "expect": [
           {
             "symptom": "RETAINED_STORAGE",

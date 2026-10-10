@@ -555,13 +555,10 @@ class Ledger:
         tm["hot_window_min"], tm["hot_window_source"] = win.learned_hot(
             hot_edge, n_hot, float(cfg.get("hot_partition_minutes", 15)), float(inc.get("hot_cap_minutes", 1440)),
             self.min_gaps, float(inc.get("hot_gap_factor", 2.0)))
-        tm["settle_window_h"], tm["settle_window_source"] = win.learned_settle(
-            p99, n_late, float(inc.get("settle_cap_hours", 168)), self.min_batches)
         tr.log("family3", "learned windows (inputs for detect)", gap_counts=gaps, idle_gaps_dropped=idle,
                gap_p95_bucket_min=hot_edge, gaps_used=n_hot, gap_lookback_days=gap_days,
                hot_window_min=tm["hot_window_min"], hot_source=tm["hot_window_source"],
-               lateness_p99_bucket_h=p99, late_batches=n_late, late_lookback_days=late_days,
-               settle_window_h=tm["settle_window_h"], settle_source=tm["settle_window_source"])
+               lateness_p99_bucket_h=p99, late_batches=n_late, late_lookback_days=late_days)
 
     def _day_hist(self, uuid, kind, bucket_col, n_col):
         """{day: {bucket_edge: n}} for one table, back to max_days (exclusive)."""

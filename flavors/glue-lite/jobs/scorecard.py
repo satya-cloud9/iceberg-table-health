@@ -189,7 +189,8 @@ def score_table(table, expectation, findings, partition_rows, hot_minutes, phase
         if age is not None and age >= hot_minutes:
             notes = (f"newest partition {newest} was {age:.1f} min old at scan time "
                      f"(hot window {hot_minutes:g} min): rebuild it and scan straight after "
-                     f"(make gl-scan FRESH_S3=1)")
+                     f"(make gl-test-tables TT_ARGS=\"--only {table.rsplit('.', 1)[-1].split('_', 1)[0]}\", "
+                     f"then make gl-scan)")
             if status == "FAIL":
                 status = "STALE"
     # Scenarios whose symptom only holds for a while after their last write

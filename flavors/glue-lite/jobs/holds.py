@@ -1,35 +1,19 @@
-"""GL2.6b: revised partition holds (Traceability group 2, shadow first).
+"""The writer-conflict hold, and the per-partition facts it and the churn advice need.
 
-Two holds keep a partition out of compaction. Both change:
+A rewrite only conflicts with a concurrent commit that removes or rewrites the
+same files (overwrite, delete, a merge, delete files added or removed); appends
+just add files. So a partition is held (HOT_PARTITION, defer) only when such a
+conflicting writer commit touched it within hot_partition_minutes. Appends never
+hold a partition, open time range or not. (GL2.6b shipped this as the
+partition_holds family next to the older "any write in the hot window" rule;
+since 2026-10-10 it is the only rule, the still-filling branch and the churn
+hold are gone, and churn is advice on the finding: symptom_rules.)
 
-  hot hold    Today: any write in the last hot_partition_minutes (the table's
-              writer age for an unpartitioned table) holds the partition. But
-              waiting is an efficiency choice, not a safety one: a rewrite only
-              conflicts with a concurrent commit that removes or rewrites the
-              same files (overwrite, delete, a merge, delete files added), and
-              appends just add files. Revised: hold only when
-                - a conflicting commit touched the partition within the hot
-                  window, or
-                - the partition is a time partition still filling: its time
-                  range ended less than a hot window ago (or hasn't ended) and
-                  it was written within the hot window.
-              Append-only partitions compact on schedule. An unpartitioned table
-              appended every few minutes is no longer held for ever; with a
-              declared time_column the plan rewrites only rows older than the
-              hot window.
+Churn facts: per partition, M32 rewrite rate = data bytes removed from the
+partition by writer commits in the last churn_window_h / its live data bytes.
 
-  churn hold  Today: REWRITE_CHURN anywhere on the table turns every SMALL_FILES
-              advisory, including partitions merges never touch. Revised: per
-              partition, M32 rewrite rate = data bytes removed from the
-              partition by writer commits in the last churn_window_h / the
-              partition's live data bytes. At or above churn_partition_rate
-              (per window) a compaction would be undone within hours, so that
-              partition's SMALL_FILES turns advisory; the rest compact normally.
-
-Inputs come from family 2 (glue.ops.partition_activity / partition_state), so
-the revised holds need family 2's tables; tables without them keep today's
-holds. Mode (config incremental.partition_holds): off | shadow (findings from
-today's holds, the revised variant reported as "would change") | on.
+Inputs come from family 2 (partition_activity / partition_state); a table with
+no activity rows yet has no minutes_since_conflict and is never held.
 
 Pure logic; detect_symptoms.py does the I/O.
 """
@@ -78,10 +62,10 @@ def activity_from_rows(rows, since_ms, churn_since_ms):
 
 
 def holds_rows(rows, pstate, activity, fields, scan_ms):
-    """Copies of the partition rows with what the revised holds need:
-    minutes_since_update from the ledger's last writer write (when known),
-    hours_since_end (time partitions), minutes_since_conflict, and the M32
-    rewrite rate. activity: {partition_key: {last_conflict_ms, removed_bytes,
+    """Copies of the partition rows with what the conflict hold and the churn
+    advice need: minutes_since_update from the ledger's last writer write (when
+    known), hours_since_end (time partitions, for the evidence),
+    minutes_since_conflict, and the M32 rewrite rate. activity: {partition_key: {last_conflict_ms, removed_bytes,
     rewrite_commits}}."""
     out = []
     for r in rows:
@@ -105,18 +89,12 @@ def holds_rows(rows, pstate, activity, fields, scan_ms):
 
 
 def decide(r, hot_minutes):
-    """-> (hold, reason, appends_continue). appends_continue: today's rule would
-    have held the partition (written within the hot window) but no conflicting
-    commit did it and it isn't a filling time partition."""
-    minutes = r.get("minutes_since_update")
-    written = minutes is not None and minutes < hot_minutes
+    """-> (hold, reason): held only for a conflicting writer commit within
+    hot_minutes."""
     conflict = r.get("minutes_since_conflict")
     if conflict is not None and conflict < hot_minutes:
-        return True, f"a commit removed or rewrote files {conflict:.1f} min ago", False
-    since_end = r.get("hours_since_end")
-    if written and since_end is not None and since_end * 60 < hot_minutes:
-        return True, "time partition still filling", False
-    return False, None, written
+        return True, f"a writer commit removed or rewrote files {conflict:.1f} min ago"
+    return False, None
 
 
 def diff_actions(current, revised):

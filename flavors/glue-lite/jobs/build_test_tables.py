@@ -58,7 +58,7 @@ data: no partition spec, bucket transforms, hour partitions, equality deletes
 deletes) and string partition values that need quoting.
 
 Usage (via scripts/run-job.sh py build_test_tables.py ...):
-  build_test_tables.py [--only s0,s4] [--hot-minutes 3] [--no-settle]
+  build_test_tables.py [--only s0,s4] [--hot-minutes 3] [--no-wait]
 """
 import argparse
 import math
@@ -552,8 +552,9 @@ def main():
     p.add_argument("--only", default="", help="comma-separated scenario ids, e.g. s0,s4")
     p.add_argument("--hot-minutes", type=int, default=3,
                    help="hot window the scan will use; s3 ages its past day beyond it")
-    p.add_argument("--no-settle", action="store_true",
-                   help="without s3 in the run, don't wait out the hot window at the end")
+    p.add_argument("--no-wait", "--no-settle", dest="no_wait", action="store_true",
+                   help="without s3 in the run, don't wait out the conflict window at the end (tables "
+                        "built with deletes or merges are held for hot_partition_minutes after them)")
     args = p.parse_args()
 
     wanted = [s.strip() for s in args.only.split(",") if s.strip()] or list(BUILDERS)
@@ -574,7 +575,7 @@ def main():
                    round(sum(total_data_file_size_in_bytes) / 1048576, 1) AS data_mb
             FROM {table}.partitions
         """).show(truncate=False)
-    if "s3" not in wanted and not args.no_settle:
+    if "s3" not in wanted and not args.no_wait:
         wait = args.hot_minutes * 60 + 30
         print(f"=== waiting {wait}s so the new tables are past the {args.hot_minutes}-min hot window ===",
               flush=True)

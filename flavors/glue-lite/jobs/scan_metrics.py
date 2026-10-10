@@ -69,7 +69,6 @@ TABLE_METRICS_DDL = """
     activity_new_snapshots BIGINT, activity_event STRING, lateness_p95_h DOUBLE, lateness_batches_window BIGINT,
     reopened_partitions BIGINT, hot_partitions_ledger BIGINT,
     lateness_p99_h DOUBLE, hot_window_min DOUBLE, hot_window_source STRING,
-    settle_window_h DOUBLE, settle_window_source STRING,
     possible_full_refreshes_30d BIGINT, possible_backfill_batches_30d BIGINT, last_full_refresh_ms BIGINT,
     full_refresh_avg_bytes BIGINT, retained_full_copies BIGINT, pre_refresh_snapshot_ms BIGINT,
     lateness_p99_batches BIGINT, lateness_lookback_days BIGINT, hot_gap_p95_min DOUBLE, hot_gaps_used BIGINT,
@@ -397,7 +396,7 @@ def run_scan(spark, namespace, config, tables=(), scan_id=None, priority=(), rep
             "snapshots", "oldest_snapshot_age_h", "commits_24h", "data_manifests", "metadata_versions",
             "retained_bytes", "retained_metadata_bytes", "metadata_json_bytes", "overwrite_commits_recent",
             "avg_overwrite_rewrite_share", "table_turnover_24h", "minutes_since_writer_commit", "orphan_files",
-            "ledger_event", "activity_event", "hot_window_min", "settle_window_h", "load_error")})
+            "ledger_event", "activity_event", "hot_window_min", "load_error")})
         tr.begin(None)
         if p and p.get("elapsed_min") is not None:     # how often this table is scanned (HISTORY_LOST)
             tm["minutes_since_previous_scan"] = round(float(p["elapsed_min"]), 2)

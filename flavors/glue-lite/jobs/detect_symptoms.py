@@ -95,20 +95,6 @@ def _mb(n):
     return "n/a" if n is None else f"{n / 1048576:.1f} MiB" if n >= 104858 else f"{n / 1024:.0f} KiB"
 
 
-def load_compactions(store, tms, since_ms=None):
-    """Compaction times per partition (family 2's activity rows), by table UUID.
-    since_ms: only compactions a rule can still count (the settle window)."""
-    out = {}
-    for u in _uuids(tms):
-        for r in store.range("commit_partition", (u,), start=since_ms):
-            if r.get("operation") == "replace" and (r.get("data_files_added") or 0) > 0:
-                out.setdefault(u, {}).setdefault(r["partition_key"], []).append(int(r["ts_ms"]))
-    for parts in out.values():
-        for pk in parts:
-            parts[pk].sort()
-    return out
-
-
 def load_late_hists(store, tms, default_days=30):
     """Lateness bucket counts by table UUID, over each table's own lookback
     (lateness_lookback_days from the scan: adaptive, see windows.py)."""
@@ -125,8 +111,9 @@ def load_late_hists(store, tms, default_days=30):
 
 
 def load_holds_activity(store, tms, scan_ms, window_h, hot_cap_min):
-    """Family 2's activity summed per partition for the revised holds (holds.py),
-    by table UUID. Reads back max(churn window, hot cap) from the scan time."""
+    """Family 2's activity summed per partition for the conflict hold and the
+    churn advice (holds.py), by table UUID. Reads back max(churn window, hot cap)
+    from the scan time."""
     churn_since = scan_ms - int(window_h * 3600000)
     since = min(churn_since, scan_ms - int(hot_cap_min * 60000))
     out = {}
@@ -142,10 +129,10 @@ CHECK_COLS = ["scan_id", "checked_at", "table_name", "table_uuid", "family", "me
 
 
 def record_holds_changes(log, scan_id, at, mode, changes, report=True,
-                         family="partition_holds", title="Partition holds", baseline="today's holds"):
+                         family="new_findings", title="New findings", baseline="today's findings"):
     """What a variant of the rules changes, per table (log incremental_check;
-    agree = no change). Families: partition_holds (GL2.6b), new_findings (GL2.6c),
-    expiry_policy (GL2.6e)."""
+    agree = no change). Families: new_findings (GL2.6c), expiry_policy (GL2.6e),
+    writer_findings (GL2.7a)."""
     log.append("incremental_check", [dict(zip(CHECK_COLS, [
         scan_id, at, tm["table_name"], tm.get("table_uuid"), family, "findings",
         baseline, note, not d, "; ".join(d)[:2000]])) for tm, d, note in changes])
@@ -165,7 +152,7 @@ def record_window_changes(log, scan_id, at, mode, changes, report=True):
     rows = []
     for tm, d in changes:
         windows = (f"hot {tm.get('hot_window_min')} min ({tm.get('hot_window_source')}); "
-                   f"settle {tm.get('settle_window_h')} h ({tm.get('settle_window_source')})")
+                   f"lateness p99 {tm.get('lateness_p99_h')} h ({tm.get('lateness_p99_batches')} batches)")
         rows.append(dict(zip(CHECK_COLS, [scan_id, at, tm["table_name"], tm.get("table_uuid"), "learned_windows",
                                           "findings", "configured windows", windows, not d, "; ".join(d)[:2000]])))
     log.append("incremental_check", rows)
@@ -180,8 +167,8 @@ def record_window_changes(log, scan_id, at, mode, changes, report=True):
             idle = f", {tm.get('idle_gaps_ignored')} idle gaps ignored" if tm.get("idle_gaps_ignored") else ""
             print(f"  {name:26} hot {tm.get('hot_window_min'):g} min [{tm.get('hot_window_source')}; "
                   f"{tm.get('hot_gaps_used')} gaps / {tm.get('gap_lookback_days')} d{idle}], "
-                  f"settle {tm.get('settle_window_h')} h [{tm.get('settle_window_source')}; "
-                  f"{tm.get('lateness_p99_batches')} batches / {tm.get('lateness_lookback_days')} d]", flush=True)
+                  f"lateness p99 {tm.get('lateness_p99_h')} h [{tm.get('lateness_p99_batches')} batches / "
+                  f"{tm.get('lateness_lookback_days')} d]", flush=True)
             for line in d[:8]:
                 print(f"  {'':26}   {line}", flush=True)
 
@@ -205,16 +192,14 @@ def run_detect(spark, scan_id, config, report=True):
     findings = []
     log = ss.make_log_sink(spark, config)
     mode3 = mode_of(config, "learned_windows")
-    mode4 = mode_of(config, "partition_holds")
     inc = config.get("incremental") or {}
     scan_ms = max((t["scanned_ms"] for t in tms), default=0)
-    # activity is read back only as far as a rule looks: the settle window (compactions
-    # since a partition ended), the churn window and the hot cap (holds)
-    act_from = scan_ms - int(max(float(inc.get("settle_cap_hours", 168)) * 3600000,
-                                 float(inc.get("churn_window_h", 24)) * 3600000,
+    # activity is read back only as far as a rule looks: the churn window (advice)
+    # and the hot cap (the conflict hold)
+    act_from = scan_ms - int(max(float(inc.get("churn_window_h", 24)) * 3600000,
                                  float(inc.get("hot_cap_minutes", 1440)) * 60000))
-    if mode3 != "off" or mode4 != "off":       # one read per kind, then per-table lookups in memory
-        uu = _uuids(tms)
+    uu = _uuids(tms)
+    if uu:                                     # one read per kind, then per-table lookups in memory
         cap = int(inc.get("store_preload_max_rows", 2000000))
         store.preload("partition_state", uuids=uu, max_rows=cap)
         store.preload("commit_partition", start=act_from, uuids=uu, max_rows=cap)
@@ -222,16 +207,12 @@ def run_detect(spark, scan_id, config, report=True):
             days = max([int(t.get("lateness_lookback_days") or 30) for t in tms] or [30])
             store.preload("late_hist", start=datetime.now(timezone.utc).date() - timedelta(days=days),
                           uuids=uu, max_rows=cap)
-    pstate = load_partition_state(store, tms) if mode3 != "off" else {}
-    compactions, late_hists = ((load_compactions(store, tms, act_from), load_late_hists(store, tms))
-                               if mode3 != "off" else ({}, {}))
+    pstate = load_partition_state(store, tms)
+    late_hists = load_late_hists(store, tms) if mode3 != "off" else {}
     changes = []
-    if mode4 != "off" and not pstate:
-        pstate = load_partition_state(store, tms)
-    hold_act = (load_holds_activity(store, tms, max((t["scanned_ms"] for t in tms), default=0),
-                                    float(inc.get("churn_window_h", 24)), float(inc.get("hot_cap_minutes", 1440)))
-                if mode4 != "off" and tms else {})
-    hold_changes = []
+    hold_act = (load_holds_activity(store, tms, scan_ms, float(inc.get("churn_window_h", 24)),
+                                    float(inc.get("hot_cap_minutes", 1440)))
+                if tms else {})
     mode5 = mode_of(config, "new_findings")
     new_changes = []
     mode6 = mode_of(config, "expiry_policy")
@@ -244,25 +225,30 @@ def run_detect(spark, scan_id, config, report=True):
         tr.begin(table)
         tr.log("detect", "inputs", partitions=len(parts.get(table, [])), history_scans=len(history.get(uuid, [])),
                actions=len(actions.get(uuid, [])), hot_partition_minutes=cfg.get("hot_partition_minutes"),
-               families=f"learned_windows={mode3} partition_holds={mode4} new_findings={mode5} "
+               families=f"learned_windows={mode3} new_findings={mode5} "
                         f"expiry_policy={mode6} writer_findings={mode7}")
         tr.variant("today")
-        current = symptom_rules.evaluate(table, tm, parts.get(table, []), cfg,
+        # the conflict hold's and the churn advice's facts, per partition (holds.py)
+        fields = json.loads(tm.get("partition_fields_json") or "[]")
+        rows_used = hl.holds_rows(parts.get(table, []), pstate.get(uuid, {}), hold_act.get(uuid, {}), fields,
+                                  tm["scanned_ms"])
+        tr.rows("detect.holds_rows", rows_used, ["partition_key", "minutes_since_update", "hours_since_end",
+                                                 "minutes_since_conflict", "removed_bytes_window",
+                                                 "rewrite_commits_window", "rewrite_rate"])
+        current = symptom_rules.evaluate(table, tm, rows_used, cfg,
                                          history=history.get(uuid, []), actions=actions.get(uuid, []))
-        mine, rows_used = current, parts.get(table, [])
+        mine = current
         if mode3 != "off" and uuid in pstate and tm.get("hot_window_min") is not None:
-            # GL2.5o: the same rules with learned windows and the ledger's per-partition age
+            # GL2.5o: the same rules with the learned hot window and the lateness evidence
             inc = config.get("incremental") or {}
-            cfg2 = dict(cfg, hot_partition_minutes=tm["hot_window_min"], settle_hours=tm.get("settle_window_h"),
+            cfg2 = dict(cfg, hot_partition_minutes=tm["hot_window_min"],
                         learned_windows=True, min_batches=int(inc.get("min_batches", inc.get("min_samples", 20))))
-            rows2 = win.learned_rows(parts.get(table, []), pstate[uuid],
-                                     json.loads(tm.get("partition_fields_json") or "[]"), tm["scanned_ms"],
-                                     compactions.get(uuid, {}), late_hists.get(uuid, {}))
+            rows2 = win.learned_rows(rows_used, pstate[uuid], fields, tm["scanned_ms"], late_hists.get(uuid, {}))
             tr.variant("learned_windows")
             tr.log("detect", "learned windows", hot_window_min=tm["hot_window_min"],
-                   settle_window_h=tm.get("settle_window_h"))
+                   lateness_p99_h=tm.get("lateness_p99_h"))
             tr.rows("detect.learned_rows", rows2, ["partition_key", "minutes_since_update", "hours_since_end",
-                                                   "compactions_since_end", "p_more_late", "last_write_label"])
+                                                   "p_more_late", "last_write_label"])
             learned = symptom_rules.evaluate(table, tm, rows2, cfg2,
                                              history=history.get(uuid, []), actions=actions.get(uuid, []))
             d = win.diff(current, learned)
@@ -270,25 +256,6 @@ def run_detect(spark, scan_id, config, report=True):
             changes.append((tm, d))
             if mode3 == "on":
                 mine, cfg, rows_used = learned, cfg2, rows2
-        if mode4 != "off" and uuid in pstate:
-            # GL2.6b: the same rules as the findings above, with the revised holds
-            fields = json.loads(tm.get("partition_fields_json") or "[]")
-            rows4 = hl.holds_rows(rows_used, pstate[uuid], hold_act.get(uuid, {}), fields, tm["scanned_ms"])
-            tr.variant("partition_holds")
-            tr.rows("detect.holds_rows", rows4, ["partition_key", "minutes_since_update", "hours_since_end",
-                                                 "minutes_since_conflict", "removed_bytes_window",
-                                                 "rewrite_commits_window", "rewrite_rate"])
-            revised = symptom_rules.evaluate(table, tm, rows4, dict(cfg, revised_holds=True),
-                                             history=history.get(uuid, []), actions=actions.get(uuid, []))
-            d4 = hl.diff_actions(mine, revised)
-            tr.log("detect.diff", "partition_holds: " + ("; ".join(d4) if d4 else "no change"))
-            churny = [r for r in rows4 if (r.get("rewrite_rate") or 0) >= cfg["thresholds"].get("churn_partition_rate", 1.0)]
-            note = (f"hot {float(cfg.get('hot_partition_minutes', 15)):g} min; "
-                    f"{len(churny)} partition(s) at rewrite rate >= "
-                    f"{cfg['thresholds'].get('churn_partition_rate', 1.0):g} / {inc.get('churn_window_h', 24)} h")
-            hold_changes.append((tm, d4, note))
-            if mode4 == "on":
-                mine, cfg, rows_used = revised, dict(cfg, revised_holds=True), rows4
         if mode5 != "off":
             # GL2.6c: the same rules plus DELETE_FILE_SPRAWL, RETAINED_STORAGE, METADATA_BLOAT
             tr.variant("new_findings")
@@ -342,8 +309,6 @@ def run_detect(spark, scan_id, config, report=True):
         findings += mine
     if mode3 != "off":
         record_window_changes(log, scan_id, detected_at, mode3, changes, report)
-    if mode4 != "off":
-        record_holds_changes(log, scan_id, detected_at, mode4, hold_changes, report)
     if mode5 != "off":
         record_holds_changes(log, scan_id, detected_at, mode5, new_changes, report,
                              family="new_findings", title="New findings", baseline="today's findings")

@@ -806,6 +806,8 @@ make gl-scan FRESH_S3=1                        # hot partition: hot_partitions_l
 
 ## GL2.5o — Incremental scan, family 3: learned windows (shadow)
 
+> Retired 2026-10-10: the settle window and SETTLING (below) are gone; family 3 keeps the hot window (shadow, item 13) and the lateness facts for LATE_ARRIVALS. See "Holds and settle retired" at the end.
+
 Two waits are learned per table instead of one fixed number (`windows.py`):
 
 | Window | Learned from | Rule | Bounds |
@@ -847,6 +849,8 @@ make gl-sql Q="SELECT table_name, ledger_value AS windows, note AS changes FROM 
 ```
 
 ### GL2.5o+ — Settle rule revised: bounded re-compaction, LATE_ARRIVALS, possible full refreshes
+
+> The settle rule was retired 2026-10-10 (see "Holds and settle retired" at the end); LATE_ARRIVALS and the full-refresh rules stay.
 
 The first SETTLING rule (wait unless excess ≥ 3× the threshold) looked only at
 file counts. Re-compaction is often cheap (binpack rewrites only files outside
@@ -1026,6 +1030,8 @@ distribution, so each load commit split its files by customer_id and the table
 was never poorly clustered.
 
 ## GL2.6b — Revised partition holds (group 2, shadow)
+
+> Since 2026-10-10 the conflict hold is the only hold and has no switch; the still-filling branch and the churn holds are gone (see "Holds and settle retired" at the end).
 
 Two holds keep a partition out of compaction; both were coarser than they need
 to be (`holds.py`, new family `incremental.partition_holds`).
@@ -1935,4 +1941,40 @@ To check on the cluster:
 ```
 make gl-image
 make gl-scan      # scorecard: s12 PASS (fixed: RETAINED_STORAGE; REWRITE_CHURN resolved), s17 scored; expect 22/22
+```
+
+## Holds and settle retired (plan item 12, first part)
+
+The tier rule replaces the waits that kept partitions out of compaction. This
+step removes them; the tier rule itself (minor and major passes) comes next.
+
+| Removed | What it did | Now |
+|---|---|---|
+| SETTLING, `max_settle_compactions` | after 2 compactions inside the settle window, wait | gone; a partition is compacted whenever it has small files and no conflict |
+| the learned settle window (`settle_window_h`, `settle_window_source`, `incremental.settle_cap_hours`, `windows.learned_settle`) | p99 lateness, how long late data was expected | gone; lateness stays as evidence and LATE_ARRIVALS advice |
+| the still-filling hold | held a time partition whose range had not ended and that was written in the hot window | gone: appends never hold a partition |
+| the `partition_holds` switch and the older rule it was compared with (hold anything written in the hot window) | on / shadow / off | gone: the conflict hold is the rule |
+| the per-partition churn hold and the table-wide REWRITE_CHURN hold | SMALL_FILES turned advisory | SMALL_FILES stays auto; the finding carries churn advice for the owner (rewrite rate, merge-on-read); REWRITE_CHURN is still its own approval finding |
+
+The one hold left: a writer commit that removed data files or added or
+removed delete files in the partition within `hot_partition_minutes`
+(HOT_PARTITION, defer). A table with no activity rows yet is never held.
+The learned hot window stays in shadow until item 13 decides it.
+
+Scenario changes: s3 (a writer appending into today) now finds SMALL_FILES on
+both days and no HOT_PARTITION; it is no longer marked fresh. s12 allows
+SMALL_FILES (compacted as usual under churn). s19's reloaded day is
+SMALL_FILES auto with churn advice. `build_test_tables.py --no-wait` (was
+`--no-settle`, still accepted) skips the wait at the end, which still matters
+for tables built with deletes or merges. `make gl-scan FRESH_S3=1` is gone: s3 no
+longer needs scanning inside a hot window (rebuild a table with
+`make gl-test-tables TT_ARGS="--only s3"` when needed).
+
+To check on the cluster:
+
+```
+make gl-image
+make gl-scan                 # no "Partition holds" block; learned windows show lateness p99, no settle
+make gl-test-tables TT_ARGS="--only s3" && make gl-scan    # s3: SMALL_FILES x2, no HOT_PARTITION
+make gl-plan T=s3            # the rewrite covers both days
 ```

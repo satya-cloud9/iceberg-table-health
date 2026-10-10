@@ -34,8 +34,8 @@ Steps:
             glue.demo.live_append_unpart (unpartitioned) and live_append_days
             (by day), each 1 healthy file + 6 small appends into 2026-09-03 (a
             day long ended), then scans and detects them in the same job, inside
-            the hot window. Today's hot hold defers both; the revised holds
-            (shadow) should not: HOT_PARTITION:defer -> SMALL_FILES:auto. The
+            the hot window. Appends never hold a partition (the only hold is
+            a conflicting commit), so both get SMALL_FILES:auto. The
             scratch tables aren't in expectations.json, so the scorecard ignores
             them. The scan covers only these two tables, so run make gl-scan
             afterwards before make gl-plan, which reads the latest scan.
