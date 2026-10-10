@@ -2065,3 +2065,63 @@ make gl-scan                         # "Tiering (minor / major / wait) (on)"; sc
 make gl-step STEP=unpart-appends     # live_unpart_appends: UNPARTITIONED_APPENDS, SMALL_FILES as a minor
 make gl-step STEP=append-live        # the two live tables: wait now, major after compaction.cold_hours
 ```
+
+### Item 13, first part: what conflicts, declared windows, the hold limit (s10a)
+
+**What counts as a conflict.** The hold (HOT_PARTITION, defer) protects a writer
+from a compaction committing first and failing its commit. Only a writer commit
+that can fail that way counts, per partition: data files removed (copy-on-write
+MERGE, UPDATE, DELETE, INSERT OVERWRITE), delete files removed, or position
+deletes / deletion vectors added (merge-on-read). Equality deletes never count:
+a rewrite keeps its starting sequence number, so they still apply to the new
+files, and Iceberg skips them in the rewrite's validation
+(`MergingSnapshotProducer.validateNoNewDeletesForDataFiles`). Neither do the
+position deletes a Flink-style upsert writes next to them (equality deletes
+added, no data file removed, data files added: they point only at that
+commit's own files). Partition activity now counts `pos_delete_files_added`
+and `eq_delete_files_added`; rows from before count any added delete file.
+Every rewrite the plan builds states `use-starting-sequence-number` `true`
+(Iceberg's default), so this never silently stops holding.
+
+**`advisor.compact.blackout`** (table property): comma-separated UTC ranges,
+`HH:MM-HH:MM` every day or `Sun HH:MM-HH:MM` on that weekday; a range may cross
+midnight (the weekday is the day it starts). A run inside one holds every
+partition of the table (HOT_PARTITION, "compact after the blackout ends").
+Text that isn't understood is ignored and shown in the trace.
+
+**`advisor.mutable-days`** (table property): a time partition that ended less
+than that many days ago gets no major (a merge may still rewrite it); minors run
+as usual.
+
+**Hold limit.** A partition the conflict hold held at every run for
+`thresholds.hold_limit_hours` (test 0.2, production 24) is starved. For time
+partitions the clock starts only after the partition's end plus the
+late-arrival allowance (`advisor.mutable-days`, else the learned lateness p99
+from at least min_batches batches, else `hold_busy_default_hours` 24), so
+today's partition of a CDC table, busy all day, never counts. Runs come from
+the table's last 30 scans; when those all held it, the writer's unbroken
+conflicting commits (no gap of the conflict window) carry the series further
+back. Runs inside a blackout are neutral, and a blackout is never overridden.
+
+**HOLD_STARVED** (approval, one per table) lists the starved partitions with
+how long they were held, their files, and the writer's conflicting commits,
+median and longest gap. The remedy follows the gaps: the writer never paused
+for the window (pause it around a scheduled run, or commit less often), or it
+did and no run landed in the pause (schedule a run then). `APPROVE=HOLD_STARVED`
+runs one major-shaped rewrite of those partitions (partial progress; a
+concurrent writer commit may fail). With `thresholds.hold_limit_action` `auto`
+the starved partitions are compacted anyway, with that risk in the remedy.
+
+To check on the cluster (the step takes ~15 min):
+
+```
+make gl-image
+make gl-scan                                   # scorecard unchanged
+make gl-step STEP=merge-holds TIMEOUT=30       # live_merge_cdc HOT_PARTITION + HOLD_STARVED;
+                                               # live_blackout HOT_PARTITION (blackout);
+                                               # live_mutable_days major for 2026-09-20, minor for the recent day
+```
+
+Equality deletes can't be written from Spark SQL, so their exclusion is covered
+by the unit tests only. Item 13's second part: learned merge windows (shadow)
+and retiring the learned hot window.

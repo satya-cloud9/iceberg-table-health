@@ -63,6 +63,33 @@ def latest_scan_id(spark, config=None):
     return r[0]["scan_id"] if r else None
 
 
+def hold_settings(cfg, tm, history, horizon_ms):
+    """Item 13: what holds.holds_rows needs for the declared blackout and the hold
+    limit. The late-arrival allowance after a time partition ends: the table's
+    advisor.mutable-days, else its learned lateness p99 (from at least min_batches
+    batches), else thresholds.hold_busy_default_hours."""
+    th = cfg.get("thresholds") or {}
+    props = json.loads(tm.get("properties_json") or "{}")
+    busy, src = None, None
+    try:
+        if props.get("advisor.mutable-days") not in (None, ""):
+            busy, src = float(props["advisor.mutable-days"]) * 24, "advisor.mutable-days"
+    except (TypeError, ValueError):
+        busy = None
+    if busy is None and tm.get("lateness_p99_h") is not None \
+            and (tm.get("lateness_p99_batches") or 0) >= int(cfg.get("min_batches", 20)):
+        # like LATE_ARRIVALS: a p99 of a few batches is just the worst of them
+        busy, src = float(tm["lateness_p99_h"]), "learned lateness p99"
+    if busy is None:
+        busy, src = float(th.get("hold_busy_default_hours", 24)), "thresholds.hold_busy_default_hours"
+    tm["hold_busy_h"], tm["hold_busy_source"] = busy, src
+    return {"blackout": props.get("advisor.compact.blackout"),
+            "window_min": float(cfg.get("hot_partition_minutes", 15)),
+            "limit_h": float(th.get("hold_limit_hours", 24)), "busy_h": busy,
+            "scan_times": [h["scanned_ms"] for h in history or [] if h.get("scanned_ms") is not None],
+            "horizon_ms": int(horizon_ms)}
+
+
 def load_history(store, tms, window_hours=168):
     """Per table UUID: earlier scans (oldest first, up to the current one) and the
     recent advisor actions, from the state store (table_state's trend, action_state),
@@ -209,8 +236,13 @@ def run_detect(spark, scan_id, config, report=True):
     scan_ms = max((t["scanned_ms"] for t in tms), default=0)
     # activity is read back only as far as a rule looks: the churn window (advice)
     # and the hot cap (the conflict hold)
+    th0 = (config.get("defaults") or {}).get("thresholds") or {}
+    hold_h = float(th0.get("hold_limit_hours", 24))
     act_from = scan_ms - int(max(float(inc.get("churn_window_h", 24)) * 3600000,
-                                 float(inc.get("hot_cap_minutes", 1440)) * 60000))
+                                 float(inc.get("hot_cap_minutes", 1440)) * 60000,
+                                 # item 13: the hold limit looks back over the runs of the last limit
+                                 (hold_h + 1) * 3600000
+                                 + float((config.get("defaults") or {}).get("hot_partition_minutes", 15)) * 60000))
     uu = _uuids(tms)
     if uu:                                     # one read per kind, then per-table lookups in memory
         cap = int(inc.get("store_preload_max_rows", 2000000))
@@ -224,7 +256,7 @@ def run_detect(spark, scan_id, config, report=True):
     late_hists = load_late_hists(store, tms) if mode3 != "off" else {}
     changes = []
     hold_act = (load_holds_activity(store, tms, scan_ms, float(inc.get("churn_window_h", 24)),
-                                    float(inc.get("hot_cap_minutes", 1440)))
+                                    max(float(inc.get("hot_cap_minutes", 1440)), (scan_ms - act_from) / 60000.0))
                 if tms else {})
     mode5 = mode_of(config, "new_findings")
     new_changes = []
@@ -246,10 +278,11 @@ def run_detect(spark, scan_id, config, report=True):
         # the conflict hold's and the churn advice's facts, per partition (holds.py)
         fields = json.loads(tm.get("partition_fields_json") or "[]")
         rows_used = hl.holds_rows(parts.get(table, []), pstate.get(uuid, {}), hold_act.get(uuid, {}), fields,
-                                  tm["scanned_ms"])
+                                  tm["scanned_ms"], hold_settings(cfg, tm, history.get(uuid, []), act_from))
         tr.rows("detect.holds_rows", rows_used, ["partition_key", "minutes_since_update", "hours_since_end",
                                                  "minutes_since_conflict", "removed_bytes_window",
-                                                 "rewrite_commits_window", "rewrite_rate"])
+                                                 "rewrite_commits_window", "rewrite_rate", "blackout",
+                                                 "held_h", "busy_until_ms", "hold_starved"])
         current = symptom_rules.evaluate(table, tm, rows_used, cfg,
                                          history=history.get(uuid, []), actions=actions.get(uuid, []))
         mine = current

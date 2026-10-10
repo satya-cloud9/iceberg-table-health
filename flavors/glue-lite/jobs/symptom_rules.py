@@ -26,7 +26,7 @@ import re
 import gltrace as tr
 import holds as hl
 
-RULE_VERSION = "t2-2"
+RULE_VERSION = "t2-3"
 
 # symptom -> (category, level, action, remedy)
 CATALOG = {
@@ -47,6 +47,11 @@ CATALOG = {
                               "a large unpartitioned table appended to all the time: every append spans the "
                               "key range again, so no sort holds; partition by time and sort within each "
                               "partition; until then minors only (no whole-table re-sort)"),
+    "HOLD_STARVED":          ("operations", "table", "approval",
+                              "partitions held at every run for the hold limit: a writer keeps changing their "
+                              "files (merge, update, delete) and never pauses long enough for compaction; "
+                              "approve a one-off compaction (risk: one failed writer commit), pause the "
+                              "writer around a scheduled run, or commit less often"),
     "DELETE_BUILDUP":        ("file_layout", "partition", "auto",
                               "rewrite_data_files with delete-file-threshold, then "
                               "rewrite_position_delete_files"),
@@ -178,6 +183,9 @@ def tier_decision(r, small, tiers):
                       has waited minor_max_wait_hours (and there are at least 2)
       never cold      tiers["never_cold"] (a large unpartitioned table with
                       continuous appends, unpartitioned_appends): minor or wait only
+      mutable zone    a time partition that ended less than tiers["mutable_days"]
+                      (advisor.mutable-days) ago: merges may still rewrite it, so
+                      no major yet; minors as usual (item 13)
     r needs fragments, undersized_segments, minutes_since_update and
     oldest_fragment_age_h."""
     frags = _num(r.get("fragments"))
@@ -185,7 +193,10 @@ def tier_decision(r, small, tiers):
     cold_h, wait_h = float(tiers["cold_hours"]), float(tiers["minor_max_wait_hours"])
     min_frags = int(tiers["minor_min_fragments"])
     never_cold = bool(tiers.get("never_cold"))
-    cold = not never_cold and (minutes is None or minutes >= cold_h * 60)
+    mutable_h = None if tiers.get("mutable_days") is None else float(tiers["mutable_days"]) * 24
+    since_end = r.get("hours_since_end")
+    mutable = mutable_h is not None and since_end is not None and since_end < mutable_h
+    cold = not never_cold and not mutable and (minutes is None or minutes >= cold_h * 60)
     age = r.get("oldest_fragment_age_h")
     if cold:
         if small:
@@ -196,6 +207,11 @@ def tier_decision(r, small, tiers):
         return "minor", f"warm, {frags} fragments (>= {min_frags}): a minor pass over the fragments"
     if frags >= 2 and age is not None and age >= wait_h:
         return "minor", f"warm, oldest fragment {age:.1f} h old (>= {wait_h:g} h): a minor pass over the fragments"
+    if (small or frags) and mutable:
+        return "wait", (f"inside the mutable zone (advisor.mutable-days {float(tiers['mutable_days']):g}: merges may "
+                        f"still rewrite it for {mutable_h - since_end:.1f} h more), so no major yet; "
+                        f"{frags} fragments (minor at {min_frags}, or once the oldest has waited {wait_h:g} h"
+                        + (f"; now {age:.1f} h" if age is not None else "") + ")")
     if (small or frags) and never_cold:
         return "wait", (f"never cold (large unpartitioned table with continuous appends: minors only); "
                         f"{frags} fragments (minor at {min_frags}, or once the oldest has waited {wait_h:g} h"
@@ -224,6 +240,8 @@ def partition_findings(table, rows, th, hot_minutes, new_findings=False, tiers=N
     (the plan builds the matching CALL), or the finding waits (defer)."""
     out = []
     min_excess = th["min_excess_files"]
+    starved = []
+    limit_action = str(th.get("hold_limit_action", "approval")).lower()
     for r in rows:
         key = r.get("partition_key")
         excess = _num(r.get("excess_files"))
@@ -267,10 +285,32 @@ def partition_findings(table, rows, th, hot_minutes, new_findings=False, tiers=N
                        if new_findings else "off"),
                hot=f"{hot_reason or 'no hold'}", rewrite_rate=r.get("rewrite_rate"),
                hours_since_end=None if r.get("hours_since_end") is None else round(r["hours_since_end"], 1))
+        forced = None
+        if r.get("held_h") is not None:
+            ev["held_h"] = r["held_h"]
         if (small or deletes or sprawl) and hot:
-            remedy = f"wait: {hot_reason}; compact once {hot_minutes:g} min have passed without another"
-            out.append(_finding(table, "HOT_PARTITION", max(excess / min_excess, 1.0), ev, key, remedy=remedy))
-            continue
+            if r.get("blackout"):
+                remedy = f"wait: {hot_reason}; compact after the blackout ends"
+            else:
+                remedy = f"wait: {hot_reason}; compact once {hot_minutes:g} min have passed without another"
+            if r.get("hold_starved") and not r.get("blackout"):
+                held_h = r.get("held_h") or 0
+                if limit_action == "auto":
+                    # the owner accepted the risk: compact despite the conflicts
+                    forced = (f"hold limit reached (held at every run for {held_h:g} h, limit "
+                              f"{float(th.get('hold_limit_hours', 24)):g} h; hold_limit_action auto): compacted "
+                              f"despite the writer's conflicting commits; a concurrent writer commit may fail")
+                    hot = False
+                else:
+                    remedy += f"; held at every run for {held_h:g} h (HOLD_STARVED)"
+                    starved.append(dict(partition_key=key, held_h=held_h, data_files=data_files, excess_files=excess,
+                                        delete_files=del_files,
+                                        **{k: r.get(k) for k in ("conflicting_commits", "median_gap_min",
+                                                                 "longest_gap_min", "longest_gap_at")}))
+            if hot:
+                out.append(_finding(table, "HOT_PARTITION", max(excess / min_excess, 1.0), ev, key, remedy=remedy))
+                continue
+        first_new = len(out)
         tier, tier_reason = (None, None)
         if tiers is not None and r.get("fragments") is not None:
             tier, tier_reason = tier_decision(r, small, tiers)
@@ -324,7 +364,39 @@ def partition_findings(table, rows, th, hot_minutes, new_findings=False, tiers=N
         if _num(r.get("oversized_files")) >= th["min_oversized_files"]:
             out.append(_finding(table, "OVERSIZED_FILES",
                                 _num(r.get("oversized_files")) / th["min_oversized_files"], ev, key))
+        if forced:
+            for f in out[first_new:]:
+                f["remedy"] = f"{f['remedy']}; {forced}"
+                f["evidence_json"] = json.dumps(dict(json.loads(f["evidence_json"]), hold_limit_forced=True),
+                                                sort_keys=True, default=str)
+    if starved:
+        out.append(hold_starved_finding(table, starved, th, hot_minutes))
     return out
+
+
+def hold_starved_finding(table, starved, th, hot_minutes):
+    """HOLD_STARVED (item 13): one table finding listing the partitions the conflict
+    hold held at every run for the hold limit (time partitions: counted only after
+    their end plus the late-arrival allowance). The remedy follows the writer's
+    gaps: it never paused for the conflict window, or it did and no run landed in
+    the pause."""
+    limit = float(th.get("hold_limit_hours", 24))
+    longest = max((p.get("longest_gap_min") or 0) for p in starved)
+    at = next((p.get("longest_gap_at") for p in starved if (p.get("longest_gap_min") or 0) == longest), None)
+    keys = ", ".join(str(p["partition_key"]) for p in starved[:5]) + (f" and {len(starved) - 5} more"
+                                                                       if len(starved) > 5 else "")
+    if longest >= hot_minutes:
+        why = (f"the writer does pause (longest gap {longest:g} min, from {at}) but no run landed in the pause: "
+               f"schedule a run then, or pause the writer around a scheduled run")
+    else:
+        why = (f"the writer never paused {hot_minutes:g} min (longest gap {longest:g} min): pause it around a "
+               f"scheduled run, or commit less often")
+    remedy = (f"{len(starved)} partition(s) held at every run for at least {limit:g} h ({keys}): {why}; or approve "
+              f"a one-off compaction of them (APPROVE=HOLD_STARVED; a concurrent writer commit may fail)")
+    ev = {"partitions": starved, "hold_limit_hours": limit, "conflict_window_min": hot_minutes,
+          "hold_limit_action": str(th.get("hold_limit_action", "approval"))}
+    score = max(float(p.get("held_h") or 0) for p in starved) / max(limit, 0.01)
+    return _finding(table, "HOLD_STARVED", score, ev, remedy=remedy)
 
 
 def table_findings(table, tm, rows, th, cfg):
@@ -917,7 +989,13 @@ def tiers_of(cfg, tm):
     table with continuous appends (unpartitioned_appends)."""
     c = cfg.get("compaction") or {}
     props = _props(tm)
+    md = props.get("advisor.mutable-days")
+    try:
+        md = None if md in (None, "") else max(0.0, float(md))
+    except (TypeError, ValueError):
+        md = None
     return {"never_cold": unpartitioned_appends(tm, cfg.get("thresholds") or {})[0],
+            "mutable_days": md,
             "fragment_ratio": float(c.get("fragment_ratio", 8)),
             "minor_min_fragments": int(c.get("minor_min_fragments", 8)),
             "minor_max_wait_hours": float(props.get("advisor.compact.minor-max-wait-hours")

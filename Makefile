@@ -149,7 +149,7 @@ gl-status:
 	  && (kubectl top nodes 2>/dev/null || true) && docker stats --no-stream --format "table {{.Name}}\t{{.MemUsage}}\t{{.CPUPerc}}"'
 
 gl-step:
-	JOB_TIMEOUT_MIN=20 bash flavors/glue-lite/scripts/run-job.sh py scenario_step.py $(STEP)
+	JOB_TIMEOUT_MIN=$(or $(TIMEOUT),20) bash flavors/glue-lite/scripts/run-job.sh py scenario_step.py $(STEP)
 
 # Group runs (profiles.py, coordinator.py): one group of config/profile.json per job.
 #   make gl-group G=group_a [SHARD=0/1] [SCAN_ARGS=--full]

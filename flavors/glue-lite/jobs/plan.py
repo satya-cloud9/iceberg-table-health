@@ -262,6 +262,10 @@ def _rewrite_step(chosen, kind, skipped, active, names, tm, cfg, th, rw, ident, 
             n = int(json.loads(f.get("evidence_json") or "{}").get("data_files", 0))
             per_part[f["partition_key"]] = max(per_part.get(f["partition_key"], 0), n)
     files_in_scope = sum(per_part.values())
+    # item 13: new files keep the rewrite's starting sequence number (Iceberg's default,
+    # stated so it is never turned off): equality deletes committed meanwhile still apply
+    # to them, so they don't conflict, which is why they never hold a partition
+    opts["use-starting-sequence-number"] = "true"
     if kind:
         opts["partial-progress.enabled"] = "true"
         opts["partial-progress.max-commits"] = str(rw.get("tier_partial_progress_max_commits", 3))
@@ -529,6 +533,18 @@ def plan_table(table, findings, tm, cfg, now=None, freed=None):
                 continue
             stmt = (f"CALL glue.system.remove_orphan_files(table => '{ident}', "
                     f"older_than => {{orphan_cutoff}}, prefix_listing => true)")
+        elif f["symptom"] == "HOLD_STARVED":
+            # approved: one compaction of the starved partitions despite the conflict hold
+            # (major-shaped: today's band plus deletes; partial progress keeps what finishes)
+            chosen_s = [(p["partition_key"], {"score": float(p.get("held_h") or 0),
+                                              "symptoms": {"SMALL_FILES"} | ({"DELETE_BUILDUP"}
+                                                                             if p.get("delete_files") else set()),
+                                              "passes": {"major"}})
+                        for p in ev.get("partitions") or [] if p.get("partition_key") is not None]
+            st = _rewrite_step(chosen_s, "major", [], active, names, tm, cfg, th, rw, ident, fields, target, now) \
+                if chosen_s else None
+            if st:
+                stmt = st["statement"]
         elif f["symptom"] == "UNPARTITIONED_APPENDS":
             # partition evolution: new appends land in time partitions, sorted within;
             # files already written stay in the old layout until a MIXED_SPEC rewrite
@@ -567,7 +583,7 @@ def plan_table(table, findings, tm, cfg, now=None, freed=None):
 
 # approved suggestions by what they change: configuration first, rewrites with
 # the data passes, expiry and orphans at the end
-APPROVED_PHASE = {"MIXED_SPEC": 3, "POOR_CLUSTERING": 3, "OVER_PARTITIONED": 3,
+APPROVED_PHASE = {"MIXED_SPEC": 3, "POOR_CLUSTERING": 3, "OVER_PARTITIONED": 3, "HOLD_STARVED": 3,
                   "RETAINED_STORAGE": 7, "ORPHAN_FILES": 9}
 
 

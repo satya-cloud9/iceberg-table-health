@@ -39,7 +39,8 @@ ACTIVITY_DDL = """
     data_files_added BIGINT, data_bytes_added BIGINT, records_added BIGINT,
     delete_files_added BIGINT, delete_bytes_added BIGINT,
     data_files_removed BIGINT, data_bytes_removed BIGINT, delete_files_removed BIGINT,
-    lateness_h DOUBLE, scan_id STRING, label STRING"""
+    lateness_h DOUBLE, scan_id STRING, label STRING,
+    pos_delete_files_added BIGINT, eq_delete_files_added BIGINT"""
 
 PARTITION_STATE_DDL = """
     table_uuid STRING, partition_key STRING, last_write_ms BIGINT, last_compaction_ms BIGINT,
@@ -140,6 +141,7 @@ def aggregate(snapshot, files):
             "partition_key": f["partition_key"], "data_files_added": 0, "data_bytes_added": 0,
             "records_added": 0, "delete_files_added": 0, "delete_bytes_added": 0,
             "data_files_removed": 0, "data_bytes_removed": 0, "delete_files_removed": 0,
+            "pos_delete_files_added": 0, "eq_delete_files_added": 0,
             "lateness_h": None, "_end": None})
         data = f["content"] == 0
         if f["change"] == "added":
@@ -152,6 +154,9 @@ def aggregate(snapshot, files):
             else:
                 r["delete_files_added"] += 1
                 r["delete_bytes_added"] += int(f["bytes"] or 0)
+                # item 13: position deletes (and deletion vectors) name files and can
+                # conflict with a rewrite; equality deletes never do
+                r["eq_delete_files_added" if f["content"] == 2 else "pos_delete_files_added"] += 1
         else:
             if data:
                 r["data_files_removed"] += 1

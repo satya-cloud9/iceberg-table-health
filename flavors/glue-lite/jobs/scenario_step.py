@@ -40,6 +40,12 @@ Steps:
             them. The scan covers only these two tables, so run make gl-scan
             afterwards before make gl-plan, which reads the latest scan.
 
+  merge-holds (item 13, ~15 min: make gl-step STEP=merge-holds TIMEOUT=30)
+            live_merge_cdc gets a MERGE before each of 6 scans 2.5 min apart:
+            HOT_PARTITION + HOLD_STARVED; live_blackout is inside its declared
+            blackout: HOT_PARTITION; live_mutable_days: a major for the old day,
+            a minor, never a major, for the recent one (advisor.mutable-days 7).
+
   unpart-appends (item 12) rebuilds the scratch table live_unpart_appends:
             unpartitioned, target 1 MiB, sorted by customer_id, 24 appends
             (each a new hour of occurred_at, each spanning every customer_id),
@@ -257,7 +263,66 @@ def unpart_appends(spark, args):
           "continuous appends gets minors only)", flush=True)
 
 
-STEPS = {"append-live": append_live, "unpart-appends": unpart_appends, "s12-mor": s12_mor, "grow": grow, "rollback": rollback, "expire-gap": expire_gap,
+def merge_holds(spark, args):
+    """Item 13 on the cluster, three scratch tables (not in expectations.json):
+      live_merge_cdc     by day; 1 healthy file + 6 small appends into 2026-09-03,
+                         then a copy-on-write MERGE of 20 rows of the healthy file
+                         right before each of 6 scans about 2.5 min apart (a CDC
+                         writer that never pauses for the conflict window): held at
+                         every run for over hold_limit_hours (0.2 h at test scale),
+                         so HOT_PARTITION plus HOLD_STARVED (approval)
+      live_blackout      by day, small files, advisor.compact.blackout covering now:
+                         HOT_PARTITION (blackout), though nothing conflicts
+      live_mutable_days  by day, advisor.mutable-days 7; small files (3 fragments)
+                         in 2026-09-20 and in a day 3 days ago, cold by the last scan:
+                         a major for 2026-09-20; the recent day is in the mutable zone,
+                         so no major: a minor (its oldest fragment has waited the
+                         minor wait time)
+    The last scan covers all three and prints the findings."""
+    from datetime import date, timedelta
+    from detect_symptoms import run_detect
+    from scan_metrics import run_scan
+    b = Builder(spark)
+    b.next_id = 95_000_000 + int(time.time()) % 1_000_000 * 100
+    rng = random.Random(13)
+    now = datetime.now(timezone.utc)
+    cdc, black, mut = f"{NS}.live_merge_cdc", f"{NS}.live_blackout", f"{NS}.live_mutable_days"
+    d = date(2026, 9, 3)
+    b.create(cdc, "days(occurred_at)", {})
+    first = b.next_id
+    b.day(cdc, d, 100_000)
+    b.fragment(cdc, d, commits=6, files_per_commit=1, rows_per_commit=500)
+    h = now.hour
+    window = f"{(h - 1) % 24:02d}:00-{(h + 2) % 24:02d}:00"
+    b.create(black, "days(occurred_at)", {"advisor.compact.blackout": window})
+    b.day(black, d, 100_000)
+    b.fragment(black, d, commits=6, files_per_commit=1, rows_per_commit=500)
+    recent = (now - timedelta(days=3)).date()
+    b.create(mut, "days(occurred_at)", {"advisor.mutable-days": "7"})
+    for day_ in (date(2026, 9, 20), recent):
+        b.day(mut, day_, 100_000)
+        b.fragment(mut, day_, commits=5, files_per_commit=1, rows_per_commit=500)
+    print(f"  {cdc}: 1 healthy file + 6 small appends into {d}; {black}: blackout {window} UTC; "
+          f"{mut}: advisor.mutable-days 7, small files in 2026-09-20 and {recent}", flush=True)
+    config = gl.load_config(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "health.json"))
+    runs = 6
+    for i in range(runs):
+        merge_random_rows(spark, cdc, first, 100_000, 20, rng, f"cdc{i}")
+        last = i == runs - 1
+        names = ["live_merge_cdc"] + (["live_blackout", "live_mutable_days"] if last else [])
+        scan_id = run_scan(spark, NS, config, tables=names, report=False)
+        print(f"  run {i + 1}/{runs}: MERGE into {d}, then scan {scan_id}", flush=True)
+        if last:
+            run_detect(spark, scan_id, config, report=True)
+        else:
+            time.sleep(150)
+    print("  look for: live_merge_cdc HOT_PARTITION and HOLD_STARVED (held at every run for over 0.2 h, the "
+          "writer never paused 3 min); live_blackout HOT_PARTITION 'inside the table's compaction blackout'; "
+          f"live_mutable_days SMALL_FILES major for 2026-09-20 and a minor, not a major, for {recent} "
+          f"(mutable zone)", flush=True)
+
+
+STEPS = {"append-live": append_live, "unpart-appends": unpart_appends, "merge-holds": merge_holds, "s12-mor": s12_mor, "grow": grow, "rollback": rollback, "expire-gap": expire_gap,
          "rapid-commits": rapid_commits}
 
 

@@ -90,7 +90,11 @@
       "_unpartitioned_comment": "Item 12, family tiering: a large unpartitioned table (data_bytes >= unpartitioned_min_target_files x target) with continuous appends (>= unpartitioned_appends_min_commits_24h writer commits in 24 h) is never cold: the tier rule gives it minors or waits only, no whole-table major. UNPARTITIONED_APPENDS (approval) when one of its sort, filter or time columns (advisor.time-column) has an average overlap depth (files one value falls into, from the files' bounds) of at least unpartitioned_overlap_depth: partition by time and sort within. TEST SCALE 12 commits a day; production 48 (expiry's streaming category).",
       "unpartitioned_min_target_files": 8,
       "unpartitioned_appends_min_commits_24h": 12,
-      "unpartitioned_overlap_depth": 4
+      "unpartitioned_overlap_depth": 4,
+      "_holds_comment": "Item 13. The conflict hold counts only commits that can make a rewrite fail: data or delete files removed, or position deletes / deletion vectors added (equality deletes never, nor the position deletes a Flink-style upsert writes next to them). advisor.compact.blackout (table property: comma-separated UTC ranges 'HH:MM-HH:MM' or 'Sun HH:MM-HH:MM', may cross midnight) holds every partition while a run is inside it. advisor.mutable-days: a time partition that ended less than that many days ago gets no major (merges may still rewrite it); minors as usual. Hold limit: a partition the conflict hold held at every run for hold_limit_hours (time partitions: counted only from their end + the late-arrival allowance: advisor.mutable-days, else the learned lateness p99, else hold_busy_default_hours) is listed in HOLD_STARVED (approval: APPROVE=HOLD_STARVED compacts them once) or, with hold_limit_action auto, compacted anyway. A declared blackout is never overridden. TEST SCALE limit 0.2 h; production 24 h.",
+      "hold_limit_hours": 0.2,
+      "hold_limit_action": "approval",
+      "hold_busy_default_hours": 24
     },
     "rewrite": {
       "_comment": "Options plan.py puts on the CALLs. min_input_files null = min_excess_files + 1, so every flagged partition is one the rewrite will change.",
