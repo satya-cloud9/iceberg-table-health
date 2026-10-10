@@ -11,11 +11,14 @@ partition is younger than the hot window at scan time. Past that, the
 partition has legitimately cooled, so the result is STALE with a hint to
 rebuild, not FAIL.
 
-Output (GL2.5l): grouped by phase. "detect" = no fix yet, PASS means the
+Output (GL2.5l, per symptom since plan item 6): grouped by phase. "detect" = no fix yet, PASS means the
 problem the table was built with was found; "fixed" = an action that addressed
 one of those problems ran (fix_phase: housekeeping such as deleting freed files
-does not count), PASS means the table is now healthy. Fixed rows show that fix,
-detect rows the next step.
+does not count), PASS means every fixed symptom is gone (or within what the
+"after" block lets the fix leave), the others are still waiting for their own
+fix or resolved along the way, and nothing unexpected is found (score_table).
+Fixed rows show the fixes and the waiting or resolved symptoms, detect rows the
+next step.
 
 Pure scoring lives in score_table() and printing in render(), so both are
 unit-tested without Spark.
@@ -89,11 +92,31 @@ def _check(exp, hits, newest):
     return problems
 
 
-def score_table(table, expectation, findings, partition_rows, hot_minutes, phase="before", writer_age_min=None):
-    """-> dict(status, found, missing, unexpected, notes, phase).
+def _built(expectation):
+    """The symptoms a table was built with: its expect list and allow list."""
+    exp = expectation or {}
+    return [e["symptom"] for e in exp.get("expect", [])] + list(exp.get("allow", []))
 
-    phase "after" = plan.py has applied fixes to this table (same table UUID)
-    since it was built; the expectation's "after" block is used if it has one.
+
+def score_table(table, expectation, findings, partition_rows, hot_minutes, phase="before", writer_age_min=None,
+                fixed=None):
+    """-> dict(status, found, missing, unexpected, notes, phase, grades).
+
+    Graded per symptom (plan item 6). For each symptom the table was built with:
+      fixed by an advisor action (fixed)   it must be gone, or meet the "after"
+                                           block's entry for it (s1: at most one
+                                           SMALL_FILES left)
+      not fixed, the table has no fix yet  it must be found as built (detect)
+      not fixed, other fixes ran           found: waits for its own fix (pass,
+                                           the next step says what);
+                                           not found: resolved with the other
+                                           fixes, or aged out (HOT_PARTITION,
+                                           REWRITE_CHURN) - pass, noted
+    Symptoms only in the "after" block are allowed, with their constraints when
+    found (a scenario step's consequence, e.g. s12's DELETE_BUILDUP after the
+    switch to merge-on-read); any other active symptom is unexpected.
+    fixed: the built symptoms an advisor action addressed. None = from phase
+    (the earlier switch: "after" = every built symptom fixed).
     """
     active = [f for f in findings if f["action"] not in ("needs-evidence", "advisory", "acknowledged")]
     by_symptom = {}
@@ -106,23 +129,51 @@ def score_table(table, expectation, findings, partition_rows, hot_minutes, phase
 
     if expectation is None:
         return {"status": "NOT SCORED", "found": found, "missing": [], "unexpected": [], "notes": "",
-                "phase": phase}
-    fresh = expectation.get("fresh")
-    if phase == "after":
-        if "after" not in expectation:
-            return {"status": "NOT SCORED", "found": found, "missing": [], "unexpected": [],
-                    "notes": "fixed by plan.py; no 'after' expectations yet", "phase": phase}
-        expectation = expectation["after"]
+                "phase": phase, "grades": []}
+    built = _built(expectation)
+    if fixed is None:
+        fixed = set(built) if phase == "after" else set()
+    fixed = set(fixed) & set(built)
+    phase = "after" if fixed else "before"
+    after = expectation.get("after") or {}
+    after_by = {e["symptom"]: e for e in after.get("expect", [])}
 
-    problems = []
-    expected_names = set(expectation.get("allow", []))
+    problems, grades = [], []
     for exp in expectation.get("expect", []):
-        expected_names.add(exp["symptom"])
-        problems += _check(exp, by_symptom.get(exp["symptom"], []), newest)
-    unexpected = sorted(s for s in by_symptom if s not in expected_names)
+        sym, hits = exp["symptom"], by_symptom.get(exp["symptom"], [])
+        if sym in fixed:
+            if sym in after_by:
+                pr = _check(dict(after_by[sym], optional=True), hits, newest) if after_by[sym].get("optional") \
+                    else _check(after_by[sym], hits, newest)
+            else:
+                pr = [f"{sym} still found after its fix"] if hits else []
+            grades.append((sym, "fixed", "FAIL" if pr else "PASS", "; ".join(pr) or
+                           ("within what the fix may leave" if hits else "gone")))
+        elif not fixed:
+            pr = _check(exp, hits, newest)
+            grades.append((sym, "detect", "FAIL" if pr else "PASS", "; ".join(pr) or
+                           ("found as built" if hits else "optional, not found")))
+        else:
+            grades.append((sym, "waiting" if hits else "resolved", "PASS",
+                           "found, waits for its own fix" if hits else
+                           "not found: resolved with the other fixes, or aged out"))
+            pr = []
+        problems += pr
+    for sym in expectation.get("allow", []):
+        if sym in fixed and by_symptom.get(sym) and sym not in after_by:
+            problems.append(f"{sym} still found after its fix")
+            grades.append((sym, "fixed", "FAIL", f"{sym} still found after its fix"))
+    for sym, e in after_by.items():
+        if sym not in built and by_symptom.get(sym):
+            pr = _check(dict(e, optional=True), by_symptom[sym], newest)
+            problems += pr
+            grades.append((sym, "allowed", "FAIL" if pr else "PASS", "; ".join(pr) or "allowed after the fixes"))
+    names = set(built) | set(after_by) | set(after.get("allow", []))
+    unexpected = sorted(s for s in by_symptom if s not in names)
 
     status = "PASS" if not problems and not unexpected else "FAIL"
     notes = ""
+    fresh = expectation.get("fresh")
     if fresh and phase == "before" and newest is not None:
         age = values[newest].get("minutes_since_update")
         if age is not None and age >= hot_minutes:
@@ -141,7 +192,7 @@ def score_table(table, expectation, findings, partition_rows, hot_minutes, phase
                  f"{stale_h:g} h after it: rebuild it (make gl-test-tables TT_ARGS=\"--only "
                  f"{table.rsplit('.', 1)[-1].split('_', 1)[0]}\") and scan")
     return {"status": status, "found": found, "missing": problems,
-            "unexpected": unexpected, "notes": notes, "phase": phase}
+            "unexpected": unexpected, "notes": notes, "phase": phase, "grades": grades}
 
 
 PHASE_LABEL = {"before": "detect", "after": "fixed"}
@@ -149,6 +200,16 @@ PHASE_LABEL = {"before": "detect", "after": "fixed"}
 
 def _when(ms):
     return datetime.fromtimestamp(ms / 1000.0, timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+
+def fixed_symptoms(expectation, fixed, complete, last_ok):
+    """The built symptoms an advisor action addressed (score_table's fixed)."""
+    built = set(_built(expectation))
+    if not last_ok:
+        return set()
+    if not complete or not built:
+        return built                    # no per-symptom history: the earlier rule
+    return {s for s in built if s in fixed}
 
 
 def fix_phase(expectation, fixed, complete, last_ok):
@@ -163,13 +224,13 @@ def fix_phase(expectation, fixed, complete, last_ok):
     -> (phase, last fix text or None, note)."""
     if not last_ok:
         return "before", None, ""
-    built = {e["symptom"] for e in (expectation or {}).get("expect", [])} | set((expectation or {}).get("allow", []))
+    built = set(_built(expectation))
     if not complete or not built:
         return "after", f"{last_ok[0]} ok {_when(last_ok[1])} UTC", ""
     hits = [(fixed[s][0], fixed[s][1], s) for s in built if s in fixed]
     if hits:
-        ms, kind, sym = max(hits)
-        return "after", f"{kind} ok {_when(ms)} UTC ({sym})", ""
+        text = "; ".join(f"{kind} ok {_when(ms)} UTC ({sym})" for ms, kind, sym in sorted(hits, reverse=True))
+        return "after", text, ""
     return "before", None, (f"advisor actions ran (latest {last_ok[0]} {_when(last_ok[1])} UTC) but none "
                             f"addressed what the table was built with ({', '.join(sorted(built))})")
 
@@ -203,7 +264,10 @@ def outcome(r):
     if r["status"] == "STALE":
         return "too old to judge (see note): rebuild and scan straight after"
     if r["phase"] == "after":
+        waiting = [g[0] for g in r.get("grades", []) if g[1] == "waiting"]
         if r["status"] == "PASS":
+            if waiting:
+                return f"fixes verified; waiting for their own fix: {', '.join(waiting)}"
             return f"healthy after fix{', allowed: ' + found if found else ''}"
         return f"fix ran, but still found: {found}" if found else "fix ran, expectations not met"
     if r["status"] == "PASS":
@@ -234,19 +298,26 @@ def render(scan_id, results):
         pad = " " * 44
         if r["phase"] == "after" and r.get("last_fix"):
             out.append(f"{pad}last fix: {r['last_fix']}")
-        for m in ([] if r["status"] == "STALE" else r["missing"]):   # STALE: the note says why
+        for m in ([] if r["status"] == "STALE" or r["phase"] == "after" else r["missing"]):   # STALE: the note says why
             out.append(f"{pad}missing: {m}")
-        if r["unexpected"] and r["phase"] == "before":
+        if r["unexpected"]:
             out.append(f"{pad}unexpected: {', '.join(r['unexpected'])}")
-        if r["phase"] == "after" and r["status"] == "FAIL" and r.get("next"):
-            out.append(f"{pad}remaining fix: {r['next']}")
+        if r["phase"] == "after":
+            for sym, kind, st, why in r.get("grades", []):
+                if kind in ("waiting", "resolved") or st == "FAIL":
+                    out.append(f"{pad}{sym}: {kind}, {why}")
+        if r["phase"] == "after" and r.get("next"):
+            if r["status"] == "FAIL":
+                out.append(f"{pad}remaining fix: {r['next']}")
+            elif any(g[1] == "waiting" for g in r.get("grades", [])):
+                out.append(f"{pad}next: {r['next']}")
         if r["phase"] == "before" and r["status"] == "PASS" and r.get("next"):
             out.append(f"{pad}next: {r['next']}")
         if r["notes"]:
             out.append(f"{pad}note: {r['notes']}")
 
     groups = [
-        ("Fixed: a fix for its built problem ran; the scan must now find the table healthy",
+        ("Fixed: a fix ran for at least one built problem; each fixed one must be gone (graded per symptom)",
          [r for r in scored if r["phase"] == "after" and r["status"] in ("PASS", "FAIL")]),
         ("Detect: no fix yet; the scan must find the problem the table was built with",
          [r for r in scored if r["phase"] == "before" and r["status"] in ("PASS", "FAIL")]),
@@ -310,7 +381,8 @@ def run_scorecard(spark, scan_id, config, expectations, partial=False):
         phase, fix_text, fix_note = fix_phase(exp_tables.get(t), fx, complete, ok)
         res = score_table(t, exp_tables.get(t), findings.get(t, []), parts.get(t, []),
                           float(cfg.get("hot_partition_minutes", 15)), phase,
-                          writer_age_min=tmrows[t].get("minutes_since_writer_commit"))
+                          writer_age_min=tmrows[t].get("minutes_since_writer_commit"),
+                          fixed=fixed_symptoms(exp_tables.get(t), fx, complete, ok))
         res["table_name"] = t
         tr.begin(t)
         tr.log("score", f"{res['status']} ({phase})", found=res.get("found"), missing=res.get("missing"),

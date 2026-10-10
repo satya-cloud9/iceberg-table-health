@@ -27,7 +27,7 @@ import re
 import gltrace as tr
 import holds as hl
 
-RULE_VERSION = "d3-2"
+RULE_VERSION = "d3-3"
 
 # symptom -> (category, level, action, remedy)
 CATALOG = {
@@ -531,8 +531,24 @@ def refresh_findings(table, tm, th, keep_full_copies=1):
     return out
 
 
-def _mib(b):
-    return f"{(b or 0) / 1048576:.1f} MiB"
+def _size(b):
+    """Human size: MiB, GiB or TiB."""
+    b = b or 0
+    for unit, n in (("TiB", 1 << 40), ("GiB", 1 << 30)):
+        if b >= n:
+            return f"{b / n:.1f} {unit}"
+    return f"{b / 1048576:.1f} MiB"
+
+
+def _usd(x):
+    return f"about {x:,.2f} USD" if x >= 0.01 else "under 0.01 USD"
+
+
+def _priced(ev, b):
+    """bytes, with what they'd cost a month when a storage price is set."""
+    p = ev.get("storage_usd_per_gb_month")
+    priced = p and (ev.get("usd_per_month") or 0) >= 0.01      # not worth pricing fractions of a cent
+    return _size(b) + (f" ({_usd(b / 1073741824 * p)} a month)" if priced else "")
 
 
 def retained_remedy(ev):
@@ -542,11 +558,14 @@ def retained_remedy(ev):
     pol_txt = (f"the policy ({float(pol):g} h, keep {ev.get('policy_min_keep')}"
                f"{', ' + ev['policy_source'] if ev.get('policy_source') else ''})" if pol is not None
                else "the policy")
-    head = (f"old snapshots keep {_mib(ev['retained_bytes'])}, {ev['share']:g}x the live "
-            f"{_mib(ev['live_bytes'])}")
+    usd = ev.get("usd_per_month")
+    head = (f"old snapshots keep {_size(ev['retained_bytes'])}, {ev['share']:g}x the live "
+            f"{_size(ev['live_bytes'])}"
+            + (f" ({_usd(usd)} a month in storage at {ev['storage_usd_per_gb_month']:g} USD per GB-month; "
+               f"reads don't touch these files)" if usd is not None else ""))
     n = ev.get("expirable_snapshots")
     if n:
-        frees = (f", which frees {_mib(ev['expirable_bytes'])} and leaves {_mib(ev['inside_policy_bytes'])} "
+        frees = (f", which frees {_size(ev['expirable_bytes'])} and leaves {_size(ev['inside_policy_bytes'])} "
                  f"inside the policy" if ev.get("expirable_bytes") is not None else "")
         return (f"{head}: {n} snapshot(s) are past {pol_txt}: expire to the policy now{frees} "
                 f"(files kept for the grace); if it stays high, see the advice on the next scan")
@@ -558,7 +577,7 @@ def retained_remedy(ev):
     writers = sum(v for k, v in by_op.items() if k != "replace")
     rewrites = by_op.get("replace", 0)
     if by_op:
-        parts.append(f"writers' overwrites and deletes keep {_mib(writers)}, rewrites (compaction) {_mib(rewrites)}")
+        parts.append(f"writers' overwrites and deletes keep {_size(writers)}, rewrites (compaction) {_size(rewrites)}")
     options = []
     total = ev["retained_bytes"]
     keep = ev.get("policy_min_keep")
@@ -572,10 +591,10 @@ def retained_remedy(ev):
                      f"minimum is lowered")
     if shorter:
         options.append("shorten the policy (history.expire.max-snapshot-age-ms): " + ", ".join(
-            f"{w['hours']:g} h would keep {_mib(w['retained_bytes'])}" for w in shorter))
+            f"{w['hours']:g} h would keep {_priced(ev, w['retained_bytes'])}" for w in shorter))
     if fewer:
         options.append("lower the minimum kept (history.expire.min-snapshots-to-keep): " + ", ".join(
-            f"{w['keep']} would keep {_mib(w['retained_bytes'])}" for w in fewer))
+            f"{w['keep']} would keep {_priced(ev, w['retained_bytes'])}" for w in fewer))
     if not shorter and not fewer:
         options.append("shorten the policy (history.expire.max-snapshot-age-ms) or lower the minimum kept "
                        "(history.expire.min-snapshots-to-keep)")
@@ -586,11 +605,11 @@ def retained_remedy(ev):
         w24 = ev.get("writer_removed_24h")
         options.append("switch the writers to merge-on-read (write.merge.mode, write.update.mode, "
                        "write.delete.mode = merge-on-read) so a MERGE writes delete files instead of copying "
-                       "whole data files" + (f" (they replaced {_mib(w24)} in the last 24 h)" if w24 else ""))
+                       "whole data files" + (f" (they replaced {_size(w24)} in the last 24 h)" if w24 else ""))
     return "; ".join(parts) + ". Options: " + "; or ".join(options)
 
 
-def storage_findings(table, tm, th):
+def storage_findings(table, tm, th, cost=None):
     """GL2.6c, size-based bloat (Traceability: snapshot count stays evidence only;
     an append-only stream with thousands of snapshots can keep almost nothing
     extra alive, a copy-on-write table with forty can keep ten copies).
@@ -607,12 +626,17 @@ def storage_findings(table, tm, th):
                   f"{kept / live:.2f} vs {th.get('retained_storage_min_share', 1.0)}"))
     if kept is not None and live:
         share = kept / live
+        price = float((cost or {}).get("storage_usd_per_gb_month") or 0)
+        usd = round(kept / 1073741824 * price, 4) if price else None
+        min_usd = float(th.get("retained_storage_min_usd_month") or 0)
         if (kept >= th.get("retained_storage_min_bytes", 1073741824)
-                and share > th.get("retained_storage_min_share", 1.0)):
+                and share > th.get("retained_storage_min_share", 1.0)
+                and (not min_usd or usd is None or usd >= min_usd)):
             ev = {"retained_bytes": int(kept), "live_bytes": int(live), "share": round(share, 2),
                   "snapshots": tm.get("snapshots"), "oldest_snapshot_age_h": tm.get("oldest_snapshot_age_h"),
                   "expirable_snapshots": tm.get("expirable_snapshots"), "policy_age_h": tm.get("policy_age_h"),
-                  "policy_min_keep": tm.get("policy_min_keep"), "policy_source": tm.get("policy_source")}
+                  "policy_min_keep": tm.get("policy_min_keep"), "policy_source": tm.get("policy_source"),
+                  "usd_per_month": usd, "storage_usd_per_gb_month": price or None}
             try:
                 detail = json.loads(tm.get("retained_detail_json") or "null")
             except ValueError:
@@ -781,7 +805,7 @@ def evaluate(table, tm, rows, cfg, history=None, actions=None):
                               int(cfg.get("max_settle_compactions", 2)), revised, new)
            + table_findings(table, tm, rows, th, cfg))
     if new:
-        out += storage_findings(table, tm, th)
+        out += storage_findings(table, tm, th, cfg.get("cost"))
     if cfg.get("writer_findings"):
         out += writer_findings(table, tm, th, float(tm.get("target_file_bytes") or cfg.get("target_file_bytes", 536870912)))
     if cfg.get("expiry_policy") and tm.get("policy_age_h") is not None:

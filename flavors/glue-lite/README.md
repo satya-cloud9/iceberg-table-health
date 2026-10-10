@@ -1893,3 +1893,38 @@ make gl-scan                       # s12, s14, s19, s2: RETAINED_STORAGE:advisor
 make gl-plan T=s12                 # [NOTE] advice: ... Options: lower the minimum kept: 5 would keep ...; or switch the writers to merge-on-read
 make gl-plan T=s19
 ```
+
+## Item 6 — Scorecard graded per symptom; RETAINED_STORAGE in USD
+
+**Per symptom.** The scorecard used to switch a whole table to "fixed" as soon
+as any fix for a built symptom ran, then demand the whole `after` block. s12
+showed the flaw: the approved RETAINED_STORAGE expiry (an optional symptom)
+moved it to "fixed", where the block wanted DELETE_BUILDUP, which only appears
+after the `s12-mor` scenario step. Now each built symptom is graded on its own:
+
+| The symptom | Graded as | Passes when |
+|---|---|---|
+| an advisor action addressed it | fixed | gone, or within the `after` block's entry for it (s1: one SMALL_FILES partition may wait for the next run) |
+| no fix for the table yet | detect | found as built (as before; STALE rules unchanged) |
+| no fix of its own, other fixes ran, still found | waiting | always; the row says it waits and shows the next step |
+| no fix of its own, other fixes ran, gone | resolved | always; gone with the other fixes (s18's POOR_CLUSTERING after the sort rewrite) or aged out (HOT_PARTITION, REWRITE_CHURN) |
+| only in the `after` block | allowed | its selectors hold when found (s12's DELETE_BUILDUP after the merge-on-read step) |
+
+Any other active symptom is unexpected and fails the table. The last-fix line
+lists every built symptom's fix, newest first.
+
+**USD.** RETAINED_STORAGE now carries `usd_per_month` (retained GiB x
+`cost.storage_usd_per_gb_month`, 0.023, S3 Standard us-east-1, an assumption
+to set per environment) and says it in the advice: these files cost storage
+only, since queries read the current snapshot's files. The what-if options
+are priced too once the total is at least a cent. With
+`thresholds.retained_storage_min_usd_month` above 0 the finding fires only
+at or above that many USD a month (0 at test scale; production placeholder
+5). Sizes print as MiB, GiB or TiB.
+
+To check on the cluster:
+
+```
+make gl-image
+make gl-scan      # scorecard: s12 PASS (fixed: RETAINED_STORAGE; REWRITE_CHURN resolved); expect 21/21
+```

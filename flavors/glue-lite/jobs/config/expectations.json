@@ -1,5 +1,5 @@
 {
-  "_comment": "GL2.5d/e expectation matrix: what the symptom engine must find on each scenario table. Any active symptom not listed under 'expect' or 'allow' is unexpected. Findings held for workload evidence (needs-evidence) are ignored. Partition selectors: 'partitions' (exact set of partition values), 'newest' (only the table's newest partition), 'not_newest', 'min_value' (every flagged partition >= this value), 'prefix' (every flagged partition value starts with this; multi-field values are joined with '/'), 'count', 'min_count'; 'optional': true = allowed but not required (selectors still apply when it appears). 'fresh' marks a table whose check is only valid while its newest partition is younger than the hot window; past that the result is STALE, not FAIL. 'after' (optional): expectations once plan.py has applied fixes to the table (matched by table UUID, so a rebuild resets it to 'before'); an empty expect list means healthy.",
+  "_comment": "GL2.5d/e expectation matrix: what the symptom engine must find on each scenario table. Any active symptom not listed under 'expect' or 'allow' is unexpected. Findings held for workload evidence (needs-evidence) are ignored. Partition selectors: 'partitions' (exact set of partition values), 'newest' (only the table's newest partition), 'not_newest', 'min_value' (every flagged partition >= this value), 'prefix' (every flagged partition value starts with this; multi-field values are joined with '/'), 'count', 'min_count'; 'optional': true = allowed but not required (selectors still apply when it appears). 'fresh' marks a table whose check is only valid while its newest partition is younger than the hot window; past that the result is STALE, not FAIL. 'after' (optional): expectations once plan.py has applied fixes to the table (matched by table UUID, so a rebuild resets it to 'before'); an empty expect list means healthy. Grading is per symptom (plan item 6): a built symptom an advisor action addressed must be gone, or meet the 'after' block's entry for it; with no fix yet, every built symptom is graded as found-as-built; once some fix ran, a built symptom without its own fix passes as waiting (still found) or resolved (gone with the other fixes, or aged out); symptoms only in 'after' are allowed with their selectors.",
   "tables": {
     "glue.demo.s0_small_appends": {
       "expect": [
@@ -210,7 +210,7 @@
         }
       ],
       "after": {
-        "_comment": "after make gl-step STEP=s12-mor: merge-on-read now, so churn is gone and the cost shows up as deletes (and small files from the merged rows) - work scheduled compaction already handles",
+        "_comment": "after make gl-step STEP=s12-mor: merge-on-read now, so churn is gone and the cost shows up as deletes (and small files from the merged rows) - work scheduled compaction already handles. Graded per symptom (plan item 6): symptoms only in this block are allowed, not required, since they follow a scenario step rather than an advisor fix; REWRITE_CHURN, once gone after any fix, counts as aged out",
         "expect": [
           {
             "symptom": "DELETE_BUILDUP",
