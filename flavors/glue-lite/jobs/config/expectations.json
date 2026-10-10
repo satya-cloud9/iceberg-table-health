@@ -401,7 +401,24 @@
           "symptom": "SNAPSHOT_BUILDUP",
           "optional": true
         }
-      ]
+      ],
+      "after": {
+        "_comment": "after a compaction the grow steps keep committing: SMALL_FILES found again after new writes passes (graded as back after new writes, not listed here so a return without new writes still fails); past 100 commits the metadata log overflows (previous-versions-max 100, delete-after-commit off), so UNBOUNDED_RETENTION and the dropped metadata.json files as ORPHAN_FILES follow, and HISTORY_LOST when commits outran the scans",
+        "expect": [
+          {
+            "symptom": "UNBOUNDED_RETENTION",
+            "optional": true
+          },
+          {
+            "symptom": "ORPHAN_FILES",
+            "optional": true
+          },
+          {
+            "symptom": "HISTORY_LOST",
+            "optional": true
+          }
+        ]
+      }
     }
   }
 }

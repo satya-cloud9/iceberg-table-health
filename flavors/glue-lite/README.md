@@ -1913,6 +1913,14 @@ after the `s12-mor` scenario step. Now each built symptom is graded on its own:
 Any other active symptom is unexpected and fails the table. The last-fix line
 lists every built symptom's fix, newest first.
 
+**Back after new writes.** A fixed symptom found again passes when the
+writer committed after its fix (new writes brought it back; the next run
+picks it up), and fails when nothing was written since. s17, the growing
+table, was the first to need it (first cluster run, 21/22): its grow steps
+commit after each compaction, so SMALL_FILES returns; its `after` block now
+allows what 100+ commits leave behind (UNBOUNDED_RETENTION, the dropped
+metadata.json files as ORPHAN_FILES, HISTORY_LOST).
+
 **USD.** RETAINED_STORAGE now carries `usd_per_month` (retained GiB x
 `cost.storage_usd_per_gb_month`, 0.023, S3 Standard us-east-1, an assumption
 to set per environment) and says it in the advice: these files cost storage
@@ -1926,5 +1934,5 @@ To check on the cluster:
 
 ```
 make gl-image
-make gl-scan      # scorecard: s12 PASS (fixed: RETAINED_STORAGE; REWRITE_CHURN resolved); expect 21/21
+make gl-scan      # scorecard: s12 PASS (fixed: RETAINED_STORAGE; REWRITE_CHURN resolved), s17 scored; expect 22/22
 ```

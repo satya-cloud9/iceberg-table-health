@@ -99,7 +99,7 @@ def _built(expectation):
 
 
 def score_table(table, expectation, findings, partition_rows, hot_minutes, phase="before", writer_age_min=None,
-                fixed=None):
+                fixed=None, now_ms=None):
     """-> dict(status, found, missing, unexpected, notes, phase, grades).
 
     Graded per symptom (plan item 6). For each symptom the table was built with:
@@ -115,8 +115,13 @@ def score_table(table, expectation, findings, partition_rows, hot_minutes, phase
     Symptoms only in the "after" block are allowed, with their constraints when
     found (a scenario step's consequence, e.g. s12's DELETE_BUILDUP after the
     switch to merge-on-read); any other active symptom is unexpected.
-    fixed: the built symptoms an advisor action addressed. None = from phase
-    (the earlier switch: "after" = every built symptom fixed).
+    A fixed symptom found again after writers committed since its fix is not a
+    failure: new writes brought it back and the next run picks it up (s17, the
+    growing table). That needs the fix time (fixed as {symptom: ms}), the
+    writer's age (writer_age_min) and now_ms.
+    fixed: the built symptoms an advisor action addressed, a set or {symptom:
+    fix ms}. None = from phase (the earlier switch: "after" = every built
+    symptom fixed).
     """
     active = [f for f in findings if f["action"] not in ("needs-evidence", "advisory", "acknowledged")]
     by_symptom = {}
@@ -133,7 +138,9 @@ def score_table(table, expectation, findings, partition_rows, hot_minutes, phase
     built = _built(expectation)
     if fixed is None:
         fixed = set(built) if phase == "after" else set()
+    fix_ms = dict(fixed) if isinstance(fixed, dict) else {}
     fixed = set(fixed) & set(built)
+    writer_ms = (now_ms - writer_age_min * 60000) if (now_ms and writer_age_min is not None) else None
     phase = "after" if fixed else "before"
     after = expectation.get("after") or {}
     after_by = {e["symptom"]: e for e in after.get("expect", [])}
@@ -147,8 +154,11 @@ def score_table(table, expectation, findings, partition_rows, hot_minutes, phase
                     else _check(after_by[sym], hits, newest)
             else:
                 pr = [f"{sym} still found after its fix"] if hits else []
-            grades.append((sym, "fixed", "FAIL" if pr else "PASS", "; ".join(pr) or
-                           ("within what the fix may leave" if hits else "gone")))
+            why = "; ".join(pr) or ("within what the fix may leave" if hits else "gone")
+            if pr and fix_ms.get(sym) and writer_ms and writer_ms > fix_ms[sym]:
+                pr, why = [], (f"found again after new writes (the writer committed "
+                               f"{(writer_ms - fix_ms[sym]) / 3600000:.1f} h after the fix); the next run picks it up")
+            grades.append((sym, "fixed", "FAIL" if pr else "PASS", why))
         elif not fixed:
             pr = _check(exp, hits, newest)
             grades.append((sym, "detect", "FAIL" if pr else "PASS", "; ".join(pr) or
@@ -203,13 +213,14 @@ def _when(ms):
 
 
 def fixed_symptoms(expectation, fixed, complete, last_ok):
-    """The built symptoms an advisor action addressed (score_table's fixed)."""
+    """The built symptoms an advisor action addressed, {symptom: fix ms or None}
+    (score_table's fixed)."""
     built = set(_built(expectation))
     if not last_ok:
-        return set()
+        return {}
     if not complete or not built:
-        return built                    # no per-symptom history: the earlier rule
-    return {s for s in built if s in fixed}
+        return {s: None for s in built}       # no per-symptom history: the earlier rule
+    return {s: fixed[s][0] for s in built if s in fixed}
 
 
 def fix_phase(expectation, fixed, complete, last_ok):
@@ -382,7 +393,8 @@ def run_scorecard(spark, scan_id, config, expectations, partial=False):
         res = score_table(t, exp_tables.get(t), findings.get(t, []), parts.get(t, []),
                           float(cfg.get("hot_partition_minutes", 15)), phase,
                           writer_age_min=tmrows[t].get("minutes_since_writer_commit"),
-                          fixed=fixed_symptoms(exp_tables.get(t), fx, complete, ok))
+                          fixed=fixed_symptoms(exp_tables.get(t), fx, complete, ok),
+                          now_ms=int(datetime.now(timezone.utc).timestamp() * 1000))
         res["table_name"] = t
         tr.begin(t)
         tr.log("score", f"{res['status']} ({phase})", found=res.get("found"), missing=res.get("missing"),
