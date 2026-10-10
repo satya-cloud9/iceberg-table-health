@@ -2024,3 +2024,44 @@ make gl-image
 make gl-scan            # "Tiering (minor / major / wait) (shadow)": test tables are days old, so expect major
 make gl-step STEP=append-live                   # its own scan: the two live tables are warm, so minor or wait
 ```
+
+### Tiering on, UNPARTITIONED_APPENDS, LATE_ARRIVALS advisory (plan item 12, end)
+
+The shadow run passed on the homelab (2026-10-10: old test tables major, the
+live tables wait right after the appends and major once cold, scorecard 22/22),
+so `incremental.tiering` is now **on**: SMALL_FILES is decided by the tier rule
+and plans carry the minor and major calls.
+
+**Large unpartitioned tables with continuous appends are never cold.** A table
+with no partition fields, at least `thresholds.unpartitioned_min_target_files`
+(8) target files of data and at least `unpartitioned_appends_min_commits_24h`
+writer commits in 24 h (test 12; production 48, expiry's streaming category)
+gets minors or waits only: a major would re-sort the whole table, and the next
+appends would spread across the key range again. A small one, or one that
+stops being appended to, follows the normal questions.
+
+**UNPARTITIONED_APPENDS** (approval, family tiering) fires on such a table when
+one of its measured columns has an average overlap depth of at least
+`unpartitioned_overlap_depth` (4) files. The scan measures, for unpartitioned
+tables only, the sort key's columns, the declared filter columns and
+`advisor.time-column` (`overlap_json` in table_metrics): `avg_depth` = files a
+uniform point lookup touches (sum of file ranges / table range), `max_depth` =
+the most files one value falls into. A column that follows arrival (ingest
+time) stays near 1 and alone never fires; without a measured column there is
+no finding (the table still gets minors only). The remedy names the columns
+and depths; the plan's suggestion, with a time column known, is
+`ALTER TABLE ... ADD PARTITION FIELD days(<time column>)` plus
+`WRITE ORDERED BY <deep columns>`; files already written move to the new
+layout through the MIXED_SPEC rewrite.
+
+**LATE_ARRIVALS is advisory** (was approval): every remedy is a change to the
+writer, so there is nothing for the advisor to run once approved.
+
+To check on the cluster:
+
+```
+make gl-image
+make gl-scan                         # "Tiering (minor / major / wait) (on)"; scorecard unchanged
+make gl-step STEP=unpart-appends     # live_unpart_appends: UNPARTITIONED_APPENDS, SMALL_FILES as a minor
+make gl-step STEP=append-live        # the two live tables: wait now, major after compaction.cold_hours
+```

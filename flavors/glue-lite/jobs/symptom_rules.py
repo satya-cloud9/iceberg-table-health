@@ -16,7 +16,8 @@ Each finding carries an action:
                  configured level (declared filter columns are not enough)
   advisory       reported, never acted on: advice for the owner, where nothing
                  the advisor could run would change it (FREQUENT_FULL_REFRESH;
-                 RETAINED_STORAGE with no snapshot past the policy, with the numbers)
+                 LATE_ARRIVALS; RETAINED_STORAGE with no snapshot past the policy,
+                 with the numbers)
 """
 import json
 import math
@@ -25,7 +26,7 @@ import re
 import gltrace as tr
 import holds as hl
 
-RULE_VERSION = "t2-1"
+RULE_VERSION = "t2-2"
 
 # symptom -> (category, level, action, remedy)
 CATALOG = {
@@ -38,10 +39,14 @@ CATALOG = {
                               "the table is replaced (nearly) whole again and again: consider an incremental "
                               "load; if deliberate, acknowledge with the table property "
                               "advisor.ack = FREQUENT_FULL_REFRESH"),
-    "LATE_ARRIVALS":         ("write_pattern", "table", "approval",
+    "LATE_ARRIVALS":         ("write_pattern", "table", "advisory",
                               "data keeps landing long after its partition ended: batch late rows, narrow "
                               "the incremental lookback, stage late data and merge once, or partition by "
                               "ingestion date and sort by event time"),
+    "UNPARTITIONED_APPENDS": ("partition_design", "table", "approval",
+                              "a large unpartitioned table appended to all the time: every append spans the "
+                              "key range again, so no sort holds; partition by time and sort within each "
+                              "partition; until then minors only (no whole-table re-sort)"),
     "DELETE_BUILDUP":        ("file_layout", "partition", "auto",
                               "rewrite_data_files with delete-file-threshold, then "
                               "rewrite_position_delete_files"),
@@ -171,13 +176,16 @@ def tier_decision(r, small, tiers):
       cold            no writer commit in the partition for cold_hours
       worth a minor   >= minor_min_fragments fragments, or the oldest fragment
                       has waited minor_max_wait_hours (and there are at least 2)
+      never cold      tiers["never_cold"] (a large unpartitioned table with
+                      continuous appends, unpartitioned_appends): minor or wait only
     r needs fragments, undersized_segments, minutes_since_update and
     oldest_fragment_age_h."""
     frags = _num(r.get("fragments"))
     minutes = r.get("minutes_since_update")
     cold_h, wait_h = float(tiers["cold_hours"]), float(tiers["minor_max_wait_hours"])
     min_frags = int(tiers["minor_min_fragments"])
-    cold = minutes is None or minutes >= cold_h * 60
+    never_cold = bool(tiers.get("never_cold"))
+    cold = not never_cold and (minutes is None or minutes >= cold_h * 60)
     age = r.get("oldest_fragment_age_h")
     if cold:
         if small:
@@ -188,6 +196,10 @@ def tier_decision(r, small, tiers):
         return "minor", f"warm, {frags} fragments (>= {min_frags}): a minor pass over the fragments"
     if frags >= 2 and age is not None and age >= wait_h:
         return "minor", f"warm, oldest fragment {age:.1f} h old (>= {wait_h:g} h): a minor pass over the fragments"
+    if (small or frags) and never_cold:
+        return "wait", (f"never cold (large unpartitioned table with continuous appends: minors only); "
+                        f"{frags} fragments (minor at {min_frags}, or once the oldest has waited {wait_h:g} h"
+                        + (f"; now {age:.1f} h" if age is not None else "") + ")")
     if small or frags:
         return "wait", (f"warm (last writer commit {minutes / 60:.1f} h ago, cold after {cold_h:g} h); "
                         f"{frags} fragments (minor at {min_frags}, or once the oldest has waited {wait_h:g} h"
@@ -831,12 +843,82 @@ def apply_acks(findings, tm):
     return findings
 
 
+def _writer_commits_24h(tm):
+    n = tm.get("writer_commits_24h_seen")
+    return _num(tm.get("writer_commits_24h") if n is None else n)
+
+
+def unpartitioned_appends(tm, th):
+    """-> (yes, facts): a large unpartitioned table appended to all the time, which
+    the tier rule never treats as cold (a major would re-sort the whole table and
+    the next appends would spread across the key range again).
+      unpartitioned   no partition fields
+      large           data_bytes >= unpartitioned_min_target_files x target
+      continuous      >= unpartitioned_appends_min_commits_24h writer commits in 24 h"""
+    try:
+        fields = json.loads(tm.get("partition_fields_json") or "null")
+    except (TypeError, ValueError):
+        fields = None
+    target = _num(tm.get("target_file_bytes"), 1) or 1
+    min_targets = float(th.get("unpartitioned_min_target_files", 8))
+    min_commits = float(th.get("unpartitioned_appends_min_commits_24h", 48))
+    n = _writer_commits_24h(tm)
+    facts = {"data_bytes": _num(tm.get("data_bytes")), "target_files": round(_num(tm.get("data_bytes")) / target, 1),
+             "min_target_files": min_targets, "writer_commits_24h": n, "min_commits_24h": min_commits}
+    yes = fields == [] and facts["target_files"] >= min_targets and n >= min_commits
+    return yes, facts
+
+
+def unpartitioned_appends_findings(table, tm, th):
+    """UNPARTITIONED_APPENDS (item 12, family tiering): a large unpartitioned table
+    with continuous appends whose sort or filter column does not follow arrival:
+    some measured column (overlap_json, from the files' bounds) has an average
+    overlap depth of at least unpartitioned_overlap_depth files. A column that
+    follows arrival (ingest time) keeps each file's range narrow by itself, and the
+    minors keep merged files narrow, so it alone never fires. Without a measured
+    column there is no evidence and no finding (the table still gets minors only)."""
+    yes, facts = unpartitioned_appends(tm, th)
+    if not yes:
+        return []
+    try:
+        overlap = json.loads(tm.get("overlap_json") or "{}")
+    except (TypeError, ValueError):
+        overlap = {}
+    limit = float(th.get("unpartitioned_overlap_depth", 4))
+    measured = {c: v for c, v in overlap.items() if v.get("status") == "ok"}
+    deep = {c: v for c, v in measured.items() if v["avg_depth"] >= limit}
+    narrow = sorted(c for c, v in measured.items() if v["avg_depth"] < limit)
+    tr.log("rule.UNPARTITIONED_APPENDS", target_files=f"{facts['target_files']} vs {facts['min_target_files']:g}",
+           commits_24h=f"{facts['writer_commits_24h']} vs {facts['min_commits_24h']:g}",
+           depth=", ".join(f"{c} {v['avg_depth']}" for c, v in sorted(measured.items())) or "no measured column",
+           limit=limit)
+    if not deep:
+        return []
+    worst = max(deep, key=lambda c: deep[c]["avg_depth"])
+    props = _props(tm)
+    time_col = props.get("advisor.time-column") or next(
+        (c for c, v in measured.items() if "time" in v.get("roles", [])), None) or "<event or ingest time>"
+    keys = ", ".join(sorted(deep))
+    remedy = (f"large unpartitioned table ({facts['target_files']:g} target files) appended to "
+              f"{facts['writer_commits_24h']:g} times in 24 h: one value of {keys} falls into "
+              f"{deep[worst]['avg_depth']:g} files on average (max {deep[worst]['max_depth']}), so lookups on it "
+              f"read most files; partition by time (days({time_col})) and sort within each partition by {keys}"
+              + (f"; {', '.join(narrow)} already follows arrival" if narrow else "")
+              + "; until then the advisor runs minors only (a whole-table re-sort would be undone by the next appends)")
+    ev = dict(facts, overlap={c: {k: v.get(k) for k in ("roles", "avg_depth", "max_depth", "files")}
+                              for c, v in measured.items()},
+              depth_limit=limit, sort_order_defined=bool(tm.get("sort_order_defined")))
+    return [_finding(table, "UNPARTITIONED_APPENDS", deep[worst]["avg_depth"] / limit, ev, remedy=remedy)]
+
+
 def tiers_of(cfg, tm):
     """The tier rule's settings: config compaction.*, the table's advisor.compact.*
-    properties winning for the two times."""
+    properties winning for the two times; never_cold for a large unpartitioned
+    table with continuous appends (unpartitioned_appends)."""
     c = cfg.get("compaction") or {}
     props = _props(tm)
-    return {"fragment_ratio": float(c.get("fragment_ratio", 8)),
+    return {"never_cold": unpartitioned_appends(tm, cfg.get("thresholds") or {})[0],
+            "fragment_ratio": float(c.get("fragment_ratio", 8)),
             "minor_min_fragments": int(c.get("minor_min_fragments", 8)),
             "minor_max_wait_hours": float(props.get("advisor.compact.minor-max-wait-hours")
                                           or c.get("minor_max_wait_hours", 8)),
@@ -852,6 +934,8 @@ def evaluate(table, tm, rows, cfg, history=None, actions=None):
     new = bool(cfg.get("new_findings"))
     out = (partition_findings(table, rows, th, hot, new, tiers_of(cfg, tm) if cfg.get("tiering") else None)
            + table_findings(table, tm, rows, th, cfg))
+    if cfg.get("tiering"):
+        out += unpartitioned_appends_findings(table, tm, th)
     if new:
         out += storage_findings(table, tm, th, cfg.get("cost"))
     if cfg.get("writer_findings"):

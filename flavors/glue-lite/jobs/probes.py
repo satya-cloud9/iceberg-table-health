@@ -41,7 +41,7 @@ WATCHED_PROPS = [
 def table_info(spark, table):
     """Spec, sort order and properties via the Iceberg Java API (py4j)."""
     info = {"partitioned": True, "spec": None, "spec_id": None, "sort_order": None,
-            "sort_order_id": None, "sort_defined": False, "format_version": None,
+            "sort_order_id": None, "sort_defined": False, "sort_columns": [], "format_version": None,
             "properties": {}, "error": None, "uuid": None, "partition_fields": [],
             "metadata_location": None, "metadata_json_bytes": None}
     try:
@@ -60,6 +60,10 @@ def table_info(spark, table):
         info["sort_order"] = so.toString().replace("\n", " ")
         info["sort_order_id"] = so.orderId()
         info["sort_defined"] = not so.isUnsorted()
+        for sf in so.fields().toArray():          # item 12: the sort key's columns (overlap depth)
+            name = schema.findColumnName(sf.sourceId())
+            if name is not None and str(sf.transform().toString()) == "identity":
+                info["sort_columns"].append(str(name))
         props = jt.properties()
         info["properties"] = {str(k): str(props.get(k)) for k in props.keySet().toArray()}
         try:
@@ -279,6 +283,71 @@ def _pruning(spark, table, info, columns):
     return out
 
 
+def overlap_columns(info, cfg):
+    """Columns whose overlap depth an unpartitioned table reports, with their roles:
+    the sort key's columns, the declared filter columns and advisor.time-column."""
+    roles = {}
+    for c in info.get("sort_columns") or []:
+        roles.setdefault(c, []).append("sort")
+    for c in cfg.get("filter_columns") or []:
+        roles.setdefault(c, []).append("filter")
+    tc = (info.get("properties") or {}).get("advisor.time-column")
+    if tc:
+        roles.setdefault(tc, []).append("time")
+    return roles
+
+
+def _overlap_depth(spark, table, roles):
+    """Item 12, UNPARTITIONED_APPENDS evidence: for each column, how many data files
+    one value falls into, from the files' lower and upper bounds.
+      avg_depth  files a uniform point lookup touches: sum(file range) / table range
+                 (1 = ranges side by side, files = every file spans everything)
+      max_depth  the most files any one value falls into (sweep over the bounds)
+    A column that follows arrival (ingest time) stays near 1 however many appends
+    land; a key every append spans (customer, event time with late rows) grows
+    with the file count."""
+    out = {}
+    if not roles:
+        return out
+    types = column_types(spark, table)
+    for col, role in roles.items():
+        t = types.get(col)
+        if t is None:
+            out[col] = {"status": "missing column", "roles": role}
+            continue
+        if t in ("int", "bigint", "smallint", "tinyint", "double", "float") or t.startswith("decimal") \
+                or t.startswith("timestamp"):
+            conv = "CAST({} AS DOUBLE)"
+        elif t == "date":
+            conv = "CAST(unix_date({}) AS DOUBLE)"
+        else:
+            out[col] = {"status": f"type {t} not measured", "roles": role}
+            continue
+        lb = conv.format(f"readable_metrics.`{col}`.lower_bound")
+        ub = conv.format(f"readable_metrics.`{col}`.upper_bound")
+        r = _one(spark, f"""
+            WITH f AS (SELECT {lb} AS lb, {ub} AS ub FROM {table}.files WHERE content = 0),
+            b AS (SELECT * FROM f WHERE lb IS NOT NULL AND ub IS NOT NULL),
+            ev AS (SELECT lb AS x, 1 AS d FROM b UNION ALL SELECT ub AS x, -1 AS d FROM b),
+            run AS (SELECT sum(d) OVER (ORDER BY x, d DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                           AS depth FROM ev)
+            SELECT (SELECT count(*) FROM f) AS files, (SELECT count(*) FROM b) AS with_bounds,
+                   (SELECT min(lb) FROM b) AS mn, (SELECT max(ub) FROM b) AS mx,
+                   (SELECT sum(ub - lb) FROM b) AS widths, (SELECT max(depth) FROM run) AS max_depth
+        """)
+        n = int(r.with_bounds or 0)
+        if not r.files:
+            out[col] = {"status": "no data files", "roles": role}
+        elif n == 0:
+            out[col] = {"status": "no column stats", "roles": role}
+        else:
+            span = float(r.mx) - float(r.mn)
+            avg = float(n) if span <= 0 else max(1.0, min(float(n), float(r.widths) / span))
+            out[col] = {"status": "ok", "roles": role, "files": n, "avg_depth": round(avg, 2),
+                        "max_depth": int(r.max_depth or 0), "stats_coverage": round(n / r.files, 3)}
+    return out
+
+
 def writer_minutes(spark, table):
     """Minutes since the last commit by a writer (anything but 'replace',
     i.e. not compaction), from snapshots alone. None if none is left."""
@@ -421,6 +490,9 @@ def table_metrics(spark, table, info, cfg, pm_rows, retained=True, retained_meta
     m["filter_columns"] = ",".join(cols)
     m["pruning_json"] = json.dumps(pruning, sort_keys=True)
     m["min_pruning_efficiency"] = min(effs) if effs else None
+    # item 12: overlap depth of the sort, filter and time columns (unpartitioned tables only)
+    m["overlap_json"] = (json.dumps(_overlap_depth(spark, table, overlap_columns(info, cfg)), sort_keys=True)
+                         if not info["partitioned"] else None)
     m["sort_order_defined"] = bool(info["sort_defined"])
     m["sort_order"] = info["sort_order"]
 

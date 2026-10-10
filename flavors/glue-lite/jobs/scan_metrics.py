@@ -82,7 +82,7 @@ TABLE_METRICS_DDL = """
     writer_commits_24h_seen BIGINT, writer_gap_median_min DOUBLE, writer_bytes_per_commit_24h DOUBLE,
     writer_files_per_commit_24h DOUBLE, history_gaps_window BIGINT, history_lost_commits BIGINT,
     last_history_gap_ms BIGINT, history_unseen_minutes DOUBLE, minutes_since_previous_scan DOUBLE,
-    retained_detail_json STRING"""
+    retained_detail_json STRING, overlap_json STRING"""
 
 
 def coerce(value, data_type):

@@ -529,6 +529,19 @@ def plan_table(table, findings, tm, cfg, now=None, freed=None):
                 continue
             stmt = (f"CALL glue.system.remove_orphan_files(table => '{ident}', "
                     f"older_than => {{orphan_cutoff}}, prefix_listing => true)")
+        elif f["symptom"] == "UNPARTITIONED_APPENDS":
+            # partition evolution: new appends land in time partitions, sorted within;
+            # files already written stay in the old layout until a MIXED_SPEC rewrite
+            props = json.loads(tm.get("properties_json") or "{}")
+            overlap = ev.get("overlap") or {}
+            time_col = props.get("advisor.time-column") or next(
+                (c for c, v in overlap.items() if "time" in (v.get("roles") or [])), None)
+            limit = float(ev.get("depth_limit") or 4)
+            keys = sorted(c for c, v in overlap.items() if (v.get("avg_depth") or 0) >= limit and c != time_col)
+            if time_col:
+                stmt = f"ALTER TABLE {table} ADD PARTITION FIELD days({time_col})"
+                if keys:
+                    stmt += f"; ALTER TABLE {table} WRITE ORDERED BY {', '.join(keys)}"
         elif f["symptom"] == "POOR_CLUSTERING" and ev.get("column"):
             rewrite = f"CALL glue.system.rewrite_data_files(table => '{ident}', strategy => 'sort')"
             stmt = rewrite if tm.get("sort_order_defined") else \

@@ -40,6 +40,12 @@ Steps:
             them. The scan covers only these two tables, so run make gl-scan
             afterwards before make gl-plan, which reads the latest scan.
 
+  unpart-appends (item 12) rebuilds the scratch table live_unpart_appends:
+            unpartitioned, target 1 MiB, sorted by customer_id, 24 appends
+            (each a new hour of occurred_at, each spanning every customer_id),
+            then scans and detects it: UNPARTITIONED_APPENDS (approval) and
+            SMALL_FILES as a minor (never cold: minors only).
+
 Usage (via scripts/run-job.sh py scenario_step.py ...):
   scenario_step.py s12-mor [--hot-minutes 3]
   scenario_step.py grow [--hot-minutes 3]
@@ -187,8 +193,9 @@ def append_live(spark, args):
     config = gl.load_config(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "health.json"))
     scan_id = run_scan(spark, NS, config, tables=names, report=False)
     run_detect(spark, scan_id, config, report=True)
-    print("  look for '=== Partition holds (shadow)' above: live_append_unpart {} and live_append_days "
-          "2026-09-03 HOT_PARTITION:defer -> SMALL_FILES:auto", flush=True)
+    print("  look for the SMALL_FILES findings above: appends never hold a partition (no HOT_PARTITION); "
+          "with tiering on, 6 fragments just written wait (minor at 8 fragments or once the oldest has waited), "
+          "and a scan after the cold time (compaction.cold_hours) gives each a major", flush=True)
 
 
 def rapid_commits(spark, args):
@@ -214,7 +221,43 @@ def rapid_commits(spark, args):
     print("  look for '=== Writer findings (shadow)' above: live_rapid_commits +SNAPSHOT_RATE", flush=True)
 
 
-STEPS = {"append-live": append_live, "s12-mor": s12_mor, "grow": grow, "rollback": rollback, "expire-gap": expire_gap,
+def unpart_appends(spark, args):
+    """Item 12, UNPARTITIONED_APPENDS: the scratch table glue.demo.live_unpart_appends
+    (not in expectations.json), unpartitioned, target file size 1 MiB, sorted by
+    customer_id, advisor.time-column = occurred_at. 16 appends of 20,000 rows, each
+    an hour of event time (occurred_at follows arrival) but every customer_id
+    (each append spans the whole key range), then 8 tiny appends (fragments).
+    Large (over 8 target files) and appended to 24 times in 24 h: never cold, so
+    the tier rule gives minors only; customer_id's overlap depth is about the file
+    count, occurred_at's about 1, so UNPARTITIONED_APPENDS advises partitioning by
+    days(occurred_at) and sorting within by customer_id."""
+    from datetime import date
+    from build_test_tables import epoch, events
+    from detect_symptoms import run_detect
+    from scan_metrics import run_scan
+    b = Builder(spark)
+    b.next_id = 90_000_000 + int(time.time()) % 1_000_000 * 100
+    t = f"{NS}.live_unpart_appends"
+    b.create(t, "", {"write.target-file-size-bytes": str(1 << 20), "advisor.time-column": "occurred_at"})
+    spark.sql(f"ALTER TABLE {t} WRITE ORDERED BY customer_id")
+    start = epoch(date(2026, 9, 3))
+    hour = 0
+    for rows, commits in ((20_000, 16), (500, 8)):
+        for _ in range(commits):
+            events(spark, b.take(rows), rows, start + hour * 3600, 3600).coalesce(1).writeTo(t).append()
+            hour += 1
+    b.finish(t)
+    print(f"  {t}: rebuilt; 16 appends of 20,000 rows + 8 tiny appends, one event hour each, sorted by "
+          f"customer_id, target 1 MiB", flush=True)
+    config = gl.load_config(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "health.json"))
+    scan_id = run_scan(spark, NS, config, tables=["live_unpart_appends"], report=False)
+    run_detect(spark, scan_id, config, report=True)
+    print("  look for live_unpart_appends above: UNPARTITIONED_APPENDS (approval; customer_id overlap depth ~ the "
+          "file count, occurred_at ~ 1) and SMALL_FILES as a minor (never cold: a large unpartitioned table with "
+          "continuous appends gets minors only)", flush=True)
+
+
+STEPS = {"append-live": append_live, "unpart-appends": unpart_appends, "s12-mor": s12_mor, "grow": grow, "rollback": rollback, "expire-gap": expire_gap,
          "rapid-commits": rapid_commits}
 
 

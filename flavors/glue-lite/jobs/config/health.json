@@ -86,7 +86,11 @@
       "refresh_file_replacement": 0.8,
       "refresh_byte_replacement": 0.8,
       "frequent_full_refresh_min": 4,
-      "frequent_full_refresh_min_bytes": 1073741824
+      "frequent_full_refresh_min_bytes": 1073741824,
+      "_unpartitioned_comment": "Item 12, family tiering: a large unpartitioned table (data_bytes >= unpartitioned_min_target_files x target) with continuous appends (>= unpartitioned_appends_min_commits_24h writer commits in 24 h) is never cold: the tier rule gives it minors or waits only, no whole-table major. UNPARTITIONED_APPENDS (approval) when one of its sort, filter or time columns (advisor.time-column) has an average overlap depth (files one value falls into, from the files' bounds) of at least unpartitioned_overlap_depth: partition by time and sort within. TEST SCALE 12 commits a day; production 48 (expiry's streaming category).",
+      "unpartitioned_min_target_files": 8,
+      "unpartitioned_appends_min_commits_24h": 12,
+      "unpartitioned_overlap_depth": 4
     },
     "rewrite": {
       "_comment": "Options plan.py puts on the CALLs. min_input_files null = min_excess_files + 1, so every flagged partition is one the rewrite will change.",
@@ -106,7 +110,7 @@
     "new_findings": "on",
     "expiry_policy": "on",
     "writer_findings": "shadow",
-    "tiering": "shadow",
+    "tiering": "on",
     "churn_window_h": 24,
     "hot_gap_factor": 2.0,
     "hot_cap_minutes": 1440,
