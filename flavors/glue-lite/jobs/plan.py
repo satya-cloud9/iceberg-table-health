@@ -348,7 +348,12 @@ def plan_table(table, findings, tm, cfg, now=None, freed=None):
                       "note": f"{len(hot)} partition(s) left out (still being written, or late data "
                               f"still expected): " + ", ".join(f["partition_key"] for f in hot)})
 
-    held = [f for f in active if f["action"] == "advisory"]
+    held = [f for f in active if f["action"] == "advisory" and f["symptom"] != "RETAINED_STORAGE"]
+    for f in active:
+        if f["action"] == "advisory" and f["symptom"] == "RETAINED_STORAGE":
+            # nothing past the policy: advice for the owner, nothing to run or approve
+            steps.append({"kind": "advice", "auto": False, "symptoms": [f["symptom"]], "statement": "",
+                          "note": f"advice: {f['remedy']}"})
     if held:
         steps.append({"kind": "hold", "auto": False, "symptoms": sorted({f["symptom"] for f in held}),
                       "statement": "", "note": f"{len(held)} finding(s) held: {held[0]['remedy']}"})
@@ -434,6 +439,13 @@ def plan_table(table, findings, tm, cfg, now=None, freed=None):
             # expire to the configured policy now, files kept for the grace;
             # shortening the policy is the owner's call
             import expiry as xp
+            if any(s["kind"] == "expire_keep_files" for s in steps):
+                # SNAPSHOT_BUILDUP's expiry already expires to the same policy
+                steps.append({"kind": "advice", "auto": False, "symptoms": [f["symptom"]], "statement": "",
+                              "note": (f"covered by the expiry above (SNAPSHOT_BUILDUP, same policy); what old "
+                                       f"snapshots still keep afterwards is reported on the next scan: "
+                                       f"{f['remedy']}")})
+                continue
             # the table's own resolved policy (as for SNAPSHOT_BUILDUP); the global
             # threshold only for scans from before the policy was recorded
             age_h = float(tm["policy_age_h"]) if tm.get("policy_age_h") is not None \
@@ -507,6 +519,8 @@ def phase_of(step):
     kind = step["kind"]
     if kind == "hold":
         return 0
+    if kind == "advice":
+        return 7          # shown with the expiry steps; never runs
     if kind == "rewrite_position_delete_files":
         return 2 if "DELETE_FILE_SPRAWL" in step["symptoms"] else 3   # else: cleanup after the rewrite
     if kind == "rewrite_data_files":
@@ -746,7 +760,7 @@ def main():
     profile = profiles.load_profile(path) if os.path.exists(path) else None
     coord = coordination.make(profile, run_id)
     ttl = int(float((config.get("defaults") or {}).get("lease_minutes", 30)) * 60)
-    total = 0
+    total = estimates = 0
     for t in tables:
         recs = run_table(spark, t, config, coord, ttl, run_id, a.apply, approve, store, log)
         if recs:
@@ -756,16 +770,19 @@ def main():
             scan_state.record_actions(store, [r for r in recs if r["kind"] != "estimate"],
                                       datetime.now(timezone.utc))
             store.flush()
-            total += len(recs)
-    print(f"\nRecorded {total} actions in the actions log under {run_id} (with snapshot before/after, "
-          f"a rollback statement each, and one estimate per table that changed).", flush=True)
+            n_est = sum(1 for r in recs if r["kind"] == "estimate")
+            total += len(recs) - n_est
+            estimates += n_est
+    print(f"\nRecorded {total} action(s) and {estimates} estimate(s) in the actions log under {run_id} "
+          f"(actions with snapshot before/after and a rollback statement each; one estimate per table that "
+          f"changed).", flush=True)
     spark.stop()
 
 
 def print_steps(t, steps, title=None):
     print(f"\n--- {t}{(': ' + title) if title else ''}: {'nothing to do' if not steps else ''}", flush=True)
     for s in steps:
-        tag = "RUN " if s["auto"] else ("HOLD" if s["kind"] == "hold" else "ASK ")
+        tag = "RUN " if s["auto"] else {"hold": "HOLD", "advice": "NOTE"}.get(s["kind"], "ASK ")
         print(f"  [{tag}] {s['kind']:18} {', '.join(s['symptoms'])}\n         {s['note']}", flush=True)
         if s["statement"]:
             print(f"         {s['statement']}", flush=True)

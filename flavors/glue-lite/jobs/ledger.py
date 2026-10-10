@@ -513,6 +513,9 @@ class Ledger:
         tm["freed_files_waiting"] = len(self.store.range("freed_file", (uuid,))) if uuid else None
         led_bytes, note = xp.retained_from_summaries(snaps, refs, current)
         tm["retained_bytes_ledger"], tm["retained_ledger_note"] = led_bytes, note
+        detail = xp.retained_detail(snaps, refs, current, now_ms, policy,
+                                    (cfg.get("expiry") or {}).get("retained_what_if_hours", (72, 24, 6)))
+        tm["retained_detail_json"] = None if detail is None else json.dumps(detail)
         mode = str(cfg.get("retained_bytes", "full"))
         tr.log("expiry", f"policy {policy['age_h']:g} h / keep {policy['min_keep']} ({policy['source']})",
                category=policy["category"], writer_commits_24h=policy["writer_commits_24h"],

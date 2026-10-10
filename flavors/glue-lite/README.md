@@ -1088,7 +1088,7 @@ added, and records it in `glue.ops.incremental_check` (family `new_findings`).
 | Finding | Fires when | Action |
 |---|---|---|
 | DELETE_FILE_SPRAWL | a partition has ≥ `delete_sprawl_min_files` (10) position delete files but its delete ratio is under DELETE_BUILDUP's 5% | auto: `rewrite_position_delete_files` scoped to the partition, no data rewrite |
-| RETAINED_STORAGE | bytes only old snapshots reference (M16) ≥ `retained_storage_min_bytes` and ≥ `retained_storage_min_share` (1.0 = more than one extra copy) of the live bytes | approval: expire to the policy age now; shorten the policy if it stays high |
+| RETAINED_STORAGE | bytes only old snapshots reference (M16) ≥ `retained_storage_min_bytes` and ≥ `retained_storage_min_share` (1.0 = more than one extra copy) of the live bytes | approval when snapshots are past the policy: expire to it now; advisory (advice with the numbers) when none are |
 | METADATA_BLOAT | current metadata.json (M35) ≥ `metadata_max_json_bytes`, or manifests only old snapshots reference (M36) ≥ `metadata_max_retained_bytes` | approval: delete-after-commit if off; shorter retention or fewer commits upstream |
 
 Byte limits are test scale, 1/64 of the production placeholders (1 GiB,
@@ -1565,8 +1565,8 @@ It is floored at `file_grace_floor_hours` unless it comes from a declared
 timeout. Production values: 12 h, 1 h, 10 min. The homelab config uses test
 scale: 0.1 h, 0.05 h, 1 min.
 
-**Window:** the policy age as before. More than `max_snapshots` (3,600)
-snapshots inside it shorten it. (It used to be raised to `window_floor_hours`;
+**Window:** the policy age as before. More than `max_snapshots` (500 since
+D3; was 3,600) snapshots inside it shorten it. (It used to be raised to `window_floor_hours`;
 the floor was retired with the run order D1, below.)
 
 **Other changes:**
@@ -1574,7 +1574,8 @@ the floor was retired with the run order D1, below.)
   waiting files apart, not as orphans.
 - The plan holds orphan removal on a table while freed files wait. A freed file
   may be months old, so an age by creation time would not protect it.
-- The RETAINED_STORAGE suggestion expires the same way.
+- The RETAINED_STORAGE suggestion expires the same way (since D3: only when
+  snapshots are past the policy; see the D3 section).
 - A crash between the expiry commit and the record leaves those files
   unrecorded; the orphan sweep (an age of days) is the backstop.
 
@@ -1824,12 +1825,60 @@ To check on the cluster:
 
 ```
 make gl-scan                       # a baseline
-make gl-plan T=s0                  # dry run: the plan from the latest scan, nothing changes
-make gl-plan T=s0 APPLY=1          # scan, steps 1-4, catch-up, expiry capped, estimate
-make gl-plan T=s2 APPLY=1
+make gl-image                      # the jobs run the code baked into the image
+make gl-plan T=s19                 # dry run: the plan from the latest scan, nothing changes
+make gl-plan T=s19 APPLY=1         # scan, steps 1-4, catch-up, expiry, estimate
+make gl-plan T=live_rapid_commits APPLY=1   # a rewrite in steps 1-4
 make gl-scan                       # scorecard as before
 ```
 
 In the APPLY output look for, per table: `steps 1-4 (scan ...)`, the `->`
 lines, `catch-up (scan ...): ledger at ...`, `steps 7-9 after the catch-up`
 (with `capped at ...` when the cap moved the cutoff) and `estimate: ...`.
+
+Verified on the homelab 2026-10-10: s19, s3, s18 and s20 expired after the
+catch-up (s18's cutoff capped at its ledger, 2026-10-04 19:23, under the
+policy's 10-05); live_rapid_commits rewrote 41 files into 1 and the catch-up
+ingested that commit before the expiry step; scorecard 20/21 (s12 waits for
+per-symptom grading).
+
+
+## D3 — Snapshot cap and RETAINED_STORAGE advice
+
+**Cap.** `expiry.max_snapshots` is 500 (D3, agreed 2026-10-09: 500–1,000;
+was 3,600). More snapshots than that inside the policy window shorten the
+window, so metadata.json, which every commit rewrites, stays around 0.5 MB
+(500 is about 30 minutes of a writer committing 1,000 times an hour). It is
+never below the policy's minimum kept, and a table can set its own with
+`advisor.expire.max-snapshots`. The expiry still never passes what the ledger
+ingested (D1).
+
+**RETAINED_STORAGE.** The finding now carries the policy, the number of
+snapshots past it, and where the retained bytes come from (the summary
+formula, per operation: `replace` = rewrites such as compaction, `overwrite`
+/ `delete` = writers), the bytes writers removed in the last 24 h, and what a
+shorter window would still keep (`expiry.retained_what_if_hours`, 72 / 24 /
+6 h, only those shorter than the policy). Then:
+
+| Snapshots past the policy | Finding | Plan |
+|---|---|---|
+| some, and SNAPSHOT_BUILDUP's expiry is planned | approval | a NOTE: covered by that expiry (same policy); the next scan reports what is still kept |
+| some, no expiry planned | approval | ASK: expire to the policy (APPROVE=RETAINED_STORAGE) |
+| none | advisory | a NOTE with the numbers: shorten the policy (what each shorter window would keep), and, when writers' overwrites keep more than rewrites, switch them to merge-on-read |
+
+An advisory finding is never run or approved, and the scorecard ignores it
+(as other advisory findings), so a table whose old snapshots are all inside
+its policy no longer reads as needing a fix. The scan records the numbers in
+`table_metrics.retained_detail_json`.
+
+The run summary now counts actions and estimates apart ("Recorded 1
+action(s) and 1 estimate(s)").
+
+To check on the cluster:
+
+```
+make gl-image
+make gl-scan                       # s12, s14, s19, s2: RETAINED_STORAGE:advisory with the numbers
+make gl-plan T=s12                 # [NOTE] advice: ... Options: shorten the policy ...; or switch the writers to merge-on-read
+make gl-plan T=s19
+```

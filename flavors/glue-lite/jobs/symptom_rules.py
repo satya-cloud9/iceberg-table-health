@@ -16,7 +16,9 @@ Each finding carries an action:
                  configured level (declared filter columns are not enough)
   advisory       reported, never acted on: another finding on the table makes
                  this remedy counterproductive (e.g. bigger files under
-                 copy-on-write churn)
+                 copy-on-write churn), or nothing the advisor could run
+                 would change it (RETAINED_STORAGE with no snapshot past the
+                 policy: advice with the numbers, for the owner)
 """
 import json
 import math
@@ -25,7 +27,7 @@ import re
 import gltrace as tr
 import holds as hl
 
-RULE_VERSION = "2.7a-1"
+RULE_VERSION = "d3-1"
 
 # symptom -> (category, level, action, remedy)
 CATALOG = {
@@ -529,6 +531,49 @@ def refresh_findings(table, tm, th, keep_full_copies=1):
     return out
 
 
+def _mib(b):
+    return f"{(b or 0) / 1048576:.1f} MiB"
+
+
+def retained_remedy(ev):
+    """RETAINED_STORAGE remedy text: an expiry when snapshots are past the policy,
+    otherwise advice with the numbers (a shorter policy, or merge-on-read writers)."""
+    pol = ev.get("policy_age_h")
+    pol_txt = (f"the policy ({float(pol):g} h, keep {ev.get('policy_min_keep')}"
+               f"{', ' + ev['policy_source'] if ev.get('policy_source') else ''})" if pol is not None
+               else "the policy")
+    head = (f"old snapshots keep {_mib(ev['retained_bytes'])}, {ev['share']:g}x the live "
+            f"{_mib(ev['live_bytes'])}")
+    n = ev.get("expirable_snapshots")
+    if n:
+        frees = (f", which frees {_mib(ev['expirable_bytes'])} and leaves {_mib(ev['inside_policy_bytes'])} "
+                 f"inside the policy" if ev.get("expirable_bytes") is not None else "")
+        return (f"{head}: {n} snapshot(s) are past {pol_txt}: expire to the policy now{frees} "
+                f"(files kept for the grace); if it stays high, see the advice on the next scan")
+    if n is None:
+        return (f"{head}: expire to the retention policy now; if it stays high inside the policy, "
+                f"shorten the policy (history.expire.max-snapshot-age-ms)")
+    parts = [f"{head}, all inside {pol_txt}: no expiry would free it"]
+    by_op = ev.get("retained_by_operation") or {}
+    writers = sum(v for k, v in by_op.items() if k != "replace")
+    rewrites = by_op.get("replace", 0)
+    if by_op:
+        parts.append(f"writers' overwrites and deletes keep {_mib(writers)}, rewrites (compaction) {_mib(rewrites)}")
+    options = []
+    shorter = [w for w in (ev.get("what_if") or []) if w.get("retained_bytes") is not None]
+    if shorter:
+        options.append("shorten the policy (history.expire.max-snapshot-age-ms): " + ", ".join(
+            f"{w['hours']:g} h would keep {_mib(w['retained_bytes'])}" for w in shorter))
+    else:
+        options.append("shorten the policy (history.expire.max-snapshot-age-ms)")
+    if writers and writers >= rewrites:
+        w24 = ev.get("writer_removed_24h")
+        options.append("switch the writers to merge-on-read (write.merge.mode, write.update.mode, "
+                       "write.delete.mode = merge-on-read) so a MERGE writes delete files instead of copying "
+                       "whole data files" + (f" (they replaced {_mib(w24)} in the last 24 h)" if w24 else ""))
+    return "; ".join(parts) + ". Options: " + "; or ".join(options)
+
+
 def storage_findings(table, tm, th):
     """GL2.6c, size-based bloat (Traceability: snapshot count stays evidence only;
     an append-only stream with thousands of snapshots can keep almost nothing
@@ -548,10 +593,26 @@ def storage_findings(table, tm, th):
         share = kept / live
         if (kept >= th.get("retained_storage_min_bytes", 1073741824)
                 and share > th.get("retained_storage_min_share", 1.0)):
-            out.append(_finding(table, "RETAINED_STORAGE", share / th.get("retained_storage_min_share", 1.0),
-                                {"retained_bytes": int(kept), "live_bytes": int(live), "share": round(share, 2),
-                                 "snapshots": tm.get("snapshots"),
-                                 "oldest_snapshot_age_h": tm.get("oldest_snapshot_age_h")}))
+            ev = {"retained_bytes": int(kept), "live_bytes": int(live), "share": round(share, 2),
+                  "snapshots": tm.get("snapshots"), "oldest_snapshot_age_h": tm.get("oldest_snapshot_age_h"),
+                  "expirable_snapshots": tm.get("expirable_snapshots"), "policy_age_h": tm.get("policy_age_h"),
+                  "policy_min_keep": tm.get("policy_min_keep"), "policy_source": tm.get("policy_source")}
+            try:
+                detail = json.loads(tm.get("retained_detail_json") or "null")
+            except ValueError:
+                detail = None
+            if detail:
+                ev["expirable_bytes"] = detail.get("expirable_bytes")
+                ev["inside_policy_bytes"] = detail.get("inside_policy_bytes")
+                ev["retained_by_operation"] = detail.get("by_operation")
+                ev["writer_removed_24h"] = detail.get("writer_removed_24h")
+                ev["what_if"] = detail.get("what_if")
+            f = _finding(table, "RETAINED_STORAGE", share / th.get("retained_storage_min_share", 1.0), ev,
+                         remedy=retained_remedy(ev))
+            if tm.get("expirable_snapshots") == 0:
+                # nothing past the policy: no expiry would change it, the policy is the owner's
+                f["action"], f["automatic"] = "advisory", False
+            out.append(f)
     js, meta = tm.get("metadata_json_bytes"), tm.get("retained_metadata_bytes")
     max_js = th.get("metadata_max_json_bytes", 8388608)
     max_meta = th.get("metadata_max_retained_bytes", 1073741824)

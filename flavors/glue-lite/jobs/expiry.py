@@ -12,7 +12,7 @@ snapshots cost (Traceability A4). The policy, first match wins:
                                   last 24 h, else batch (defaults: batch 120 h / 10,
                                   streaming 72 h / 10)
   then one bound on that window:
-    max snapshots   advisor.expire.max-snapshots / expiry.max_snapshots (3,600):
+    max snapshots   advisor.expire.max-snapshots / expiry.max_snapshots (500, D3):
                     more snapshots inside the window shorten it, since each one
                     is an entry in metadata.json that every commit rewrites
   There is no window floor: the advisor's own expiry runs after the ledger
@@ -83,7 +83,7 @@ def resolve_policy(props, cfg, snaps, now_ms):
             keep = int(props["history.expire.min-snapshots-to-keep"])
         source = "table property history.expire.*"
     # metadata.json cost: at most max_snapshots inside the window
-    max_snaps = int(props.get("advisor.expire.max-snapshots") or exp.get("max_snapshots", 3600))
+    max_snaps = int(props.get("advisor.expire.max-snapshots") or exp.get("max_snapshots", 500))
     max_snaps = max(max_snaps, keep)
     newest = sorted((s["ts_ms"] for s in snaps), reverse=True)
     inside = [t for t in newest if t >= now_ms - age_h * H]
@@ -180,3 +180,45 @@ def retained_from_summaries(snaps, refs, current):
             continue
         total += int(v)
     return total, f"summary formula over {len(chain)} snapshots"
+
+
+def retained_detail(snaps, refs, current, now_ms, policy, what_if_hours=(72, 24, 6)):
+    """Where the retained bytes come from and what a shorter policy would keep,
+    from the same summary formula (RETAINED_STORAGE advice). -> dict or None
+    when the formula doesn't hold (see retained_from_summaries).
+      expirable_bytes / inside_policy_bytes   what an expiry to the policy would
+                     free now / what would still be retained after it
+      by_operation   retained bytes by the operation that removed them: replace =
+                     rewrites (compaction), overwrite / delete = writers (a
+                     copy-on-write MERGE, UPDATE or DELETE copies whole files)
+      writer_removed_24h   bytes writers removed in the last 24 h: what each day
+                     of retention costs while they keep writing like this
+      what_if        [{hours, retained_bytes}] for windows shorter than the
+                     policy: what would still be retained right after an
+                     expiry to that window (min_keep still kept)."""
+    total, _ = retained_from_summaries(snaps, refs, current)
+    if total is None or current is None:
+        return None
+    by_id = {s["snapshot_id"]: s for s in snaps}
+    chain = ancestors(by_id, current)            # newest first
+
+    def removed(s):
+        return int(s.get("removed_files_size") or 0)
+
+    by_op = {}
+    for sid in chain[:-1]:
+        s = by_id[sid]
+        if removed(s):
+            by_op[s["operation"]] = by_op.get(s["operation"], 0) + removed(s)
+    w24 = sum(removed(by_id[sid]) for sid in chain
+              if by_id[sid]["operation"] != "replace" and by_id[sid]["ts_ms"] >= now_ms - 24 * H)
+    def kept_after(h):
+        kept = [sid for i, sid in enumerate(chain)
+                if i < max(int(policy["min_keep"]), 1) or by_id[sid]["ts_ms"] >= now_ms - h * H]
+        return sum(removed(by_id[sid]) for sid in kept[:-1])
+
+    inside = kept_after(float(policy["age_h"]))
+    what_if = [{"hours": h, "retained_bytes": kept_after(h)}
+               for h in sorted({float(x) for x in what_if_hours}, reverse=True) if h < float(policy["age_h"])]
+    return {"retained_bytes": total, "expirable_bytes": total - inside, "inside_policy_bytes": inside,
+            "by_operation": by_op, "writer_removed_24h": w24, "what_if": what_if}
